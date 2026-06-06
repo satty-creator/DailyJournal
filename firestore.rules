@@ -1,0 +1,30 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Users can only read/write their own profile
+    match /users/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+
+      // Journal entries are private to each user
+      match /entries/{entryId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+
+      // Echoes are private to each user
+      match /echoes/{echoId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+
+      // Daily mood check-ins are private to each user
+      match /moodLogs/{logId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+
+      // Pattern callbacks are private to each user
+      match /patternCallbacks/{callbackId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+    }
+  }
+}
