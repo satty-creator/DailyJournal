@@ -7,12 +7,14 @@
 //
 //  No third-party SDK — plain URLSession + JSONSerialization.
 //
-//  API key is stored in UserDefaults and entered once in Profile → Settings.
-//  If the key is absent or the call fails we fall back silently to LocalAI
-//  results that were saved first.
+//  There is NO user-supplied API key: the Gemini key lives server-side in the
+//  `geminiProxy` Cloud Function. AI is simply available whenever the user is
+//  signed in (the proxy authenticates with their Firebase ID token). If the call
+//  fails we fall back silently to LocalAI results that were saved first.
 //
 
 import Foundation
+import FirebaseAuth
 
 // MARK: - Output model
 struct JournalInsights {
@@ -27,62 +29,88 @@ final class AIService {
     static let shared = AIService()
     private init() {}
 
-    // MARK: - API key (stored in UserDefaults)
-    var apiKey: String {
-        get { UserDefaults.standard.string(forKey: "gemini_api_key") ?? "" }
-        set { UserDefaults.standard.set(newValue, forKey: "gemini_api_key") }
+    // MARK: - Backend proxy
+    //
+    // The Gemini key lives server-side in the `geminiProxy` Cloud Function — never
+    // in the app. We authenticate with the signed-in user's Firebase ID token.
+    // Update this if you deploy to a different project/region (see functions/README).
+    static let proxyURLString =
+        "https://us-central1-dailyjournal-12a35.cloudfunctions.net/geminiProxy"
+
+    /// AI is available whenever there's a signed-in user (the proxy needs a token).
+    /// There is no user-entered key — this is purely an auth check.
+    var isAIAvailable: Bool { Auth.auth().currentUser != nil }
+
+    /// Fetches the current user's Firebase ID token (auto-refreshing).
+    private func idToken() async -> String? {
+        guard let user = Auth.auth().currentUser else { return nil }
+        return try? await user.getIDToken()
     }
 
-    var hasApiKey: Bool { !apiKey.trimmingCharacters(in: .whitespaces).isEmpty }
+    /// The single point all Gemini calls go through. Sends the prompt to the
+    /// backend proxy and returns Gemini's raw response Data (same shape Gemini
+    /// returns directly), so existing response parsers are unchanged.
+    func generate(prompt: String, maxTokens: Int, temperature: Double) async throws -> Data {
+        guard let token = await idToken() else { throw AIError.aiUnavailable }
+
+        let body: [String: Any] = [
+            "contents": [["parts": [["text": prompt]]]],
+            "generationConfig": [
+                "responseMimeType": "application/json",
+                "maxOutputTokens":  maxTokens,
+                "temperature":      temperature
+            ]
+        ]
+
+        var request = URLRequest(url: URL(string: Self.proxyURLString)!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.timeoutInterval = 25
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw AIError.invalidResponse }
+        guard (200..<300).contains(http.statusCode) else {
+            throw AIError.httpError(http.statusCode, String(data: data, encoding: .utf8) ?? "")
+        }
+        return data
+    }
 
     // MARK: - Generate insights
     func generateInsights(from text: String) async throws -> JournalInsights {
-        guard hasApiKey else { throw AIError.noApiKey }
+        guard isAIAvailable else { throw AIError.aiUnavailable }
         guard text.count > 20 else { throw AIError.textTooShort }
 
-        let url = URL(string:
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=\(apiKey)"
-        )!
-
         let prompt = """
-        You are a compassionate journaling assistant. Analyze this journal entry and respond with a JSON object.
+        \(NinetyVoice.system)
 
-        Rules:
-        - "bullets": array of exactly 2-3 short strings (max 80 chars each) capturing the core emotional themes
-        - "question": one warm, reflective follow-up question (max 100 chars)
-        - "sentiment": exactly one of: Anxious, Excited, Happy, Sad, Frustrated, Calm, Hopeful, Uncertain, Reflective
+        TASK: Read the journal entry and return a reflection as JSON.
+
+        "bullets": array of EXACTLY 2 short strings (max ~110 chars each). These are
+          your "noticed" layer — observations, not a summary. Each one must do a
+          MOVE from the rule above (tension / underneath / absence / reframe / pattern).
+          A bullet that restates a sentence from the entry is WRONG — rewrite it until
+          it says something the user did not already write.
+        "question": ONE sharp, specific question grounded in this entry, with a little
+          edge — not a soft generic prompt. Max ~120 chars.
+        "sentiment": exactly one of: Anxious, Excited, Happy, Sad, Frustrated, Calm,
+          Hopeful, Uncertain, Tired, Grateful, Lonely, Proud, Reflective.
+          Use the single most fitting label. Do NOT invent labels outside this list.
+
+        Before you answer, silently test each bullet: "could I have written this just by
+        re-reading their entry?" If yes, replace it.
+        \(MemoryProfileService.shared.cachedPromptContext())
 
         Journal entry:
+        \"\"\"
         \(text)
+        \"\"\"
 
         Respond with valid JSON only — no markdown, no code fences.
         """
 
-        let requestBody: [String: Any] = [
-            "contents": [
-                ["parts": [["text": prompt]]]
-            ],
-            "generationConfig": [
-                "responseMimeType": "application/json",
-                "maxOutputTokens": 300,
-                "temperature": 0.4
-            ]
-        ]
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
-        request.timeoutInterval = 20
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-
-        guard let http = response as? HTTPURLResponse else { throw AIError.invalidResponse }
-        guard (200..<300).contains(http.statusCode) else {
-            let body = String(data: data, encoding: .utf8) ?? ""
-            throw AIError.httpError(http.statusCode, body)
-        }
-
+        let data = try await generate(prompt: prompt, maxTokens: 300, temperature: 0.4)
         return try parseGeminiResponse(data)
     }
 
@@ -102,7 +130,9 @@ final class AIService {
 
         let bullets   = json["bullets"] as? [String] ?? []
         let question  = json["question"] as? String ?? ""
-        let sentiment = json["sentiment"] as? String ?? "Reflective"
+        // The model occasionally returns an off-list word (e.g. "Receptive").
+        // Clamp it to the known vocabulary so cards show consistent labels.
+        let sentiment = LocalAI.normalizedSentiment(json["sentiment"] as? String) ?? "Reflective"
 
         guard !bullets.isEmpty, !question.isEmpty else { throw AIError.parseError }
 
@@ -120,6 +150,7 @@ struct EchoExtractionResult {
     let surfaceAfterHours: Int   // when to surface the echo
     let confidence: Double       // 0.0–1.0 as reported by the model
     let themeKeyword: String?    // only present for .theme type
+    let line: String?            // ninety-voice callback line that FRAMES the quote
 }
 
 extension AIService {
@@ -135,12 +166,8 @@ extension AIService {
         from entryText: String,
         recentEntries: [JournalEntry]
     ) async throws -> EchoExtractionResult? {
-        guard hasApiKey else { throw AIError.noApiKey }
+        guard isAIAvailable else { throw AIError.aiUnavailable }
         guard entryText.count > 20 else { return nil }
-
-        let url = URL(string:
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=\(apiKey)"
-        )!
 
         let recentContext: String = recentEntries.prefix(3).map { entry in
             let dateStr = entry.createdAt.formatted(.dateTime.month(.abbreviated).day())
@@ -148,41 +175,21 @@ extension AIService {
             return "[\(dateStr)]: \(snippet)"
         }.joined(separator: "\n")
 
-        let prompt = buildEchoPrompt(entryText: entryText, recentContext: recentContext)
+        let seed = MemoryProfileService.shared.cachedRecurrenceSeed()
+        let prompt = buildEchoPrompt(entryText: entryText, recentContext: recentContext, recurrenceSeed: seed)
 
-        let requestBody: [String: Any] = [
-            "contents": [
-                ["parts": [["text": prompt]]]
-            ],
-            "generationConfig": [
-                "responseMimeType": "application/json",
-                "maxOutputTokens":  350,
-                "temperature":      0.2   // low temperature — conservative extraction
-            ]
-        ]
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody   = try JSONSerialization.data(withJSONObject: requestBody)
-        request.timeoutInterval = 20
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-
-        guard let http = response as? HTTPURLResponse else { throw AIError.invalidResponse }
-        guard (200..<300).contains(http.statusCode) else {
-            let body = String(data: data, encoding: .utf8) ?? ""
-            throw AIError.httpError(http.statusCode, body)
-        }
-
+        // Low effective temperature — conservative extraction.
+        let data = try await generate(prompt: prompt, maxTokens: 350, temperature: 0.2)
         return try parseEchoResponse(data)
     }
 
     // MARK: - Echo prompt
 
-    private func buildEchoPrompt(entryText: String, recentContext: String) -> String {
+    private func buildEchoPrompt(entryText: String, recentContext: String, recurrenceSeed: String = "") -> String {
         """
-        You are an extraction system for a journaling app called ninety. \
+        \(NinetyVoice.system)
+
+        EXTRACTION TASK (you are also acting as ninety's quiet noticing system). \
         Read the journal entry below and decide if it contains EXACTLY ONE of \
         these things worth following up on later:
 
@@ -204,6 +211,15 @@ extension AIService {
         - surface_after_hours values: INTENTION → 36, OPEN_LOOP → 72, THEME → 168, MOOD_MARKER → 336
         - For THEME type, include "theme_keyword": the name or word that recurs \
           (e.g. "dad", "the promotion"). Keep it short — 1–3 words.
+        - Already-recurring for THIS person (from their history): \(recurrenceSeed.isEmpty ? "(unknown yet)" : recurrenceSeed). \
+          If the entry clearly touches one of these, a THEME echo is more justified — \
+          prefer reusing that exact keyword. Do NOT invent recurrence that isn't in the entry.
+        - "line": write ONE short callback line in ninety's voice (max ~120 chars) that \
+          will be shown ABOVE the quote when this resurfaces later. It must FRAME the \
+          quote with a perspective or a pointed question — never restate it. It should \
+          make the user feel gently caught. End on a question or an open observation. \
+          Example for an intention: "Three days ago you said you'd do this. Did it \
+          happen, or did it quietly become next week's problem?"
 
         Return ONLY valid JSON, one of these two shapes:
 
@@ -213,7 +229,8 @@ extension AIService {
         Found result:
         {"echo": {"type": "intention"|"open_loop"|"theme"|"mood_marker", \
         "quote": "exact user words", "surface_after_hours": <int>, \
-        "confidence": <0.0–1.0>, "theme_keyword": "<string or null>"}}
+        "confidence": <0.0–1.0>, "theme_keyword": "<string or null>", \
+        "line": "ninety-voice callback line"}}
 
         Entry:
         \"\"\"
@@ -224,6 +241,7 @@ extension AIService {
         \"\"\"
         \(recentContext.isEmpty ? "(none)" : recentContext)
         \"\"\"
+        \(MemoryProfileService.shared.cachedPromptContext())
         """
     }
 
@@ -266,14 +284,15 @@ extension AIService {
             quote:            quote,
             surfaceAfterHours: hours,
             confidence:       confidence,
-            themeKeyword:     echoDict["theme_keyword"] as? String
+            themeKeyword:     echoDict["theme_keyword"] as? String,
+            line:             (echoDict["line"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         )
     }
 }
 
 // MARK: - Errors
 enum AIError: LocalizedError {
-    case noApiKey
+    case aiUnavailable
     case textTooShort
     case invalidResponse
     case httpError(Int, String)
@@ -281,7 +300,7 @@ enum AIError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .noApiKey:             return "No Gemini API key set."
+        case .aiUnavailable:        return "AI is unavailable — sign in to enable it."
         case .textTooShort:         return "Entry too short to analyse."
         case .invalidResponse:      return "Invalid response from Gemini."
         case .httpError(let c, _):  return "Gemini returned HTTP \(c)."

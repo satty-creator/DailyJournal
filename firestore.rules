@@ -25,6 +25,23 @@ service cloud.firestore {
       match /patternCallbacks/{callbackId} {
         allow read, write: if request.auth != null && request.auth.uid == userId;
       }
+
+      // River marks (derived per-entry signals) are private to each user
+      match /riverMarks/{markId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+
+      // Today's Read — one doc per local date. The client reads it and writes
+      // feedback / local fallbacks; the overnight function writes via Admin SDK.
+      match /dailyReads/{readId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+
+      // FCM push tokens for this user's devices. Written by the client, read by
+      // the Cloud Function (Admin SDK bypasses rules).
+      match /pushTokens/{token} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
     }
   }
 }

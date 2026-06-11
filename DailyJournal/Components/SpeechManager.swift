@@ -161,11 +161,19 @@ final class SpeechManager: ObservableObject {
                     guard let self else { return }
                     if let result {
                         let spoken = result.bestTranscription.formattedString
-                        self.partialTranscript = spoken
-                        // Publish the live, composed text so the editor updates
-                        // word-by-word as the user speaks — no need to stop first.
-                        let sep = self.baseText.isEmpty ? "" : " "
-                        self.liveText = self.baseText + sep + spoken
+                        // CRITICAL: ignore empty transcriptions. When recording is
+                        // stopped/cancelled the recognizer often fires a FINAL
+                        // callback with an empty string; writing that through would
+                        // reset liveText back to baseText and wipe the words the
+                        // user just spoke (the whole field, if they spoke into an
+                        // empty editor). Only ever advance on real text.
+                        if !spoken.isEmpty {
+                            self.partialTranscript = spoken
+                            // Publish the live, composed text so the editor updates
+                            // word-by-word as the user speaks — no need to stop first.
+                            let sep = self.baseText.isEmpty ? "" : " "
+                            self.liveText = self.baseText + sep + spoken
+                        }
                     }
                     if let error {
                         let nsErr = error as NSError

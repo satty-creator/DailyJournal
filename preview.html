@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ninety - clickable viral UX prototype</title>
+  <style>
+    :root{
+      /* Core ink + neutrals */
+      --ink:#1c1830;
+      --muted:#6b6478;
+      --faint:#9a93a6;
+      --line:rgba(28,24,48,.08);
+      --hairline:rgba(28,24,48,.06);
+
+      /* Surfaces */
+      --bg-1:#fdf9ff;
+      --bg-2:#f4f0fb;
+      --bg-3:#eef6fd;
+      --phone:#ffffff;
+      --surface:rgba(255,255,255,.72);
+      --surface-solid:#ffffff;
+
+      /* Brand / river palette */
+      --rose:#ff9fb4;
+      --rose2:#ffe1e8;
+      --peach:#ffcaa0;
+      --mint:#a9f1d3;
+      --blue:#bde7ff;
+      --lav:#cdbcff;
+      --sun:#ffe27a;
+      --indigo:#5a45c8;
+      --indigo-2:#7a63e6;
+      --deep:#2a2440;
+
+      /* Elevation */
+      --shadow:0 30px 80px -28px rgba(46,33,74,.40);
+      --softShadow:0 10px 30px -12px rgba(46,33,74,.18);
+      --cardShadow:0 1px 2px rgba(28,24,48,.04), 0 8px 24px -14px rgba(46,33,74,.22);
+      --insetHairline:inset 0 0 0 1px rgba(255,255,255,.6);
+
+      --radius:24px;
+      --radius-lg:30px;
+      --radius-sm:16px;
+    }
+    *{box-sizing:border-box}
+    html{-webkit-text-size-adjust:100%}
+    body{
+      margin:0;
+      min-height:100vh;
+      font-family: ui-rounded, "SF Pro Rounded", "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+      color:var(--ink);
+      -webkit-font-smoothing:antialiased;
+      text-rendering:optimizeLegibility;
+      background:
+        radial-gradient(circle at 6% 4%, rgba(255,159,180,.28), transparent 30%),
+        radial-gradient(circle at 96% 8%, rgba(189,231,255,.34), transparent 32%),
+        radial-gradient(circle at 14% 96%, rgba(169,241,211,.30), transparent 30%),
+        linear-gradient(140deg, var(--bg-1), var(--bg-2) 54%, var(--bg-3));
+      display:grid;
+      grid-template-columns:minmax(320px, 430px) minmax(300px, 520px);
+      gap:48px;
+      align-items:center;
+      justify-content:center;
+      padding:36px;
+    }
+    .phone-wrap{position:relative;}
+    .phone{
+      width:min(390px, 100%);
+      height:844px;
+      margin:auto;
+      background:var(--phone);
+      border:11px solid #15121f;
+      border-radius:54px;
+      box-shadow:var(--shadow), inset 0 0 0 2px rgba(255,255,255,.04);
+      overflow:hidden;
+      position:relative;
+    }
+    .notch{
+      position:absolute; left:50%; top:11px; transform:translateX(-50%);
+      width:118px; height:33px; background:#15121f; border-radius:20px; z-index:50;
+    }
+    .status{
+      height:50px; padding:18px 30px 0; font-size:14px; font-weight:700; letter-spacing:-.2px;
+      display:flex; justify-content:space-between; align-items:center; color:var(--ink); position:relative; z-index:40;
+    }
+    .app{
+      height:794px; position:relative; overflow:hidden;
+      background:
+        radial-gradient(circle at 18px 70px, rgba(255,226,122,.32), transparent 90px),
+        radial-gradient(circle at 340px 220px, rgba(205,188,255,.30), transparent 100px),
+        linear-gradient(180deg,#ffffff 0%, #fbf8ff 48%, #f5f9ff 100%);
+    }
+    .screen{
+      display:none; height:100%; padding:18px 20px 100px; overflow:auto; scrollbar-width:none; -webkit-overflow-scrolling:touch;
+    }
+    .screen::-webkit-scrollbar{display:none}
+    .screen.active{display:block; animation:screenIn .42s cubic-bezier(.22,.9,.24,1)}
+    @keyframes screenIn{from{opacity:0; transform:translateY(10px)}to{opacity:1; transform:none}}
+
+    .brand-row{display:flex; align-items:center; justify-content:space-between; gap:12px; margin:6px 0 20px;}
+    .brand{font-size:23px; font-weight:800; letter-spacing:-.7px; display:flex; align-items:center; gap:9px}
+    .drop{
+      width:28px; height:28px; border-radius:50% 50% 50% 8px; transform:rotate(-45deg);
+      background:linear-gradient(150deg,var(--blue),var(--lav)); box-shadow:0 6px 16px rgba(90,69,200,.28), var(--insetHairline); display:inline-block; position:relative;
+    }
+    .drop:after{content:""; width:6px; height:6px; background:#fff; border-radius:50%; position:absolute; left:7px; top:6px; opacity:.95}
+    .chip{
+      border:1px solid var(--line); background:rgba(255,255,255,.66); padding:7px 13px; border-radius:999px;
+      font-size:11.5px; font-weight:700; letter-spacing:.01em; color:var(--muted); backdrop-filter:blur(8px);
+    }
+
+    .hero-card,.card{
+      background:var(--surface-solid);
+      border:1px solid var(--hairline);
+      border-radius:var(--radius);
+      box-shadow:var(--cardShadow);
+      padding:22px;
+    }
+    .hero-card{position:relative; overflow:hidden; min-height:262px; background:linear-gradient(170deg,#ffffff, #fbf7ff)}
+    .hero-card:before{content:""; position:absolute; width:240px; height:240px; border-radius:50%; right:-90px; top:-78px; background:radial-gradient(circle, rgba(255,159,180,.42), transparent 68%)}
+    .hero-card:after{content:""; position:absolute; width:180px; height:180px; border-radius:50%; left:-66px; bottom:-78px; background:radial-gradient(circle, rgba(189,231,255,.46), transparent 70%)}
+
+    .eyebrow{font-size:11.5px; color:var(--indigo); font-weight:800; text-transform:uppercase; letter-spacing:.1em; margin-bottom:13px; position:relative; z-index:1}
+    h1{font-size:34px; line-height:1.04; margin:0 0 14px; letter-spacing:-1.4px; font-weight:800; position:relative; z-index:1}
+    h2{font-size:27px; line-height:1.06; margin:0 0 12px; letter-spacing:-1px; font-weight:800}
+    h3{font-size:18px; margin:0 0 8px; letter-spacing:-.4px; font-weight:700}
+    p{font-size:15px; line-height:1.46; color:var(--muted); margin:0 0 12px; font-weight:450}
+    .big-copy{font-size:16px; color:#4a4357; font-weight:500; line-height:1.46; position:relative; z-index:1}
+
+    .button-row{display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:18px; position:relative; z-index:1}
+    button,.btn{
+      border:0; cursor:pointer; font-family:inherit; font-size:15px; font-weight:700; letter-spacing:-.2px;
+      padding:14px 18px; border-radius:15px; color:#fff;
+      background:linear-gradient(135deg,var(--indigo),var(--indigo-2));
+      box-shadow:0 10px 22px -8px rgba(90,69,200,.55); transition:transform .16s ease, box-shadow .16s ease, opacity .16s ease, background .16s ease;
+    }
+    button:hover,.btn:hover{transform:translateY(-1px); box-shadow:0 14px 28px -8px rgba(90,69,200,.6)}
+    button:active,.btn:active{transform:translateY(0) scale(.985); box-shadow:0 6px 14px -8px rgba(90,69,200,.5)}
+    .secondary{background:var(--surface-solid); color:var(--ink); border:1px solid var(--line); box-shadow:var(--cardShadow)}
+    .secondary:hover{box-shadow:var(--cardShadow); background:#faf8ff}
+    .ghost{background:transparent; color:var(--indigo); box-shadow:none; border:1px solid rgba(90,69,200,.22)}
+    .ghost:hover{background:rgba(90,69,200,.05); box-shadow:none}
+    .soft{background:linear-gradient(135deg,var(--rose),var(--peach)); color:#5a3140; box-shadow:0 10px 22px -10px rgba(255,159,180,.7)}
+    .mint{background:linear-gradient(135deg,var(--mint),var(--blue)); color:#1c4136; box-shadow:0 10px 22px -10px rgba(120,200,180,.55)}
+    .small-btn{font-size:13px; padding:9px 14px; border-radius:12px; box-shadow:none}
+
+    .pill-row{display:flex; flex-wrap:wrap; gap:8px; margin-top:14px}
+    .pill{font-size:12px; font-weight:600; padding:8px 12px; background:#f6f3fc; border:1px solid var(--hairline); border-radius:999px; color:#5d5570}
+    .tiny{font-size:12px; color:var(--faint); line-height:1.4; font-weight:450}
+    .stack{display:grid; gap:13px}
+
+    .bottom-nav{
+      position:absolute; bottom:0; left:0; right:0; height:84px;
+      background:rgba(255,255,255,.78); backdrop-filter:blur(24px) saturate(160%);
+      border-top:1px solid var(--hairline); display:flex; justify-content:space-around; padding:11px 14px 22px; z-index:30;
+    }
+    .nav-item{
+      background:transparent; box-shadow:none; border:0; padding:7px 10px; color:var(--faint);
+      font-size:10.5px; font-weight:600; display:grid; gap:3px; justify-items:center; border-radius:14px; min-width:54px;
+      transition:color .16s ease, background .16s ease;
+    }
+    .nav-item:hover{background:transparent; box-shadow:none; transform:none; color:var(--muted)}
+    .nav-item b{font-size:18px; line-height:1; font-weight:400}
+    .nav-item.active{background:transparent; color:var(--indigo)}
+
+    .timer-ring{
+      width:200px; height:200px; margin:22px auto; border-radius:50%;
+      background:conic-gradient(var(--indigo-2) var(--p, 18%), #ece6fb 0);
+      display:grid; place-items:center;
+      box-shadow:inset 0 0 0 16px #fff, 0 22px 48px -20px rgba(90,69,200,.5);
+      transition:background .25s linear;
+    }
+    .timer-core{width:148px; height:148px; background:#fff; border-radius:50%; display:grid; place-items:center; text-align:center; padding:18px; box-shadow:0 2px 14px rgba(60,45,87,.08)}
+    .timer-core strong{font-size:46px; letter-spacing:-2px; display:block; font-weight:800; color:var(--ink)}
+
+    textarea{
+      width:100%; min-height:210px; resize:none; border:1px solid var(--line); border-radius:20px; padding:18px;
+      font:500 16px/1.5 ui-rounded, system-ui, sans-serif; color:var(--ink); background:#fff; outline:none;
+      box-shadow:var(--cardShadow); transition:border-color .16s ease, box-shadow .16s ease;
+    }
+    textarea:focus{border-color:rgba(90,69,200,.45); box-shadow:0 0 0 4px rgba(90,69,200,.1), var(--cardShadow)}
+
+    .reflection-card{background:linear-gradient(175deg,#ffffff,#f8f4ff); border:1px solid rgba(90,69,200,.12); border-radius:var(--radius); padding:20px; box-shadow:var(--cardShadow);}
+    .raw-entry{font-family:inherit; background:#fffaf6; border:1px solid rgba(255,159,180,.28); padding:16px; border-radius:16px; color:#4c4459; font-size:15px; line-height:1.5; font-weight:450}
+    .label{font-size:10.5px; text-transform:uppercase; letter-spacing:.1em; font-weight:800; color:var(--indigo); margin-bottom:8px}
+
+    .split{display:grid; grid-template-columns:1fr 1fr; gap:11px}
+    .metric{background:#fff; border:1px solid var(--hairline); border-radius:16px; padding:14px; text-align:center; box-shadow:var(--cardShadow)}
+    .metric strong{display:block; font-size:22px; letter-spacing:-.6px; font-weight:800}
+    .metric span{font-size:11px; color:var(--muted); font-weight:600}
+
+    .river-wrap{
+      height:246px; background:linear-gradient(180deg,#ffffff,#f1f9ff); border-radius:var(--radius-lg);
+      border:1px solid rgba(189,231,255,.55); position:relative; overflow:hidden;
+      box-shadow:inset 0 -30px 60px -30px rgba(140,190,235,.4), var(--cardShadow);
+    }
+    .river-svg{position:absolute; inset:0; width:100%; height:100%}
+    .hotspot{
+      position:absolute; width:42px; height:42px; border-radius:50%; display:grid; place-items:center;
+      border:1.5px solid rgba(255,255,255,.95); background:#fff;
+      box-shadow:0 8px 22px -8px rgba(53,74,111,.5); cursor:pointer; font-size:18px;
+      transition:transform .18s cubic-bezier(.2,.9,.2,1);
+    }
+    .hotspot:hover{transform:scale(1.1)}
+    .hotspot:active{transform:scale(1.02)}
+    .h1{left:54px; top:110px}.h2{left:125px; top:76px}.h3{left:180px; top:129px}.h4{left:257px; top:88px}
+    .bubble-tip{
+      display:none; position:absolute; left:18px; right:18px; bottom:16px;
+      background:rgba(255,255,255,.92); border:1px solid var(--line); border-radius:18px; padding:14px 16px;
+      box-shadow:0 14px 36px -14px rgba(49,40,68,.4); font-size:13px; color:#4c4459; line-height:1.45; font-weight:450;
+      backdrop-filter:blur(12px);
+    }
+    .bubble-tip.active{display:block; animation:screenIn .24s}
+
+    .segment-row{display:flex; gap:7px; margin:16px 0 0}
+    .day-dot{
+      height:38px; flex:1; border-radius:13px; display:grid; place-items:center; font-size:12px; font-weight:700;
+      color:#fff; border:1px solid rgba(255,255,255,.6); cursor:pointer;
+      box-shadow:var(--cardShadow); transition:transform .16s ease;
+    }
+    .day-dot:hover{transform:translateY(-2px)}
+    .water{background:linear-gradient(160deg,#9fd8ff,#bcb0f5); color:#22384a}
+    .rapid{background:linear-gradient(160deg,#c4b1f5,#ff9fb4); color:#5a2c40}
+    .mist{background:linear-gradient(160deg,#eef0f6,#fff); color:#8a8398; border-color:var(--hairline)}
+    .glimmer{background:linear-gradient(160deg,#ffe27a,#ffcaa0); color:#6b4a1e}
+
+    .share-card{
+      height:392px; border-radius:var(--radius-lg); overflow:hidden; position:relative;
+      background:linear-gradient(160deg,#fff4fb,#eef8ff 60%,#f6f1ff);
+      border:1px solid rgba(255,255,255,.9); box-shadow:var(--cardShadow);
+      padding:26px; display:flex; flex-direction:column; justify-content:space-between;
+    }
+    .share-card:before{content:""; position:absolute; left:-60px; top:64px; width:490px; height:190px; background:radial-gradient(ellipse at 30% 55%, rgba(189,231,255,.6), transparent 62%), radial-gradient(ellipse at 65% 35%, rgba(205,188,255,.55), transparent 60%); transform:rotate(-12deg); border-radius:50%;}
+    .share-river{position:absolute; left:0; right:0; top:120px; height:150px; opacity:.95}
+    .share-content{position:relative; z-index:1}
+    .share-title{font-size:31px; line-height:1.04; font-weight:800; letter-spacing:-1.2px; color:#241d33; max-width:272px}
+    .share-line{font-size:14.5px; font-weight:600; color:#675a78; margin-top:11px}
+    .wm{font-weight:800; font-size:14px; letter-spacing:-.2px; color:#352c46; display:flex; align-items:center; gap:7px}
+
+    .toggle-row{display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; margin:14px 0}
+    .toggle-row button{font-size:13px; padding:11px 8px; background:#fff; color:var(--muted); border:1px solid var(--line); box-shadow:var(--cardShadow); font-weight:600}
+    .toggle-row button:hover{background:#faf8ff}
+    .toggle-row button.selected{background:var(--deep); color:#fff; border-color:var(--deep); box-shadow:0 10px 22px -10px rgba(42,36,64,.6)}
+
+    .landing-shell{background:#fff; border-radius:var(--radius); padding:18px; border:1px solid var(--hairline); box-shadow:var(--cardShadow)}
+    .mini-share{height:212px; border-radius:20px; background:linear-gradient(150deg,#fff1f8,#e9f7ff); position:relative; overflow:hidden; padding:20px; margin-bottom:14px}
+    .mini-share:after{content:""; position:absolute; left:-40px; right:-30px; top:74px; height:86px; background:linear-gradient(90deg, rgba(189,231,255,.7),rgba(205,188,255,.7),rgba(255,159,180,.55)); border-radius:50%; transform:rotate(-10deg)}
+
+    .letter{background:#fffdf7; border:1px solid rgba(255,202,160,.55); border-radius:var(--radius); padding:20px; box-shadow:var(--cardShadow); position:relative; overflow:hidden;}
+    .letter:before{content:""; position:absolute; left:20px; right:20px; top:0; height:10px; background:repeating-linear-gradient(45deg,var(--rose) 0 12px,#fff 12px 24px,var(--blue) 24px 36px,#fff 36px 48px); border-radius:0 0 10px 10px; opacity:.7}
+
+    .paywall{background:linear-gradient(180deg,#ffffff,#f7f3ff); border:1px solid rgba(205,188,255,.5); border-radius:var(--radius-lg); padding:24px; box-shadow:var(--cardShadow)}
+    .price{display:flex; align-items:baseline; gap:5px; margin:14px 0}.price strong{font-size:44px; letter-spacing:-2px; font-weight:800}.price span{color:var(--muted); font-weight:600}
+    .check{display:flex; gap:10px; align-items:flex-start; font-size:14.5px; color:#4c4459; margin:11px 0; font-weight:500}.check b{color:#3aa074; font-weight:800}
+
+    .toast{
+      position:absolute; left:22px; right:22px; bottom:100px; background:var(--deep); color:#fff;
+      padding:15px 18px; border-radius:16px; box-shadow:0 20px 40px -16px rgba(28,24,48,.7);
+      font-weight:600; font-size:14px; display:none; z-index:99;
+    }
+    .toast.show{display:block; animation:toast .26s cubic-bezier(.2,.9,.2,1)}
+    @keyframes toast{from{opacity:0; transform:translateY(10px)}to{opacity:1; transform:none}}
+
+    /* Right-hand notes panel */
+    .notes{max-width:520px; align-self:stretch; display:flex; flex-direction:column; justify-content:center;}
+    .notes-panel{background:rgba(255,255,255,.7); border:1px solid rgba(255,255,255,.85); border-radius:var(--radius-lg); padding:28px; box-shadow:var(--softShadow); backdrop-filter:blur(24px) saturate(160%)}
+    .notes h2{font-size:32px; letter-spacing:-1.2px}
+    .flow-list{display:grid; gap:11px; margin:20px 0}
+    .flow-item{display:flex; gap:12px; align-items:flex-start; background:#fff; border:1px solid var(--hairline); border-radius:18px; padding:14px; box-shadow:var(--cardShadow)}
+    .flow-item b{background:linear-gradient(135deg,#efeaff,#e6f4ff); min-width:30px; height:30px; display:grid; place-items:center; border-radius:11px; color:var(--indigo); font-weight:800}
+    .flow-item span{font-size:14px; line-height:1.42; color:#544c66; font-weight:450}
+    .caption{font-size:12px; color:var(--faint); line-height:1.5; margin-top:16px; font-weight:450}
+    .progress{height:8px; background:#ece6f5; border-radius:999px; overflow:hidden; margin:14px 0}
+    .bar{height:100%; width:42%; background:linear-gradient(90deg,var(--rose),var(--lav),var(--blue)); border-radius:inherit}
+    .copy-block{background:var(--deep); color:#fff; border-radius:18px; padding:16px 18px; font-size:13px; line-height:1.5; margin-top:14px; font-weight:500; white-space:pre-wrap}
+
+    @media (max-width:860px){body{grid-template-columns:1fr; padding:18px; gap:28px}.notes{order:2}.phone{height:800px}.app{height:750px}.screen{padding-bottom:96px}}
+  </style>
+</head>
+<body>
+  <main class="phone-wrap">
+    <div class="phone">
+      <div class="notch"></div>
+      <div class="status"><span>9:41</span><span>5G ◜</span></div>
+      <div class="app">
+        <section class="screen active" id="s-onboard">
+          <div class="brand-row"><div class="brand"><span class="drop"></span>ninety</div><div class="chip">v1 ritual</div></div>
+          <div class="hero-card">
+            <div class="eyebrow">for loud-brain days</div>
+            <h1>One honest minute, before the day explains itself away.</h1>
+            <p class="big-copy">A tiny daily prompt. 90 seconds. Saved as you wrote it. Watch your words become a river.</p>
+            <div class="button-row">
+              <button onclick="show('s-timer')">Start my first 90</button>
+              <button class="secondary" onclick="show('s-river')">Peek at the river</button>
+            </div>
+          </div>
+          <div class="stack" style="margin-top:14px">
+            <div class="card"><div class="label">why it feels different</div><h3>No blank page. No streak shame.</h3><p>ninety finds you once a day inside a time window you choose. Missing days become mist, not failure.</p></div>
+            <div class="split">
+              <div class="metric"><strong>90s</strong><span>hard timer</span></div>
+              <div class="metric"><strong>3/7</strong><span>river unlock</span></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="screen" id="s-timer">
+          <div class="brand-row"><button class="secondary small-btn" onclick="show('s-onboard')">←</button><div class="chip">today's prompt</div></div>
+          <h2>What is still open in you?</h2>
+          <p>Do not polish it. Catch it.</p>
+          <div class="timer-ring" id="timerRing" style="--p:13%"><div class="timer-core"><strong id="timerText">90</strong><span class="tiny">seconds left</span></div></div>
+          <textarea id="entryText" spellcheck="false">I woke up already behind. There are messages I have not answered and I can feel the whole day leaning on me. I do not even know what I need, I just want it to be quiet for ten minutes.</textarea>
+          <div class="button-row">
+            <button onclick="finishEntry()">Save exactly as written</button>
+            <button class="secondary" onclick="startFastTimer()">Preview timer</button>
+          </div>
+          <p class="tiny">Cute interaction: the ring gets softer, not scarier. The last 10 seconds pulse like a tiny heartbeat.</p>
+        </section>
+
+        <section class="screen" id="s-reflection">
+          <div class="brand-row"><button class="secondary small-btn" onclick="show('s-timer')">←</button><div class="chip">entry saved</div></div>
+          <h2>Saved as you wrote it.</h2>
+          <div class="stack">
+            <div class="card">
+              <div class="label">your words</div>
+              <div class="raw-entry" id="rawEntry">I woke up already behind...</div>
+            </div>
+            <div class="reflection-card">
+              <div class="label">ninety noticed</div>
+              <h3>The day arrived already crowded.</h3>
+              <p>“Quiet for ten minutes” feels less like a small request and more like the thing your whole entry was reaching for.</p>
+              <div class="pill-row"><span class="pill">behind</span><span class="pill">quiet</span><span class="pill">day leaning on me</span></div>
+              <div class="button-row">
+                <button class="small-btn mint" onclick="toast('Saved: this reflection felt true')">Felt true</button>
+                <button class="small-btn secondary" onclick="toast('Got it. Future reflections will be less intense.')">Too intense</button>
+                <button class="small-btn ghost" onclick="toast('Hidden from Noticed')">Hide</button>
+              </div>
+            </div>
+            <button onclick="show('s-mark')">Add my first river mark</button>
+          </div>
+        </section>
+
+        <section class="screen" id="s-mark">
+          <div class="brand-row"><button class="secondary small-btn" onclick="show('s-reflection')">←</button><div class="chip">day 1</div></div>
+          <h2>A mark appeared.</h2>
+          <p>Your words made the first bend in the river.</p>
+          <div class="river-wrap" style="height:300px">
+            <svg class="river-svg" viewBox="0 0 350 280" preserveAspectRatio="none">
+              <path d="M-20 177 C80 112, 105 209, 180 150 S283 90, 372 151" fill="none" stroke="#d8ccff" stroke-width="56" stroke-linecap="round" opacity=".86"/>
+              <path d="M-10 176 C80 120, 110 198, 180 151 S280 102, 362 151" fill="none" stroke="#bde7ff" stroke-width="36" stroke-linecap="round" opacity=".95"/>
+              <circle cx="94" cy="154" r="18" fill="#ffe77a" opacity=".85"/>
+              <circle cx="175" cy="150" r="13" fill="#fff" opacity=".8"/>
+            </svg>
+            <div class="hotspot h2" onclick="tip('Your first mark: high pressure, strong image, one request for quiet.')">💧</div>
+            <div class="bubble-tip" id="markTip">Tap the droplet to read the mark.</div>
+          </div>
+          <div class="card" style="margin-top:14px">
+            <div class="label">notification permission after value</div>
+            <h3>Want tomorrow’s 90 seconds to find you?</h3>
+            <p>Choose a window. ninety picks the exact moment.</p>
+            <div class="pill-row"><span class="pill">Morning</span><span class="pill">Afternoon</span><span class="pill">Never after 10pm</span></div>
+            <div class="button-row"><button onclick="toast('Window saved: 8:30-11:30am')">Let it find me</button><button class="secondary" onclick="show('s-river')">Not now</button></div>
+          </div>
+        </section>
+
+        <section class="screen" id="s-river">
+          <div class="brand-row"><button class="secondary small-btn" onclick="show('s-mark')">←</button><div class="chip">7-day artifact</div></div>
+          <h2>Your First Current</h2>
+          <p>4 entries · 2 returns · 3 quiet days</p>
+          <div class="river-wrap">
+            <svg class="river-svg" viewBox="0 0 350 240" preserveAspectRatio="none">
+              <path d="M-24 138 C42 80, 85 82, 128 118 C178 162, 216 154, 256 104 C292 61, 332 84, 374 132" fill="none" stroke="#eadfff" stroke-width="66" stroke-linecap="round" opacity=".95"/>
+              <path d="M-22 139 C42 92, 84 93, 127 120 C177 151, 213 150, 252 108 C293 71, 331 93, 372 132" fill="none" stroke="#bde7ff" stroke-width="44" stroke-linecap="round" opacity=".92"/>
+              <path d="M-22 139 C42 92, 84 93, 127 120 C177 151, 213 150, 252 108 C293 71, 331 93, 372 132" fill="none" stroke="#ffffff" stroke-width="8" stroke-linecap="round" opacity=".65" stroke-dasharray="26 28"/>
+              <circle cx="62" cy="116" r="18" fill="#ffb8c6" opacity=".9"/>
+              <circle cx="142" cy="126" r="15" fill="#fff" opacity=".85"/>
+              <circle cx="196" cy="141" r="18" fill="#ffe77a" opacity=".8"/>
+              <circle cx="274" cy="92" r="17" fill="#c8f4df" opacity=".85"/>
+            </svg>
+            <div class="hotspot h1" onclick="tip('Rapid: “behind” and “noise” appeared together. This is a private marker.')">🌊</div>
+            <div class="hotspot h2" onclick="tip('Bridge: you came back after a quiet day. Coming back is the habit.')">🌉</div>
+            <div class="hotspot h3" onclick="tip('Glimmer: the tone softened from “I should” to “I need quiet.”')">✨</div>
+            <div class="hotspot h4" onclick="tip('Stone: “quiet” returned across 3 entries.')">🪨</div>
+            <div class="bubble-tip active" id="mainTip">Tap the river stones. Each one explains a private signal without exposing raw text.</div>
+          </div>
+          <div class="segment-row">
+            <div class="day-dot rapid" onclick="tip('Mon: high pressure')">M</div><div class="day-dot mist" onclick="tip('Tue: quiet day, shown as mist')">T</div><div class="day-dot water" onclick="tip('Wed: bridge back')">W</div><div class="day-dot water" onclick="tip('Thu: steady current')">T</div><div class="day-dot mist" onclick="tip('Fri: quiet day')">F</div><div class="day-dot mist" onclick="tip('Sat: quiet day')">S</div><div class="day-dot glimmer" onclick="tip('Sun: softer ending')">S</div>
+          </div>
+          <div class="card" style="margin-top:14px"><div class="label">private interpretation</div><h3>The week that started too fast</h3><p>The river moved from pressure toward a clearer request for quiet. It was not perfect attendance. It was return.</p><div class="button-row"><button onclick="show('s-share')">Make share card</button><button class="secondary" onclick="show('s-noticed')">Open Noticed</button></div></div>
+        </section>
+
+        <section class="screen" id="s-share">
+          <div class="brand-row"><button class="secondary small-btn" onclick="show('s-river')">←</button><div class="chip">share-safe export</div></div>
+          <h2>Make it postable, not exposing.</h2>
+          <p>Raw text is hidden by default. Sensitive themes stay private.</p>
+          <div class="toggle-row"><button id="t-min" class="selected" onclick="setShare('minimal')">Minimal</button><button id="t-poem" onclick="setShare('poetic')">Poetic</button><button id="t-stat" onclick="setShare('stats')">Stats</button></div>
+          <div class="share-card" id="shareCard">
+            <svg class="share-river" viewBox="0 0 360 150" preserveAspectRatio="none">
+              <path d="M-20 92 C50 20, 98 118, 150 82 C207 43, 230 115, 282 74 C316 47, 342 64, 386 96" fill="none" stroke="#d8ccff" stroke-width="54" stroke-linecap="round" opacity=".9"/>
+              <path d="M-20 93 C50 33, 98 106, 150 83 C207 55, 230 105, 282 76 C316 56, 342 69, 386 96" fill="none" stroke="#bde7ff" stroke-width="34" stroke-linecap="round" opacity=".92"/>
+              <circle cx="148" cy="82" r="16" fill="#ffe77a" opacity=".86"/>
+              <circle cx="245" cy="88" r="12" fill="#fff" opacity=".8"/>
+            </svg>
+            <div class="share-content"><div class="eyebrow">my first current</div><div class="share-title" id="shareTitle">this week had rapids, but I came back twice.</div><div class="share-line" id="shareLine">4 entries · 2 returns · made with ninety</div></div>
+            <div class="share-content wm"><span class="drop" style="width:18px;height:18px"></span> ninety</div>
+          </div>
+          <div class="button-row"><button onclick="toast('Share sheet opened')">Open share sheet</button><button class="secondary" onclick="show('s-landing')">Preview friend tap</button></div>
+        </section>
+
+        <section class="screen" id="s-landing">
+          <div class="brand-row"><button class="secondary small-btn" onclick="show('s-share')">←</button><div class="chip">viral landing</div></div>
+          <h2>When a friend taps the story.</h2>
+          <div class="landing-shell">
+            <div class="mini-share"><div style="position:relative;z-index:1;font-weight:800;font-size:26px;line-height:1.04;letter-spacing:-1px">this week had rapids,<br>but I came back twice.</div><div style="position:absolute;bottom:16px;left:20px;z-index:1;font-weight:700;color:#675a78">made with ninety</div></div>
+            <h3>Make your first current.</h3>
+            <p>Write for 90 seconds a day. Unlock a private 7-day river after 3 entries.</p>
+            <div class="button-row"><button onclick="show('s-onboard')">Start mine</button><button class="secondary" onclick="toast('App Store handoff')">Send to App Store</button></div>
+          </div>
+          <div class="copy-block">Viral CTA: Not “download a journal app.”
+Instead: “make your first current.”</div>
+        </section>
+
+        <section class="screen" id="s-noticed">
+          <div class="brand-row"><button class="secondary small-btn" onclick="show('s-river')">←</button><div class="chip">paid habit value</div></div>
+          <h2>Noticed</h2>
+          <p>A private shelf of reflections, patterns, and returns.</p>
+          <div class="stack">
+            <div class="card"><div class="label">this week</div><h3>“Quiet” returned 3 times.</h3><p>It showed up beside pressure, messages, and mornings.</p><div class="button-row"><button class="small-btn mint" onclick="toast('Pattern confirmed')">Yes, that’s a thing</button><button class="small-btn secondary" onclick="toast('Rename flow opened')">Rename</button></div></div>
+            <div class="card"><div class="label">return story</div><h3>You came back after 2 quiet days.</h3><p>The river keeps the gap without turning it into a broken streak.</p></div>
+            <div class="card"><div class="label">small pattern</div><h3>Pressure rose when sleep appeared.</h3><p>Not a diagnosis. Just a pattern your words made.</p></div>
+          </div>
+          <div class="button-row"><button onclick="show('s-letter')">Create future letter</button><button class="secondary" onclick="show('s-paywall')">See paid unlocks</button></div>
+        </section>
+
+        <section class="screen" id="s-letter">
+          <div class="brand-row"><button class="secondary small-btn" onclick="show('s-noticed')">←</button><div class="chip">delayed payoff</div></div>
+          <h2>Send this to future you?</h2>
+          <div class="letter">
+            <div class="label">letter seed</div>
+            <h3>“Remember: you were asking for quiet, not a whole new life.”</h3>
+            <p>Open when ready. ninety will not resurface intense entries casually.</p>
+            <div class="pill-row"><span class="pill">7 days</span><span class="pill">30 days</span><span class="pill">90 days</span></div>
+          </div>
+          <div class="button-row"><button onclick="toast('Future letter scheduled for 30 days')">Send in 30 days</button><button class="secondary" onclick="toast('Saved as draft')">Save draft</button></div>
+          <div class="card" style="margin-top:14px"><div class="label">cute retention loop</div><p>The app becomes emotionally valuable later, not just immediately. This creates a reason to come back that does not rely on guilt.</p></div>
+        </section>
+
+        <section class="screen" id="s-paywall">
+          <div class="brand-row"><button class="secondary small-btn" onclick="show('s-noticed')">←</button><div class="chip">after first value</div></div>
+          <div class="paywall">
+            <div class="eyebrow">unlock the full river</div>
+            <h2>Keep seeing what your words become.</h2>
+            <div class="price"><strong>$44.99</strong><span>/ year</span></div>
+            <div class="check"><b>✓</b><span>Monthly and yearly rivers</span></div>
+            <div class="check"><b>✓</b><span>Pattern callbacks after enough data</span></div>
+            <div class="check"><b>✓</b><span>Future-self letters and private Noticed shelf</span></div>
+            <div class="check"><b>✓</b><span>Share-card themes with privacy controls</span></div>
+            <div class="button-row"><button onclick="toast('Trial started')">Start 14-day trial</button><button class="secondary" onclick="toast('Monthly option opened')">Monthly</button></div>
+            <p class="tiny">Paywall appears after the user has seen a reflection and a river mark, not cold on launch.</p>
+          </div>
+        </section>
+
+        <div class="bottom-nav">
+          <button class="nav-item" onclick="show('s-onboard')"><b>⌂</b>Start</button>
+          <button class="nav-item" onclick="show('s-timer')"><b>⏱</b>Write</button>
+          <button class="nav-item" onclick="show('s-river')"><b>〰</b>River</button>
+          <button class="nav-item" onclick="show('s-share')"><b>↗</b>Share</button>
+          <button class="nav-item" onclick="show('s-noticed')"><b>✦</b>Noticed</button>
+        </div>
+        <div class="toast" id="toast"></div>
+      </div>
+    </div>
+  </main>
+
+  <aside class="notes">
+    <div class="notes-panel">
+      <div class="brand" style="margin-bottom:12px"><span class="drop"></span> clickable UX concept</div>
+      <h2>Cute, viral, but still private.</h2>
+      <p>This prototype turns ninety into a shareable ritual: the user writes, gets one precise reflection, sees a river mark, unlocks a 7-day artifact, then exports a safe story card.</p>
+      <div class="progress"><div class="bar"></div></div>
+      <div class="flow-list">
+        <div class="flow-item"><b>1</b><span><strong>First value before permissions:</strong> write first, then ask for notification windows.</span></div>
+        <div class="flow-item"><b>2</b><span><strong>Meaningful cuteness:</strong> mist, bridges, glimmers, stones. Cute metaphors with real data meaning.</span></div>
+        <div class="flow-item"><b>3</b><span><strong>Viral object:</strong> share card hides raw text by default and sells “make your first current.”</span></div>
+        <div class="flow-item"><b>4</b><span><strong>Retention:</strong> future letters and Noticed shelf create delayed payoff without streak guilt.</span></div>
+      </div>
+      <div class="copy-block">Design north star:
+“Here is the shape your words made.”</div>
+      <p class="caption">Click the phone buttons, river markers, day pills, share styles, and feedback chips. This is intentionally built as a frontend-only prototype for product/design review.</p>
+    </div>
+  </aside>
+
+  <script>
+    const screens = Array.from(document.querySelectorAll('.screen'));
+    const navItems = Array.from(document.querySelectorAll('.nav-item'));
+    let timerInterval;
+    function show(id){
+      screens.forEach(s=>s.classList.toggle('active', s.id===id));
+      const map = {'s-onboard':0,'s-timer':1,'s-reflection':1,'s-mark':2,'s-river':2,'s-share':3,'s-landing':3,'s-noticed':4,'s-letter':4,'s-paywall':4};
+      navItems.forEach((n,i)=>n.classList.toggle('active', map[id]===i));
+      clearInterval(timerInterval);
+      const app = document.querySelector('.app');
+      app.scrollTop = 0;
+    }
+    function toast(msg){
+      const t=document.getElementById('toast');
+      t.textContent=msg; t.classList.add('show');
+      setTimeout(()=>t.classList.remove('show'),1800);
+    }
+    function finishEntry(){
+      const text=document.getElementById('entryText').value.trim();
+      document.getElementById('rawEntry').textContent=text || 'No polishing. No editing. Saved as written.';
+      show('s-reflection');
+    }
+    function startFastTimer(){
+      clearInterval(timerInterval);
+      let n=90;
+      const text=document.getElementById('timerText');
+      const ring=document.getElementById('timerRing');
+      timerInterval=setInterval(()=>{
+        n-=3;
+        if(n<0){ clearInterval(timerInterval); finishEntry(); return; }
+        text.textContent=n;
+        ring.style.setProperty('--p', (100-(n/90*100))+'%');
+      },220);
+    }
+    function tip(text){
+      const el=document.getElementById('mainTip') || document.getElementById('markTip');
+      document.querySelectorAll('.bubble-tip').forEach(b=>{b.textContent=text; b.classList.add('active')});
+    }
+    function setShare(mode){
+      ['t-min','t-poem','t-stat'].forEach(id=>document.getElementById(id).classList.remove('selected'));
+      const data={
+        minimal:['my first current','4 entries · 2 returns · made with ninety','t-min'],
+        poetic:['this week had rapids, but I came back twice.','4 entries · 2 returns · made with ninety','t-poem'],
+        stats:['4 entries. 3 quiet days. 2 returns.','my week, as a river · made with ninety','t-stat']
+      }[mode];
+      document.getElementById('shareTitle').textContent=data[0];
+      document.getElementById('shareLine').textContent=data[1];
+      document.getElementById(data[2]).classList.add('selected');
+    }
+    show('s-onboard');
+  </script>
+</body>
+</html>

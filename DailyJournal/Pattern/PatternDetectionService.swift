@@ -67,9 +67,9 @@ final class PatternDetectionService {
             return .safetyRouted
         }
 
-        // Detect (LLM if we have a key, else local fallback).
+        // Detect (LLM when AI is available, else local fallback).
         let raws: PatternDetectionRaw
-        if AIService.shared.hasApiKey {
+        if AIService.shared.isAIAvailable {
             guard let result = try? await AIService.shared
                 .detectPatterns(indexedEntries: window.map { snippet(for: $0) })
             else { return .noPattern }

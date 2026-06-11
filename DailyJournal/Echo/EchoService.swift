@@ -20,6 +20,16 @@ final class EchoService {
         db.collection("users").document(userId).collection("echoes")
     }
 
+    // Cache-first read (mirrors JournalService): serve the warm on-disk cache
+    // instantly and only hit the network when the cache is cold. Keeps echoes
+    // surfacing offline and on first paint.
+    private func getDocuments(_ query: Query) async throws -> QuerySnapshot {
+        if let cached = try? await query.getDocuments(source: .cache), !cached.isEmpty {
+            return cached
+        }
+        return try await query.getDocuments(source: .default)
+    }
+
     // MARK: - Create
 
     /// Fire-and-forget. Writes to local cache immediately.
@@ -37,22 +47,51 @@ final class EchoService {
     /// Also schedules a background decay pass to expire stale echoes — this
     /// runs fire-and-forget and never blocks the caller.
     func fetchTopPendingEcho(for userId: String) async throws -> Echo? {
-        let now = Timestamp(date: Date())
+        let now = Date()
 
-        let snapshot = try await collection(for: userId)
-            .whereField("status",          isEqualTo: EchoStatus.pending.rawValue)
-            .whereField("surfaceAfterDate", isLessThanOrEqualTo: now)
-            .order(by: "surfaceAfterDate", descending: false) // oldest surface date first
-            .order(by: "confidence",       descending: true)  // highest confidence wins
-            .limit(to: 1)
-            .getDocuments()
+        // Single-field equality only (auto-indexed) — combining an inequality with
+        // an order-by on a *different* field (confidence) previously required a
+        // composite index that wasn't deployed, so this query silently threw and
+        // no echo ever surfaced. We now fetch pending echoes and do the surface-date
+        // gate + highest-confidence pick on the client. Cache-first so it works
+        // offline and on first paint.
+        let snapshot = try await getDocuments(
+            collection(for: userId)
+                .whereField("status", isEqualTo: EchoStatus.pending.rawValue)
+                .limit(to: 50)
+        )
 
         // Schedule decay asynchronously — never awaited
         Task.detached(priority: .background) { [weak self] in
             try? await self?.decayExpiredEchoes(for: userId)
         }
 
-        return snapshot.documents.compactMap { Echo(from: $0.data()) }.first
+        return snapshot.documents
+            .compactMap { Echo(from: $0.data()) }
+            .filter { $0.surfaceAfterDate <= now }
+            // Highest confidence first; tie-break on the oldest surface date.
+            .sorted {
+                if $0.confidence != $1.confidence { return $0.confidence > $1.confidence }
+                return $0.surfaceAfterDate < $1.surfaceAfterDate
+            }
+            .first
+    }
+
+    // MARK: - Browse (Echoes feed)
+
+    /// Recent echoes for the Echoes/Memories feed — newest source-entry first.
+    /// Unlike `fetchTopPendingEcho`, this is for browsing, so it returns pending
+    /// AND answered echoes (the feed shows resurfaced moments, answered or not)
+    /// and ignores the surface-after gate. Dismissed/expired are filtered out.
+    func fetchAll(for userId: String, limit: Int = 12) async throws -> [Echo] {
+        let snapshot = try await collection(for: userId)
+            .order(by: "sourceEntryCreatedAt", descending: true)
+            .limit(to: limit)
+            .getDocuments()
+
+        return snapshot.documents
+            .compactMap { Echo(from: $0.data()) }
+            .filter { $0.status == .pending || $0.status == .answered }
     }
 
     // MARK: - Skip / decay

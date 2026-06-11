@@ -23,6 +23,12 @@ struct RootView: View {
             }
         }
         .animation(.easeInOut(duration: 0.4), value: authViewModel.authState)
+        // The whole design system is a fixed light pastel palette (AppTheme uses
+        // hardcoded light colours, no dark variants). In dark mode the system
+        // label colour flips to white and renders invisibly on our warm-white
+        // surfaces (e.g. the "Journal" large title). Pin the app to light so the
+        // palette always has the contrast it was designed for.
+        .preferredColorScheme(.light)
     }
 }
 
@@ -68,14 +74,19 @@ struct MainTabView: View {
                     Label("Journal", systemImage: "book")
                 }
 
+            RiverView(userId: authViewModel.currentUser?.id ?? "")
+                .tabItem {
+                    Label("River", systemImage: "drop")
+                }
+
             PatternsView(userId: authViewModel.currentUser?.id ?? "")
                 .tabItem {
                     Label("Patterns", systemImage: "waveform.path")
                 }
 
-            ProfileView()
+            EchoesView(userId: authViewModel.currentUser?.id ?? "")
                 .tabItem {
-                    Label("Profile", systemImage: "person")
+                    Label("Echoes", systemImage: "sparkles")
                 }
         }
         .tint(AppTheme.terracotta)

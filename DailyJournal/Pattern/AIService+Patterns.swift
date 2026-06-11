@@ -41,38 +41,13 @@ extension AIService {
     /// Runs pattern detection over an indexed, chronological list of entries.
     /// `indexedEntries[i]` corresponds to evidence index `i` in the result.
     func detectPatterns(indexedEntries: [String]) async throws -> PatternDetectionRaw {
-        guard hasApiKey else { throw AIError.noApiKey }
+        guard isAIAvailable else { throw AIError.aiUnavailable }
         guard indexedEntries.count >= 6 else {
             return PatternDetectionRaw(safetyFlag: false, callbacks: [])
         }
 
-        let url = URL(string:
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=\(apiKey)"
-        )!
-
         let prompt = buildPatternPrompt(indexedEntries: indexedEntries)
-
-        let requestBody: [String: Any] = [
-            "contents": [["parts": [["text": prompt]]]],
-            "generationConfig": [
-                "responseMimeType": "application/json",
-                "maxOutputTokens":  700,
-                "temperature":      0.3
-            ]
-        ]
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
-        request.timeoutInterval = 25
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else { throw AIError.invalidResponse }
-        guard (200..<300).contains(http.statusCode) else {
-            let body = String(data: data, encoding: .utf8) ?? ""
-            throw AIError.httpError(http.statusCode, body)
-        }
+        let data = try await generate(prompt: prompt, maxTokens: 700, temperature: 0.3)
         return try parsePatternResponse(data)
     }
 

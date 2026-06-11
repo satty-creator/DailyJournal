@@ -36,6 +36,39 @@ final class JournalService {
             .setData(entry.toFirestoreData())
     }
 
+    // MARK: - Save a hint-ladder trace
+    //
+    // A "trace" is the ladder's floor: the user couldn't (or didn't want to)
+    // write or talk, but still showed up. We persist a tiny presence mark so the
+    // day still becomes a pebble in the river. The raw-entry pipelines (insights,
+    // echoes, Gemini river marks) all guard on length and harmlessly no-op on
+    // these — a trace is never analysed or "noticed".
+    @discardableResult
+    func saveTrace(userId: String, pebbles: [String], feelings: [String] = [], blank: Bool) -> JournalEntry {
+        let summary: String
+        if blank {
+            summary = "A blank present — showed up with no words today."
+        } else if !feelings.isEmpty {
+            summary = "A trace: " + feelings.joined(separator: " · ")
+        } else if !pebbles.isEmpty {
+            summary = "A trace: " + pebbles.joined(separator: " · ")
+        } else {
+            summary = "A quiet trace — present, without words."
+        }
+
+        var tags = pebbles
+        tags.append(blank ? "blank-drop" : "trace")
+
+        let entry = JournalEntry(
+            userId:      userId,
+            content:     summary,
+            tags:        tags,
+            sessionType: .ninetySecond
+        )
+        createEntry(entry)
+        return entry
+    }
+
     // MARK: - Update
     func updateEntry(_ entry: JournalEntry) {
         var data = entry.toFirestoreData()

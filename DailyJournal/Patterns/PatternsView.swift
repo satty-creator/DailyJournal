@@ -171,14 +171,14 @@ struct PatternsView: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                AppTheme.paper.ignoresSafeArea()
+                pastelBackground.ignoresSafeArea()
 
                 if vm.isLoading {
                     ProgressView("Reading your patterns…")
                         .tint(AppTheme.terracotta)
                 } else {
                     ScrollView {
-                        VStack(alignment: .leading, spacing: 32) {
+                        VStack(alignment: .leading, spacing: 18) {
                             if vm.hasWeeklyRecap { weeklyRecapSection }
                             resilienceCard
                             activityGrid
@@ -186,11 +186,12 @@ struct PatternsView: View {
                             statsRow
                             if !vm.frequentWords.isEmpty { wordsCloud }
                             if !vm.frequentTags.isEmpty  { tagsSection }
-                            Spacer(minLength: 80)
+                            Spacer(minLength: 90)
                         }
                         .padding(.horizontal, 20)
                         .padding(.top, 16)
                     }
+                    .scrollIndicators(.hidden)
                 }
             }
             .navigationTitle("Patterns")
@@ -198,6 +199,16 @@ struct PatternsView: View {
             .task { await vm.load() }
             .refreshable { await vm.load() }
         }
+    }
+
+    // MARK: - Background
+    // Same soft pastel wash the River tab uses, so the two analytic surfaces
+    // feel like siblings rather than two different apps.
+    private var pastelBackground: some View {
+        LinearGradient(
+            colors: [AppTheme.paper, AppTheme.rose2.opacity(0.4), AppTheme.blue.opacity(0.3)],
+            startPoint: .topLeading, endPoint: .bottomTrailing
+        )
     }
 
     // MARK: - Weekly recap
@@ -219,189 +230,207 @@ struct PatternsView: View {
     }
 
     // MARK: - Resilience card
+    // A soft pastel card with a conic-gradient ring (echoes the 90-second timer
+    // ring and the River's vocabulary) instead of the old dark editorial slab.
     private var resilienceCard: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("RESILIENCE SCORE")
-                        .font(AppTheme.mono(size: 10))
-                        .foregroundStyle(AppTheme.inkSoft)
-                        .tracking(2)
-                    Text(vm.resilienceLabel)
-                        .font(AppTheme.editorialDisplay(size: 28))
-                        .foregroundStyle(AppTheme.cream)
-                }
-                Spacer()
-                VStack(spacing: 2) {
+        HStack(spacing: 18) {
+            ZStack {
+                Circle()
+                    .stroke(AppTheme.paperWarm, lineWidth: 13)
+                Circle()
+                    .trim(from: 0, to: max(0.02, CGFloat(vm.resilienceScore) / 30.0))
+                    .stroke(
+                        AngularGradient(
+                            colors: [AppTheme.rose, AppTheme.lav, AppTheme.blue, AppTheme.mint, AppTheme.rose],
+                            center: .center
+                        ),
+                        style: StrokeStyle(lineWidth: 13, lineCap: .round)
+                    )
+                    .rotationEffect(.degrees(-90))
+                    .animation(.spring(response: 0.8), value: vm.resilienceScore)
+                VStack(spacing: 0) {
                     Text("\(vm.resilienceScore)")
-                        .font(AppTheme.editorialDisplay(size: 52))
-                        .foregroundStyle(AppTheme.cream)
-                    Text("of 30 days")
-                        .font(AppTheme.mono(size: 11))
-                        .foregroundStyle(AppTheme.cream.opacity(0.6))
-                        .tracking(1)
+                        .font(AppTheme.editorialDisplay(size: 38))
+                        .foregroundStyle(AppTheme.ink)
+                    Text("of 30")
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .foregroundStyle(AppTheme.inkSoft)
                 }
             }
+            .frame(width: 118, height: 118)
 
-            // Progress bar
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(AppTheme.cream.opacity(0.2))
-                        .frame(height: 6)
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(AppTheme.cream)
-                        .frame(width: geo.size.width * CGFloat(vm.resilienceScore) / 30.0, height: 6)
-                        .animation(.spring(response: 0.8), value: vm.resilienceScore)
-                }
+            VStack(alignment: .leading, spacing: 7) {
+                sectionLabel("Resilience")
+                Text(vm.resilienceLabel)
+                    .font(AppTheme.editorialDisplay(size: 25))
+                    .foregroundStyle(AppTheme.ink)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("No streak to break. Just showing up.")
+                    .font(AppTheme.editorialBody(size: 13))
+                    .foregroundStyle(AppTheme.inkSoft)
+                    .italic()
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .frame(height: 6)
-
-            Text("No streak to break. Just showing up.")
-                .font(AppTheme.editorialBody(size: 13))
-                .foregroundStyle(AppTheme.cream.opacity(0.7))
-                .italic()
+            Spacer(minLength: 0)
         }
-        .padding(20)
-        .background(AppTheme.ink)
-        .clipShape(RoundedRectangle(cornerRadius: 20))
+        .softCard(cornerRadius: 28)
     }
 
     // MARK: - Activity grid (last 30 days)
+    // Soft pastel "pebbles" — journaled days glow rose→lavender, quiet days
+    // sit as pale mist. Cute, but still a legible 30-day read.
+    private var pebbleFill: LinearGradient {
+        LinearGradient(colors: [AppTheme.rose, AppTheme.lav],
+                       startPoint: .topLeading, endPoint: .bottomTrailing)
+    }
+
     private var activityGrid: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 14) {
             sectionLabel("Last 30 days")
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 10), spacing: 4) {
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 10), spacing: 6) {
                 ForEach(vm.last30Days, id: \.date) { day in
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(day.hasEntry ? AppTheme.terracotta : AppTheme.paperWarm)
+                    Circle()
+                        .fill(day.hasEntry ? AnyShapeStyle(pebbleFill) : AnyShapeStyle(AppTheme.paperWarm))
                         .aspectRatio(1, contentMode: .fit)
                         .overlay(
-                            day.hasEntry ? nil :
-                            RoundedRectangle(cornerRadius: 3)
-                                .stroke(AppTheme.inkSoft.opacity(0.1), lineWidth: 0.5)
+                            Circle().stroke(AppTheme.cream, lineWidth: day.hasEntry ? 1.5 : 0)
                         )
+                        .shadow(color: day.hasEntry ? AppTheme.rose.opacity(0.25) : .clear,
+                                radius: 4, x: 0, y: 2)
                 }
             }
-            HStack {
-                Circle().fill(AppTheme.paperWarm).frame(width: 10, height: 10)
-                Text("No entry").font(AppTheme.mono(size: 10)).foregroundStyle(AppTheme.inkSoft)
-                Spacer().frame(width: 16)
-                Circle().fill(AppTheme.terracotta).frame(width: 10, height: 10)
-                Text("Journaled").font(AppTheme.mono(size: 10)).foregroundStyle(AppTheme.inkSoft)
+            HStack(spacing: 7) {
+                Circle().fill(AppTheme.paperWarm).frame(width: 11, height: 11)
+                Text("quiet").font(.system(size: 11, weight: .bold, design: .rounded)).foregroundStyle(AppTheme.inkSoft)
+                Spacer().frame(width: 14)
+                Circle().fill(pebbleFill).frame(width: 11, height: 11)
+                Text("journaled").font(.system(size: 11, weight: .bold, design: .rounded)).foregroundStyle(AppTheme.inkSoft)
             }
-            .padding(.top, 2)
+            .padding(.top, 4)
         }
+        .softCard(cornerRadius: 28)
     }
 
     // MARK: - Mood distribution
     private var moodSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 14) {
             sectionLabel("Mood (last 30)")
             ForEach(vm.moodDistribution, id: \.mood) { item in
                 HStack(spacing: 10) {
                     Text(item.mood.faceEmoji)
                         .font(.title3)
                     Text(item.mood.scaleLabel)
-                        .font(.system(size: 14, weight: .medium))
+                        .font(.system(size: 14, weight: .semibold, design: .rounded))
                         .foregroundStyle(AppTheme.ink)
                     Spacer()
                     GeometryReader { geo in
-                        RoundedRectangle(cornerRadius: 3)
-                            .fill(AppTheme.moodColor(item.mood).opacity(0.7))
+                        Capsule()
+                            .fill(LinearGradient(
+                                colors: [AppTheme.moodColor(item.mood).opacity(0.95),
+                                         AppTheme.moodColor(item.mood).opacity(0.45)],
+                                startPoint: .leading, endPoint: .trailing))
                             .frame(
-                                width: geo.size.width * CGFloat(item.count) / CGFloat(max(vm.moodDistribution.first?.count ?? 1, 1)),
-                                height: 8
+                                width: max(12, geo.size.width * CGFloat(item.count) / CGFloat(max(vm.moodDistribution.first?.count ?? 1, 1))),
+                                height: 11
                             )
+                            .frame(maxHeight: .infinity, alignment: .center)
                     }
-                    .frame(height: 8)
+                    .frame(height: 11)
                     Text("\(item.count)")
-                        .font(AppTheme.mono(size: 11))
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
                         .foregroundStyle(AppTheme.inkSoft)
                         .frame(width: 24, alignment: .trailing)
                 }
             }
         }
+        .softCard(cornerRadius: 28)
     }
 
     // MARK: - Stats row
     private var statsRow: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 6) {
             statCell(value: "\(vm.totalEntries)", label: "entries")
-            Divider().frame(height: 40)
             statCell(value: "\(vm.totalWords)", label: "words")
-            Divider().frame(height: 40)
             statCell(value: "\(vm.sessionsThisWeek)", label: "this week")
-            Divider().frame(height: 40)
             statCell(value: "\(vm.ninetySecondSessions)", label: "90-sec")
         }
-        .padding(16)
-        .background(AppTheme.cream)
-        .clipShape(RoundedRectangle(cornerRadius: 16))
+        .softCard(cornerRadius: 28, padding: 18)
     }
 
     private func statCell(value: String, label: String) -> some View {
-        VStack(spacing: 3) {
+        VStack(spacing: 4) {
             Text(value)
                 .font(AppTheme.editorialDisplay(size: 24))
                 .foregroundStyle(AppTheme.ink)
             Text(label)
-                .font(AppTheme.mono(size: 9))
+                .font(.system(size: 10, weight: .bold, design: .rounded))
                 .foregroundStyle(AppTheme.inkSoft)
-                .tracking(1)
+                .tracking(0.5)
         }
         .frame(maxWidth: .infinity)
     }
 
+    // Rotating soft pastel chip tints for words & tags.
+    private func chipTint(_ i: Int) -> Color {
+        [AppTheme.rose2,
+         AppTheme.blue.opacity(0.45),
+         AppTheme.lav.opacity(0.5),
+         AppTheme.mint.opacity(0.6),
+         AppTheme.peach.opacity(0.5)][i % 5]
+    }
+
     // MARK: - Word cloud
     private var wordsCloud: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 14) {
             sectionLabel("Words you return to")
             FlowLayout(spacing: 8) {
-                ForEach(vm.frequentWords, id: \.word) { item in
-                    HStack(spacing: 4) {
+                ForEach(Array(vm.frequentWords.enumerated()), id: \.element.word) { idx, item in
+                    HStack(spacing: 5) {
                         Text(item.word)
-                            .font(.system(size: 13, weight: .medium))
+                            .font(.system(size: 13, weight: .heavy, design: .rounded))
                         Text("×\(item.count)")
-                            .font(AppTheme.mono(size: 10))
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
                             .foregroundStyle(AppTheme.inkSoft)
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(AppTheme.cream)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(chipTint(idx))
                     .clipShape(Capsule())
-                    .overlay(Capsule().stroke(AppTheme.inkSoft.opacity(0.15), lineWidth: 1))
                     .foregroundStyle(AppTheme.ink)
                 }
             }
         }
+        .softCard(cornerRadius: 28)
     }
 
     // MARK: - Tags section
     private var tagsSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             sectionLabel("Recurring tags")
-            ForEach(vm.frequentTags, id: \.tag) { item in
+            ForEach(Array(vm.frequentTags.enumerated()), id: \.element.tag) { idx, item in
                 HStack {
                     Text("#\(item.tag)")
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(AppTheme.terracotta)
+                        .font(.system(size: 14, weight: .heavy, design: .rounded))
+                        .foregroundStyle(AppTheme.ink)
                     Spacer()
                     Text("\(item.count) entries")
-                        .font(AppTheme.mono(size: 11))
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
                         .foregroundStyle(AppTheme.inkSoft)
                 }
-                .padding(.vertical, 6)
-                Divider().overlay(AppTheme.inkSoft.opacity(0.1))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 11)
+                .background(chipTint(idx))
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             }
         }
+        .softCard(cornerRadius: 28)
     }
 
     // MARK: - Section label
     private func sectionLabel(_ text: String) -> some View {
         Text(text.uppercased())
-            .font(AppTheme.mono(size: 10))
+            .font(.system(size: 12, weight: .heavy, design: .rounded))
             .foregroundStyle(AppTheme.inkSoft)
-            .tracking(1.5)
+            .tracking(1.2)
     }
 }

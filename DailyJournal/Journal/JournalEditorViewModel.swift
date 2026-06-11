@@ -48,10 +48,12 @@ final class JournalEditorViewModel: ObservableObject {
     /// a subtle "Draft restored" note).
     @Published var didRestoreDraft = false
 
-    init(userId: String, existingEntry: JournalEntry? = nil) {
+    init(userId: String, existingEntry: JournalEntry? = nil, initialMood: Mood? = nil) {
         self.userId        = userId
         self.existingEntry = existingEntry
-        self.selectedMood  = existingEntry?.mood
+        // For a brand-new entry, seed the mood from an initial value (e.g. the
+        // mood the user just tapped on Home before being redirected here).
+        self.selectedMood  = existingEntry?.mood ?? initialMood
         self.tags          = existingEntry?.tags             ?? []
         self.sentimentLabel     = existingEntry?.sentimentLabel
         self.aiSummaryBullets   = existingEntry?.aiSummaryBullets ?? []
@@ -102,8 +104,9 @@ final class JournalEditorViewModel: ObservableObject {
 
         let trimmed   = content.trimmingCharacters(in: .whitespacesAndNewlines)
         let sentiment = sentimentLabel ?? LocalAI.detectSentiment(from: trimmed)
-        let bullets   = aiSummaryBullets.isEmpty ? LocalAI.generateBullets(from: trimmed) : aiSummaryBullets
-        let question  = aiQuestion ?? LocalAI.generateQuestion(from: trimmed, sentiment: sentiment)
+        let localRef  = NinetyVoice.localReflection(from: trimmed, sentiment: sentiment)
+        let bullets   = aiSummaryBullets.isEmpty ? localRef.observations : aiSummaryBullets
+        let question  = aiQuestion ?? localRef.question
 
         let savedId: String
         if var entry = existingEntry {
@@ -118,11 +121,18 @@ final class JournalEditorViewModel: ObservableObject {
             savedEntry = entry
             savedId = entry.id
         } else {
+            // New entry: enrich the user's own tags with a few content-derived
+            // topical tags (work, sleep, people, …) so cards aren't limited to a
+            // mood word. User tags always come first and are never dropped.
+            var mergedTags = tags
+            for topic in LocalAI.extractTopics(from: trimmed) where !mergedTags.contains(topic) && mergedTags.count < 5 {
+                mergedTags.append(topic)
+            }
             let entry = JournalEntry(
                 userId:           userId,
                 content:          trimmed,
                 mood:             selectedMood,
-                tags:             tags,
+                tags:             mergedTags,
                 sessionType:      .freeWrite,
                 aiSummaryBullets: bullets,
                 aiQuestion:       question,
@@ -162,6 +172,17 @@ final class JournalEditorViewModel: ObservableObject {
                 )
             }
         }
+
+        // River mark — regenerate on every save (new or edited) so the river
+        // reflects the latest text. Local-first, Gemini-upgraded if keyed.
+        Task.detached(priority: .background) {
+            await RiverService().generateMark(
+                entryText:      trimmed,
+                entryId:        savedId,
+                userId:         uid,
+                entryCreatedAt: entryCreatedAt
+            )
+        }
     }
 
     // MARK: - Delete
@@ -170,6 +191,8 @@ final class JournalEditorViewModel: ObservableObject {
     func delete() {
         guard let entry = existingEntry else { return }
         service.deleteEntry(entry)
+        // Derived data follows the entry — drop its river mark too.
+        RiverService().deleteMark(entryId: entry.id, userId: userId)
         didDeleteSuccessfully = true
     }
 

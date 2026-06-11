@@ -14,6 +14,11 @@ final class HomeViewModel: ObservableObject {
     @Published var showingFreeWrite = false
     @Published var selectedLetter: JournalEntry?
 
+    // ── Today's Read ───────────────────────────────────────────────────
+    /// The daily hook. Replaces the prompt card when present. Fetched once per
+    /// session (server doc if the overnight job wrote one, else a local read).
+    @Published var todayRead: DailyRead?
+
     // ── Echoes ─────────────────────────────────────────────────────────
     /// The single pending echo to surface this session. Nil when none is
     /// available or after the user dismisses / answers it.
@@ -33,6 +38,7 @@ final class HomeViewModel: ObservableObject {
     @Published var showResourceCard = false
 
     private let service          = JournalService()
+    private let readService      = ReadService()
     private let echoService      = EchoService()
     private let moodService      = MoodLogService()
     private let callbackService  = PatternCallbackService()
@@ -62,12 +68,25 @@ final class HomeViewModel: ObservableObject {
             pendingEcho = await echo
         }
 
+        // Today's Read — fetched once per session so the sealed/revealed state
+        // and any feedback the user gave survive a pull-to-refresh.
+        if todayRead == nil {
+            todayRead = await readService.todayRead(for: userId)
+        }
+
         isLoading = false
 
         // Surface any callback already waiting, then kick off detection in the
         // background (throttled to ~once/20h inside the service).
         await refreshCallback()
         Task { [weak self] in await self?.runDetection() }
+
+        // Prime the durable memory profile (and the AI prompt context it caches)
+        // so hints/echoes/insights are personalised even before the user opens
+        // the Echoes tab. Fire-and-forget; never blocks the home screen.
+        Task.detached(priority: .utility) { [userId] in
+            await MemoryProfileService.shared.build(for: userId)
+        }
     }
 
     // MARK: - Pattern callbacks
@@ -149,6 +168,30 @@ final class HomeViewModel: ObservableObject {
         arrivedLetters.removeAll { $0.id == entry.id }
     }
 
+    // MARK: - Today's Read actions
+    //
+    // The card owns its own sealed→revealed→replied animation; the ViewModel just
+    // persists the feedback (fire-and-forget) and lets ReadService recalibrate the
+    // local engine via ReadSettings.
+
+    /// "felt true" — positive signal; rewards the read's source patterns.
+    func readFeltTrue() {
+        guard let read = todayRead else { return }
+        readService.recordFeedback(.feltTrue, on: read)
+    }
+
+    /// "too sharp" — softens future reads one gradient.
+    func readTooSharp() {
+        guard let read = todayRead else { return }
+        readService.recordFeedback(.tooSharp, on: read)
+    }
+
+    /// "not me" → classification code from the micro-menu.
+    func readNotMe(_ code: ReadRejectionCode) {
+        guard let read = todayRead else { return }
+        readService.recordRejection(code, on: read)
+    }
+
     // MARK: - Echo actions
 
     /// User tapped "skip" or "not yet". Increments skip count; after 2 skips
@@ -174,6 +217,10 @@ struct HomeView: View {
     @EnvironmentObject private var authViewModel: AuthViewModel
     @State private var showingNinetySecond  = false
     @State private var showingFreeWrite     = false
+    @State private var showProfile          = false
+    /// When the user taps a mood on Home we log it AND redirect into the editor
+    /// with that mood pre-selected. nil for a plain "write" tap.
+    @State private var moodForEditor: Mood?
     @State private var openedLetter: JournalEntry?
     // Echo sheets — capture the echo at tap time so the sheet content stays
     // stable even after vm.pendingEcho is cleared during the dismissal animation.
@@ -195,6 +242,7 @@ struct HomeView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
                         headerSection
+                        writeCTASection      // ← always-visible primary "write" entry point
                         patternSection       // ← rare, weighty cross-entry callback (or safety card)
                         if !vm.arrivedLetters.isEmpty { lettersSection }
                         echoSection   // ← echo card sits above the prompt card
@@ -206,15 +254,30 @@ struct HomeView: View {
                 .refreshable { await vm.load() }
             }
             .navigationBarHidden(true)
-            .task { await vm.load() }
-            .sheet(isPresented: $showingNinetySecond, onDismiss: { Task { await vm.load() } }) {
-                NinetySecondSessionView(userId: vm.userId, onSave: {})
+            .task {
+                await vm.load()
+                // Ask for push permission once the user is on the (authed) Home
+                // screen — the FCM token is saved against their uid via the
+                // Messaging delegate. iOS shows the system prompt only once.
+                PushNotificationManager.shared.requestAuthorization()
             }
-            .sheet(isPresented: $showingFreeWrite, onDismiss: { Task { await vm.load() } }) {
-                JournalEditorView(userId: vm.userId)
+            .fullScreenCover(isPresented: $showingNinetySecond, onDismiss: { Task { await vm.load() } }) {
+                // Straight into the writing screen — pebbles are now chosen inline,
+                // not on a separate gating picker step.
+                NinetySecondSessionView(userId: vm.userId) { Task { await vm.load() } }
+            }
+            .sheet(isPresented: $showingFreeWrite, onDismiss: {
+                moodForEditor = nil
+                Task { await vm.load() }
+            }) {
+                JournalEditorView(userId: vm.userId, initialMood: moodForEditor)
             }
             .sheet(item: $openedLetter) { letter in
                 LetterReadView(entry: letter)
+            }
+            .sheet(isPresented: $showProfile) {
+                ProfileView()
+                    .environmentObject(authViewModel)
             }
             // Echo: answered / closing sheet.
             // onDismiss fires after the animation completes — at that point
@@ -238,6 +301,48 @@ struct HomeView: View {
                 )
             }
         }
+    }
+
+    // MARK: - Write CTA (always visible)
+    //
+    // A clear, always-present way to start writing — independent of whether
+    // Today's Read or the prompt card is showing. Primary action opens a free
+    // write; the secondary opens the 90-second hinted session.
+    private var writeCTASection: some View {
+        VStack(spacing: 10) {
+            Button {
+                moodForEditor = nil
+                showingFreeWrite = true
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "square.and.pencil")
+                        .font(.system(size: 15, weight: .semibold))
+                    Text("Write something")
+                        .font(.system(size: 16, weight: .semibold))
+                }
+                .foregroundStyle(AppTheme.cream)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 15)
+                .background(AppTheme.terracotta)
+                .clipShape(Capsule())
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                showingNinetySecond = true
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 12, weight: .medium))
+                    Text("No words yet? Start with a hint")
+                        .font(.system(size: 13, weight: .medium))
+                }
+                .foregroundStyle(AppTheme.inkSoft)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 24)
+        .padding(.bottom, 28)
     }
 
     // MARK: - Pattern callback section
@@ -292,11 +397,36 @@ struct HomeView: View {
                     .font(AppTheme.mono(size: 11))
                     .foregroundStyle(AppTheme.inkSoft)
                     .multilineTextAlignment(.trailing)
+
+                Button { showProfile = true } label: {
+                    Text(profileInitial)
+                        .font(.system(size: 16, weight: .heavy, design: .rounded))
+                        .foregroundStyle(AppTheme.ink)
+                        .frame(width: 40, height: 40)
+                        .background(
+                            LinearGradient(colors: [AppTheme.rose, AppTheme.lav],
+                                           startPoint: .topLeading, endPoint: .bottomTrailing)
+                        )
+                        .clipShape(Circle())
+                        .overlay(Circle().stroke(AppTheme.cream, lineWidth: 2))
+                        .shadow(color: AppTheme.rose.opacity(0.3), radius: 6, x: 0, y: 3)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Profile")
+                .padding(.leading, 4)
             }
         }
         .padding(.horizontal, 24)
         .padding(.top, 60)
         .padding(.bottom, 32)
+    }
+
+    /// First letter of the user's display name (or email) for the avatar chip.
+    private var profileInitial: String {
+        let source = authViewModel.currentUser?.displayName?.trimmingCharacters(in: .whitespaces)
+            ?? authViewModel.currentUser?.email
+            ?? "·"
+        return String(source.prefix(1)).uppercased()
     }
 
     // MARK: - Daily mood check-in
@@ -309,7 +439,11 @@ struct HomeView: View {
                 .padding(.horizontal, 24)
 
             MoodBlobView(existingMood: vm.todayMood) { mood in
+                // Log the mood, then redirect into the journal editor with it
+                // pre-selected so a check-in flows straight into writing.
                 vm.logMood(mood)
+                moodForEditor = mood
+                showingFreeWrite = true
             }
             .padding(.horizontal, 20)
             .padding(.bottom, 32)
@@ -365,8 +499,30 @@ struct HomeView: View {
         }
     }
 
-    // MARK: - Today's prompt card
+    // MARK: - Daily hook — Today's Read (replaces the prompt card) or fallback prompt
+    //
+    // Per the product pivot, The Read is the active daily vehicle. When a read is
+    // available it takes the primary slot; the plain prompt card is the fallback
+    // for brand-new users (no entries yet) or a held-back read.
+    @ViewBuilder
     private var promptCard: some View {
+        if let read = vm.todayRead {
+            VStack(alignment: .leading, spacing: 0) {
+                TodayReadCardView(
+                    read:    read,
+                    onReply: { showingNinetySecond = true }
+                )
+                .padding(.horizontal, 20)
+                .padding(.bottom, 32)
+            }
+            .transition(.opacity)
+        } else {
+            fallbackPromptCard
+        }
+    }
+
+    // MARK: - Today's prompt card (fallback)
+    private var fallbackPromptCard: some View {
         VStack(alignment: .leading, spacing: 0) {
             sectionLabel("Today's prompt", count: nil)
                 .padding(.horizontal, 24)
@@ -402,9 +558,9 @@ struct HomeView: View {
                         showingNinetySecond = true
                     } label: {
                         HStack(spacing: 6) {
-                            Image(systemName: "timer")
+                            Image(systemName: "sparkles")
                                 .font(.system(size: 12, weight: .medium))
-                            Text("Try a 90-second session")
+                            Text("No words yet? Start with a hint")
                                 .font(.system(size: 13, weight: .medium))
                         }
                         .foregroundStyle(AppTheme.cream.opacity(0.85))
@@ -433,7 +589,7 @@ struct HomeView: View {
             } else if vm.recentEntries.isEmpty {
                 FriendlyEmptyState(
                     title: "No entries yet.",
-                    subtitle: "Your first 90 seconds is waiting."
+                    subtitle: "Write as much or as little as you like. Your river starts with one entry."
                 )
                 .padding(.vertical, 28)
             } else {

@@ -31,6 +31,17 @@ struct EchoCardView: View {
             headerRow
                 .padding(.bottom, 10)
 
+            // ninety's voice — the framing that gives the echo depth. Shown first,
+            // larger; the quote sits beneath it as the evidence it's pointing at.
+            if let line = echo.line, !line.isEmpty {
+                Text(line)
+                    .font(AppTheme.editorialDisplay(size: 18, weight: .medium))
+                    .foregroundStyle(AppTheme.ink)
+                    .lineSpacing(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.bottom, 10)
+            }
+
             quoteText
                 .padding(.bottom, 6)
 

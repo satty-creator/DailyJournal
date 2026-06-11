@@ -69,6 +69,9 @@ struct Echo: Identifiable, Codable {
     /// For .theme type only — the specific keyword / name that recurs across entries
     /// (e.g. "dad", "the promotion"). Used to drive ThemeCompilationView search.
     var themeKeyword: String?
+    /// ninety's voice line that FRAMES the quote (shown above it). The whole point
+    /// of an echo's depth — a perspective, not a replay. Optional + default-safe.
+    var line: String?
 
     // MARK: - Computed
 
@@ -87,7 +90,8 @@ struct Echo: Identifiable, Codable {
         quote: String,
         surfaceAfterHours: Int,
         confidence: Double,
-        themeKeyword: String? = nil
+        themeKeyword: String? = nil,
+        line: String? = nil
     ) {
         self.id                   = UUID().uuidString
         self.userId               = userId
@@ -102,6 +106,7 @@ struct Echo: Identifiable, Codable {
         self.createdAt            = Date()
         self.answeredAt           = nil
         self.themeKeyword         = themeKeyword
+        self.line                 = line
     }
 
     // MARK: - Firestore deserialisation
@@ -136,6 +141,7 @@ struct Echo: Identifiable, Codable {
         self.createdAt            = createdAt
         self.answeredAt           = (data["answeredAt"] as? Timestamp)?.dateValue()
         self.themeKeyword         = data["themeKeyword"] as? String
+        self.line                 = data["line"] as? String
     }
 
     // MARK: - Firestore serialisation
@@ -156,6 +162,7 @@ struct Echo: Identifiable, Codable {
         ]
         if let answeredAt   = answeredAt   { data["answeredAt"]   = Timestamp(date: answeredAt) }
         if let themeKeyword = themeKeyword { data["themeKeyword"] = themeKeyword }
+        if let line         = line         { data["line"]         = line }
         return data
     }
 }

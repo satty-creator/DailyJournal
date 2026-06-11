@@ -39,8 +39,8 @@ final class EchoExtractionService {
         userId: String,
         entryCreatedAt: Date
     ) async {
-        // Guard: no API key → skip extraction silently
-        guard AIService.shared.hasApiKey else { return }
+        // Guard: AI unavailable (not signed in) → skip extraction silently
+        guard AIService.shared.isAIAvailable else { return }
         // Guard: entry too short to yield anything meaningful
         guard entryText.count > 30 else { return }
 
@@ -62,7 +62,11 @@ final class EchoExtractionService {
         // 3. Confidence gate — belt-and-suspenders on top of the prompt instruction
         guard result.confidence >= 0.8 else { return }
 
-        // 4. Persist
+        // 4. Persist — always attach a ninety-voice line (model's, or a local fallback
+        //    so an echo never resurfaces as a bare quote).
+        let line = result.line ?? NinetyVoice.localEchoLine(
+            type: result.type, quote: result.quote, daysAgo: 0
+        )
         let echo = Echo(
             userId:               userId,
             sourceEntryId:        entryId,
@@ -71,7 +75,8 @@ final class EchoExtractionService {
             quote:                result.quote,
             surfaceAfterHours:    result.surfaceAfterHours,
             confidence:           result.confidence,
-            themeKeyword:         result.themeKeyword
+            themeKeyword:         result.themeKeyword,
+            line:                 line
         )
         echoService.createEcho(echo)
     }

@@ -6,12 +6,48 @@
 //
 
 import SwiftUI
+import UIKit
 import FirebaseCore
 import FirebaseFirestore
+import FirebaseMessaging
+
+// MARK: - App delegate (push notifications)
+//
+// SwiftUI's App lifecycle doesn't expose the UIKit remote-notification callbacks
+// FCM needs, so we bridge a tiny UIApplicationDelegate. `FirebaseApp.configure()`
+// still runs in `DailyJournalApp.init` (before this delegate's didFinishLaunching),
+// so Messaging is safe to touch here.
+final class AppDelegate: NSObject, UIApplicationDelegate {
+
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        PushNotificationManager.shared.configure()
+        return true
+    }
+
+    /// APNs handed us a device token — pass it to FCM so it can mint an FCM token.
+    func application(
+        _ application: UIApplication,
+        didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+    ) {
+        Messaging.messaging().apnsToken = deviceToken
+    }
+
+    func application(
+        _ application: UIApplication,
+        didFailToRegisterForRemoteNotificationsWithError error: Error
+    ) {
+        // Registration failure is non-fatal: the user simply won't get pushes.
+        // The in-app sealed card still works. Fail silently.
+    }
+}
 
 @main
 struct DailyJournalApp: App {
 
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var authViewModel = AuthViewModel()
 
     init() {
@@ -27,7 +63,7 @@ struct DailyJournalApp: App {
         )
         Firestore.firestore().settings = settings
     }
-    
+
     var body: some Scene {
         WindowGroup {
             RootView()

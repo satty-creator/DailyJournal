@@ -19,12 +19,25 @@ struct JournalEditorView: View {
     @State private var wantsFutureSelf = false
 
     private let onSave: (() -> Void)?
+    /// Fires with the just-saved entry so a list can insert it optimistically
+    /// (no wait on a re-fetch). Optional and additive — existing callers unaffected.
+    private let onSaveEntry: ((JournalEntry) -> Void)?
 
-    init(userId: String, existingEntry: JournalEntry? = nil, onSave: (() -> Void)? = nil) {
+    // NOTE: `onSave` is intentionally the LAST parameter so existing trailing-
+    // closure call sites (e.g. `JournalEditorView(userId:existingEntry:) { … }`)
+    // keep binding to it rather than to `onSaveEntry`.
+    init(
+        userId: String,
+        existingEntry: JournalEntry? = nil,
+        initialMood: Mood? = nil,
+        onSaveEntry: ((JournalEntry) -> Void)? = nil,
+        onSave: (() -> Void)? = nil
+    ) {
         _viewModel = StateObject(
-            wrappedValue: JournalEditorViewModel(userId: userId, existingEntry: existingEntry)
+            wrappedValue: JournalEditorViewModel(userId: userId, existingEntry: existingEntry, initialMood: initialMood)
         )
         self.onSave = onSave
+        self.onSaveEntry = onSaveEntry
     }
 
     var body: some View {
@@ -52,6 +65,19 @@ struct JournalEditorView: View {
                             }
                         }
                         moodWeatherPicker
+                        // A way in for the blank page — an AI-sharpened, probing
+                        // starter the user can tap to drop in. Only for brand-new,
+                        // still-empty entries; vanishes the moment they write.
+                        if !viewModel.isEditing && viewModel.content.isEmpty {
+                            FreeWriteStarterView(initialMood: viewModel.selectedMood) { fragment in
+                                viewModel.content = fragment
+                                viewModel.updateSentiment()
+                                viewModel.persistDraft()
+                                isContentFocused = true
+                            }
+                            .padding(.bottom, 24)
+                            .transition(.opacity)
+                        }
                         contentArea
                         if !viewModel.aiSummaryBullets.isEmpty && viewModel.isEditing {
                             aiSummarySection
@@ -82,6 +108,7 @@ struct JournalEditorView: View {
             }
             .onChange(of: viewModel.didSaveSuccessfully) { _, saved in
                 if saved {
+                    if let savedEntry = viewModel.savedEntry { onSaveEntry?(savedEntry) }
                     onSave?()
                     // Only open the future-self sheet when the user explicitly
                     // asked for it via the toolbar; a plain save just dismisses.
@@ -457,5 +484,103 @@ struct JournalEditorView: View {
         .padding(.horizontal, 24)
         .padding(.vertical, 10)
         .background(.ultraThinMaterial)
+    }
+}
+
+// MARK: - Free-write starter
+//
+// Brings the Hint Ladder's starter to the open blank page. It owns its own
+// HintEngine (empty pebbles, write mode), so it shows a sharp local starter
+// instantly and quietly upgrades to the AI-sharpened one when it arrives. The
+// user can re-roll the angle (gentler / direct / weirder) or tap to drop it in.
+private struct FreeWriteStarterView: View {
+    let initialMood: Mood?
+    let onUse: (String) -> Void
+
+    @StateObject private var hints = HintEngine(
+        context: HintContext(pebbles: [], personal: .safe, mode: .write)
+    )
+    @State private var prompt: String
+    /// Once the user re-rolls, stop auto-adopting the AI starter over their choice.
+    @State private var userRerolled = false
+
+    init(initialMood: Mood? = nil, onUse: @escaping (String) -> Void) {
+        self.initialMood = initialMood
+        self.onUse = onUse
+        // If we arrived here from a mood check-in, open with a mood-tuned prompt
+        // rather than a generic one.
+        if let mood = initialMood {
+            _prompt = State(initialValue: LocalAI.moodPrompt(for: mood))
+        } else {
+            _prompt = State(initialValue: HintLadder.starterPrompt(pebbles: [], personal: .safe))
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("NEED A WAY IN?")
+                    .font(AppTheme.mono(size: 10))
+                    .foregroundStyle(AppTheme.inkSoft)
+                    .tracking(2)
+                Spacer()
+                if hints.bundle.source == "gemini" {
+                    Text("for you")
+                        .font(AppTheme.mono(size: 9)).tracking(1)
+                        .foregroundStyle(AppTheme.terracotta)
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .background(AppTheme.terracotta.opacity(0.10))
+                        .clipShape(Capsule())
+                }
+            }
+
+            Button { onUse(prompt) } label: {
+                Text(prompt)
+                    .font(AppTheme.editorialDisplay(size: 20))
+                    .foregroundStyle(AppTheme.ink)
+                    .multilineTextAlignment(.leading)
+                    .lineSpacing(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(16)
+                    .background(AppTheme.rose2.opacity(0.5))
+                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .animation(.easeInOut(duration: 0.2), value: prompt)
+
+            HStack(spacing: 8) {
+                pill("gentler")     { reroll(.gentle) }
+                pill("more direct") { reroll(.direct) }
+                pill("weirder")     { reroll(.weird) }
+                Spacer()
+                Text("tap to use")
+                    .font(AppTheme.mono(size: 9)).tracking(1)
+                    .foregroundStyle(AppTheme.slate)
+            }
+        }
+        .onChange(of: hints.bundle) { _, newBundle in
+            // Don't let the generic AI starter clobber a mood-tuned prompt or a
+            // prompt the user has already reshaped.
+            guard initialMood == nil, !userRerolled, newBundle.source == "gemini" else { return }
+            withAnimation { prompt = newBundle.starterWrite }
+        }
+    }
+
+    private func reroll(_ style: HintLadder.PromptStyle) {
+        userRerolled = true
+        prompt = hints.restyledStarter(style)
+    }
+
+    private func pill(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(AppTheme.inkSoft)
+                .padding(.horizontal, 12).padding(.vertical, 7)
+                .background(AppTheme.paperWarm)
+                .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
     }
 }
