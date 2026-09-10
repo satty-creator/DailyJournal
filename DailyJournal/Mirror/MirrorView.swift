@@ -432,6 +432,10 @@ final class MirrorViewModel: ObservableObject {
         if feedback == .almost {
             AnalyticsManager.shared.trackPatternDismissed()
         }
+        // §10's metrics: the Huh rate and the Not-quite -> Wrong rate by
+        // shape both come from this one event.
+        AnalyticsManager.shared.trackMirrorReadingFeedback(
+            feedback: feedback.rawValue, reason: reason?.rawValue, shape: reading.shape)
     }
 
     /// Records that today's line was actually displayed, for the 14-day
@@ -768,6 +772,7 @@ struct MirrorView: View {
                                 onSelect: { hyp in
                                     exploreSeed = hyp.testQuestion ?? hyp.hypothesis
                                     showExploreChat = true
+                                    AnalyticsManager.shared.trackMirrorOpenHypothesisTapped()
                                 }
                             )
 
@@ -994,7 +999,10 @@ struct MirrorView: View {
     // MARK: - Ask pill (pinned at top)
 
     private var askCard: some View {
-        Button { showAsk = true } label: {
+        Button {
+            showAsk = true
+            AnalyticsManager.shared.trackMirrorAskUsed()
+        } label: {
             HStack(spacing: 10) {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 16, weight: .semibold))

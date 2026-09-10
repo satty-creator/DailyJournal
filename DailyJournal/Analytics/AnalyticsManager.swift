@@ -74,6 +74,15 @@ enum AnalyticsEvent: String {
     case mirrorHypothesisEdited = "mirror_hypothesis_edited"
     case mirrorGraphViewed = "mirror_graph_viewed"
 
+    // Mirror v3.1 — the Person Model (mirror-v3.1-person-model-2026-09-10.md
+    // §10). `mirrorReadingFeedback`'s `feedback == "huh"` share IS the
+    // "Didn't know that" metric (target >= 25% of shown lines); `feedback ==
+    // "almost" && reason == "wrong"` by `shape` is the Not-quite -> Wrong
+    // rate the doc asks be broken out per shape.
+    case mirrorReadingFeedback = "mirror_reading_feedback"
+    case mirrorAskUsed = "mirror_ask_used"
+    case mirrorOpenHypothesisTapped = "mirror_open_hypothesis_tapped"
+
     // Chat
     case dailyChatStarted = "daily_chat_started"
     case dailyChatCompleted = "daily_chat_completed"
@@ -288,6 +297,22 @@ final class AnalyticsManager {
 
     func trackPatternExplored(archetype: String) {
         logEvent(.patternExplored, parameters: ["archetype": archetype])
+    }
+
+    // Mirror v3.1
+    func trackMirrorReadingFeedback(feedback: String, reason: String?, shape: String?) {
+        var params: [String: Any] = ["feedback": feedback]
+        if let reason { params["reason"] = reason }
+        if let shape { params["shape"] = shape }
+        logEvent(.mirrorReadingFeedback, parameters: params)
+    }
+
+    func trackMirrorAskUsed() {
+        logEvent(.mirrorAskUsed)
+    }
+
+    func trackMirrorOpenHypothesisTapped() {
+        logEvent(.mirrorOpenHypothesisTapped)
     }
 
     // Journal interactions
