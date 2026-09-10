@@ -59,6 +59,15 @@ final class AIService {
     static let refreshDerivedURLString =
         "https://us-central1-spilr-100f7.cloudfunctions.net/refreshDerived"
 
+    /// Prompt ASK, server-side (mirror-v3.1-person-model-2026-09-10.md §7) —
+    /// see `functions/index.js` `exports.mirrorAsk`. Answers a question about
+    /// the user FROM the Person Model, with receipts, never by re-reading
+    /// raw entries client-side. Replaces AskView's old on-device retrieval +
+    /// client-built prompt (engineering-decisions §1: the client sends
+    /// structured input, never a prompt).
+    static let mirrorAskURLString =
+        "https://us-central1-spilr-100f7.cloudfunctions.net/mirrorAsk"
+
     /// AI is available when the user is signed in AND has given consent for
     /// their journal text to be sent to Google Gemini (Guideline 5.1.2(i)).
     /// Returns false for users who declined consent during onboarding — all

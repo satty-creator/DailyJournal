@@ -37,11 +37,19 @@ struct TodayReadingCardView: View {
 
             if let question = reading.question, !question.isEmpty {
                 Button { onTapQuestion?(question) } label: {
-                    Text(question)
-                        .font(AppTheme.editorialBody(size: 15).italic())
-                        .foregroundStyle(AppTheme.terracotta)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .multilineTextAlignment(.leading)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(question)
+                            .font(AppTheme.editorialBody(size: 15).italic())
+                            .foregroundStyle(AppTheme.terracotta)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .multilineTextAlignment(.leading)
+                        // §9's [Answer tonight] affordance — the question is
+                        // Prompt Q's test for the model's top open hypothesis;
+                        // answering it is how the model learns fastest.
+                        Text("Answer tonight →")
+                            .font(AppTheme.mono(size: 11))
+                            .foregroundStyle(AppTheme.terracotta.opacity(0.75))
+                    }
                 }
                 .buttonStyle(.plain)
             }
@@ -87,11 +95,18 @@ struct TodayReadingCardView: View {
 
     // MARK: - Feedback
 
+    /// §9: "That's me" / "Huh" / "Not quite" — three reactions, not two.
+    /// "Huh" ("new to me") is the mind-blowing metric (target >= 25% of shown
+    /// lines) and is weighted below "That's me" but is not a rejection.
     private var feedbackRow: some View {
         HStack(spacing: 10) {
             feedbackButton("That's me", filled: true) {
                 withAnimation { saved = true }
                 onFeedback?(.thisIsMe, nil)
+            }
+            feedbackButton("Huh", filled: false) {
+                withAnimation { saved = true }
+                onFeedback?(.huh, nil)
             }
             feedbackButton("Not quite", filled: false) {
                 withAnimation { showMissReasons = true }

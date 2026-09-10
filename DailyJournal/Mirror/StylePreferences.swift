@@ -84,7 +84,7 @@ enum MirrorCorrectionClassifier {
     /// asking so many questions", "be blunter", "no bullet points") rather
     /// than the CONTENT of a specific hypothesis ("this isn't about fear,
     /// it's about control"). Routes to StylePreferences instead of
-    /// ProfileCorrection — see EvidenceDrawerView's correction submit.
+    /// ProfileCorrection — see TeachSpilrSheet's correction submit.
     /// Short and keyword-bearing reads as a style note; a content correction
     /// is usually a longer reinterpretation with no behavioural keyword.
     static func isStyleCorrection(_ text: String) -> Bool {

@@ -41,4 +41,33 @@ enum MirrorText {
         guard union > 0 else { return 0 }
         return Double(intersection) / Double(union)
     }
+
+    /// "12 Aug" from "2026-08-12". Deliberately not a DateFormatter round-trip:
+    /// these keys are already in the USER's local calendar (the server built
+    /// them in their timezone), so re-parsing them as instants would shift
+    /// them back into the device's timezone and could move the date by a day.
+    /// Moved here from MirrorThread.swift (retired with the v3.0 Threads
+    /// section) since ProofSheetView needs it independent of that type.
+    static func shortDate(_ key: String) -> String? {
+        guard key.count >= 10 else { return nil }
+        let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        let monthIndex = Int(key.dropFirst(5).prefix(2)) ?? 0
+        let day = Int(key.dropFirst(8).prefix(2)) ?? 0
+        guard monthIndex >= 1, monthIndex <= 12, day >= 1 else { return nil }
+        return "\(day) \(months[monthIndex - 1])"
+    }
+
+    /// Moved here from ThisWeekStripView.swift (retired along with the v3.0
+    /// "This week, in your words" strip) since ProofSheetView needs it
+    /// independent of that view.
+    static func bandPhrase(_ band: String) -> String {
+        switch band {
+        case "morning":   return "before noon"
+        case "afternoon": return "in the afternoon"
+        case "evening":   return "in the evening"
+        case "late":      return "after 9pm"
+        default:          return band
+        }
+    }
 }

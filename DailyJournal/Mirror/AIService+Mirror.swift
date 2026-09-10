@@ -205,6 +205,50 @@ extension AIService {
         _ = try? await URLSession.shared.data(for: request)
     }
 
+    // MARK: - Prompt ASK (mirror-v3.1), server-side
+
+    struct MirrorAskCitation {
+        let itemId: String
+        let quote: String
+        let date: String?
+    }
+
+    struct MirrorAskResult {
+        let answer: String
+        let citations: [MirrorAskCitation]
+    }
+
+    /// Prompt ASK, server-side — `functions:mirrorAsk`. The client sends only
+    /// the question; the server answers from the Person Model with receipts.
+    /// Never throws — a failure reads to the caller as `nil`, same degrade
+    /// contract as every other AI-adjacent call in this file.
+    func askMirror(question: String, userId: String) async -> MirrorAskResult? {
+        guard let token = await idToken() else { return nil }
+
+        var request = URLRequest(url: URL(string: Self.mirrorAskURLString)!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let appCheckToken = try? await AppCheck.appCheck().token(forcingRefresh: false) {
+            request.setValue(appCheckToken.token, forHTTPHeaderField: "X-Firebase-AppCheck")
+        }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["question": question])
+        request.timeoutInterval = 30
+
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, http.statusCode == 200,
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let answer = root["answer"] as? String, !answer.isEmpty
+        else { return nil }
+
+        let citations = (root["citations"] as? [[String: Any]] ?? []).compactMap { c -> MirrorAskCitation? in
+            guard let itemId = c["itemId"] as? String, let quote = c["quote"] as? String,
+                  !itemId.isEmpty, !quote.isEmpty else { return nil }
+            return MirrorAskCitation(itemId: itemId, quote: quote, date: c["date"] as? String)
+        }
+        return MirrorAskResult(answer: answer, citations: citations)
+    }
+
     // MARK: - Fetch a card from the server-generated deck
 
     /// Reads one card from `users/{uid}/mirrorCards/{hypothesisId}` — the deck

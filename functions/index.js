@@ -3736,6 +3736,11 @@ async function writeFormulationOutput(db, uid, now, output, existingById) {
         computedAt: admin.firestore.Timestamp.fromDate(now),
       },
     };
+    // Stored, not left for a client-side reimplementation of the same three
+    // lines to (inevitably) drift from — confidenceBandFor is (timesSeen,
+    // disconfirmationVerdict, userStatus) ONLY, never a number the model
+    // returned, and it's cheap enough to just recompute on every write.
+    doc.confidence = confidenceBandFor(doc);
     batch.set(userRef.collection("personModel").doc(id), doc, { merge: true });
     written++;
     return id;
@@ -4060,7 +4065,11 @@ async function selectAndWriteMirrorLineForUser(db, uid, now, tz, facts, observat
     question: (question && question.endsWith("?")) ? question : null,
     wouldBeFalseIf: output.would_be_false_if || null,
     receipt,
-    source: { kind: "personModel", shape: winner.shape, id: winner.ref.id || null },
+    // `type` (not `shape`) so the client's existing `Reading.sourceType`
+    // decode (`source["type"]`) picks it up without a new field — a v3.0
+    // reading's `source.type` is an observation type ("cooccurrence",
+    // "exception"); a v3.1 line's is one of SIGNATURE/BECAUSE/SAYDO/EXCEPTION.
+    source: { kind: "personModel", type: winner.shape, id: winner.ref.id || null },
     lintPassed: true,
     lintReason: null,
     silence: false,

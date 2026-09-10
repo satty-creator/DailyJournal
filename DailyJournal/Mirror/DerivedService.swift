@@ -2,11 +2,12 @@
 //  DerivedService.swift
 //  DailyJournal
 //
-//  The client's read side of the Mirror v3 derived layer:
-//    users/{uid}/derived/facts     — Tier 0 counts (MirrorFacts)
-//    users/{uid}/derived/threads   — Tier 3, max 3 (MirrorThreads)
-//    users/{uid}/derived/firstSeven— the 7-entry unlock card
-//    users/{uid}/readings/{date}   — today's one thing (Reading)
+//  The client's read side of the Mirror v3 / v3.1 derived layer:
+//    users/{uid}/derived/facts        — Tier 0 counts (MirrorFacts)
+//    users/{uid}/derived/firstSeven   — the 7-entry unlock card
+//    users/{uid}/derived/personModel  — needs, open hypotheses (PersonModelAggregate)
+//    users/{uid}/readings/{date}      — today's one thing (Reading)
+//    users/{uid}/personModel/*        — Person Model items (PersonModelItem)
 //
 //  All server-written. The only client writes are the three feedback fields on
 //  a reading, which firestore.rules narrows to exactly those keys — see §5.2's
@@ -23,9 +24,13 @@ final class DerivedService: ObservableObject {
     private init() {}
 
     @Published private(set) var facts: MirrorFacts = .empty(userId: "")
-    @Published private(set) var threads: MirrorThreads = .empty
     @Published private(set) var reading: Reading?
     @Published private(set) var firstSeven: FirstSevenCard?
+    /// Mirror v3.1 — active Person Model items, newest evidence first. Feeds
+    /// "WHAT SPILR THINKS IT KNOWS" (signatures) on the Mirror tab.
+    @Published private(set) var personModelItems: [PersonModelItem] = []
+    /// `derived/personModel` — needs, open hypotheses, tonight's question.
+    @Published private(set) var personModel: PersonModelAggregate = .empty
     @Published private(set) var isLoading = false
     /// True when the LAST `load()` could not reach either the server or a
     /// warm local cache for some part of this layer — distinct from the docs
@@ -71,8 +76,8 @@ final class DerivedService: ObservableObject {
         let derived = await fetchDerived(userId: userId)
         if derived.succeeded {
             if let f = derived.facts { facts = f }
-            threads = derived.threads ?? .empty
             firstSeven = derived.firstSeven
+            personModel = derived.personModel ?? .empty
         } else {
             failed = true
         }
@@ -85,28 +90,50 @@ final class DerivedService: ObservableObject {
             failed = true
         }
 
+        let items = await fetchPersonModelItems(userId: userId)
+        if items.succeeded {
+            personModelItems = items.items
+        } else {
+            failed = true
+        }
+
         loadFailed = failed
     }
 
     private func fetchDerived(userId: String) async
-    -> (facts: MirrorFacts?, threads: MirrorThreads?, firstSeven: FirstSevenCard?, succeeded: Bool) {
+    -> (facts: MirrorFacts?, firstSeven: FirstSevenCard?,
+        personModel: PersonModelAggregate?, succeeded: Bool) {
         let col = db.collection("users").document(userId).collection("derived")
         guard let snapshot = try? await col.getDocuments(source: .default) else {
             return (nil, nil, nil, false)
         }
 
         var facts: MirrorFacts?
-        var threads: MirrorThreads?
         var firstSeven: FirstSevenCard?
+        var personModel: PersonModelAggregate?
         for doc in snapshot.documents {
             switch doc.documentID {
-            case "facts":      facts = MirrorFacts(from: doc.data())
-            case "threads":    threads = MirrorThreads(from: doc.data())
-            case "firstSeven": firstSeven = FirstSevenCard(from: doc.data())
-            default:           break
+            case "facts":       facts = MirrorFacts(from: doc.data())
+            case "firstSeven":  firstSeven = FirstSevenCard(from: doc.data())
+            case "personModel": personModel = PersonModelAggregate(from: doc.data())
+            default:            break
             }
         }
-        return (facts, threads, firstSeven, true)
+        return (facts, firstSeven, personModel, true)
+    }
+
+    /// Active Person Model items, most recent evidence first, capped the same
+    /// as the server's own bounded reads (PERSON_MODEL_ITEM_LIMIT).
+    private func fetchPersonModelItems(userId: String) async -> (items: [PersonModelItem], succeeded: Bool) {
+        let col = db.collection("users").document(userId).collection("personModel")
+        guard let snapshot = try? await col.limit(to: 60).getDocuments(source: .default) else {
+            return ([], false)
+        }
+        let items = snapshot.documents
+            .compactMap { PersonModelItem(id: $0.documentID, from: $0.data()) }
+            .filter(\.isActive)
+            .sorted { ($0.lastEvidenceAt ?? .distantPast) > ($1.lastEvidenceAt ?? .distantPast) }
+        return (items, true)
     }
 
     private func fetchReading(userId: String, dateKey: String) async -> (reading: Reading?, succeeded: Bool) {
@@ -174,12 +201,18 @@ final class DerivedService: ObservableObject {
     ///
     /// Writes to three places, each for a different reason:
     ///   - the reading, so the card shows its own state immediately;
-    ///   - the source observation, so the ranking learns (two "not quite"s
-    ///     retire it — `notQuiteCount` is what the server checks);
+    ///   - the source observation/personModel item, so the ranking learns
+    ///     (two "not quite"s retire it — `notQuiteCount` is what the server
+    ///     checks);
     ///   - StylePreferences, but ONLY when the follow-up chip says "too much".
-    ///     "Wrong" and "already knew" are not requests for a softer voice, and
+    ///     "Wrong" and "half" are not requests for a softer voice, and
     ///     treating them as one is how an app ends up mushy for everyone who
     ///     ever disagreed with it.
+    ///
+    /// `.huh` ("new to me") writes the reading's own status for the "Didn't
+    /// know that" metric but never touches `notQuiteCount` or sharpness — it
+    /// is not a rejection, it's the strongest kind of praise this surface can
+    /// get short of "That's me".
     func recordReadingFeedback(
         _ feedback: ReadingFeedback,
         reason: ReadingMissReason? = nil,
@@ -195,7 +228,7 @@ final class DerivedService: ObservableObject {
             "followUp": reason?.rawValue as Any
         ]) { _ in }
 
-        if let observationId = reading.sourceId {
+        if let sourceId = reading.sourceId, feedback != .huh {
             var patch: [String: Any] = [
                 "userStatus": feedback.rawValue,
                 "shownAt": Timestamp(date: Date())
@@ -203,7 +236,11 @@ final class DerivedService: ObservableObject {
             if feedback == .almost {
                 patch["notQuiteCount"] = FieldValue.increment(Int64(1))
             }
-            userRef.collection("observations").document(observationId)
+            // v3.1 signatures live in personModel; a v3.0-only reading's
+            // source is an observation. Both collections accept the same
+            // field-scoped update shape (firestore.rules).
+            let collection = reading.sourceType == "SIGNATURE" ? "personModel" : "observations"
+            userRef.collection(collection).document(sourceId)
                 .updateData(patch) { _ in }
         }
 
@@ -258,6 +295,8 @@ private extension Reading {
         if let sourceId, let sourceType {
             data["source"] = ["id": sourceId, "type": sourceType, "kind": "observation"]
         }
+        if let shape { data["shape"] = shape }
+        if let wouldBeFalseIf { data["wouldBeFalseIf"] = wouldBeFalseIf }
         if let receipt {
             data["receipt"] = [
                 "quote": receipt.quote,

@@ -75,16 +75,19 @@ final class MirrorViewModel: ObservableObject {
     @Published var showSelfModel = false
     @Published var weeklyLetter: MirrorLetter? = nil
 
-    // MARK: - Mirror v3 derived layer
-    /// Tier 0 — the counts behind "This week, in your words". Never empty once
-    /// the nightly job has run once, and never wrong: it is arithmetic.
+    // MARK: - Mirror v3 / v3.1 derived layer
+    /// Tier 0 facts — arithmetic, never wrong, available from the first entry.
+    /// No longer rendered as its own strip (v3.1 §11 removes "This week, in
+    /// your words" as a surface), but still backs the maturity/unlock gates.
     @Published var facts: MirrorFacts = .empty(userId: "")
-    /// Tier 3 — at most three threads.
-    @Published var threads: MirrorThreads = .empty
     /// Today's one thing. `nil` means the nightly job has not written one yet
     /// (a brand-new account), which is distinct from `reading.silence == true`
     /// — a deliberate quiet day.
     @Published var reading: Reading? = nil
+    /// Mirror v3.1 — active Person Model items ("what Spilr thinks it knows").
+    @Published var personModelItems: [PersonModelItem] = []
+    /// Mirror v3.1 — needs, open hypotheses, tonight's question.
+    @Published var personModel: PersonModelAggregate = .empty
     /// True when the derived layer's last read couldn't reach the server or a
     /// warm cache at all — distinct from `!facts.isFresh`, which means the
     /// docs genuinely don't exist yet. Mirrors `DerivedService.loadFailed`;
@@ -153,7 +156,7 @@ final class MirrorViewModel: ObservableObject {
     /// to Mirror is now guaranteed to show that same line.
     var bridgeInsightTitle: String? {
         if let reading, !reading.silence { return reading.line }
-        return threads.threads.first?.title
+        return personModelItems.first(where: { $0.kind == "signature" })?.displayTitle
     }
 
     /// Hypotheses seen on at least 3 distinct entries, sorted by MirrorScore —
@@ -299,8 +302,8 @@ final class MirrorViewModel: ObservableObject {
         // Entry count comes from `rollups/stats`, not from fetching (and
         // decrypting) 100 full entry documents just to call `.count` on the
         // array — see RollupStats.swift. Mirror no longer holds a live entries
-        // corpus at all; Ask loads its own on demand (`AskViewModel.entriesTask`)
-        // when the user actually opens it, off this load's critical path.
+        // corpus at all; Ask is server-side now (Prompt ASK, mirror-v3.1) and
+        // makes its own request when the user actually opens it.
         //
         // No `entryAnalyses` fetch here any more, either. It existed only to
         // feed the client-side mine/write prompts — both now run server-side
@@ -330,8 +333,9 @@ final class MirrorViewModel: ObservableObject {
         hypotheses  = MirrorGraphService.shared.hypotheses
         weeklyLetter = MirrorLetterService.shared.latest
         facts       = DerivedService.shared.facts
-        threads     = DerivedService.shared.threads
         reading     = DerivedService.shared.reading
+        personModelItems = DerivedService.shared.personModelItems
+        personModel = DerivedService.shared.personModel
         derivedLoadFailed = DerivedService.shared.loadFailed
 
         AIService.cacheLifeContext(await lifeCtx)
@@ -400,8 +404,9 @@ final class MirrorViewModel: ObservableObject {
 
         await DerivedService.shared.load(for: userId)
         facts       = DerivedService.shared.facts
-        threads     = DerivedService.shared.threads
         reading     = DerivedService.shared.reading
+        personModelItems = DerivedService.shared.personModelItems
+        personModel = DerivedService.shared.personModel
         derivedLoadFailed = DerivedService.shared.loadFailed
     }
 
@@ -602,32 +607,18 @@ struct MirrorView: View {
     // Accepts a pre-warmed VM from MainTabView to avoid cold-load spinner on first tap.
     // Falls back to creating its own when used standalone (previews, deep links).
     @ObservedObject private var vm: MirrorViewModel
-    @State private var selectedHypothesis: PatternHypothesis? = nil
-    @State private var showEvidenceDrawer = false
     @State private var showAsk = false
     @State private var showExploreChat = false
     @State private var exploreSeed: String? = nil
-    @State private var showMoreSheet = false
     @State private var silenceSeedPrompt: String? = nil
     @State private var showWeeklyLetter = false
-    /// The §5.2 proof sheet — opened from "more…" on Today, and from a thread
-    /// row. Same sheet either way: the numbers, the quotes, the exception.
+    /// The §5.2 proof sheet — opened from "more…" on Today.
     @State private var showProofSheet = false
-    @State private var selectedThread: MirrorThread? = nil
     @State private var showTeachSheet = false
     @State private var teachText = ""
 
     init(userId: String, viewModel: MirrorViewModel? = nil) {
         vm = viewModel ?? MirrorViewModel(userId: userId)
-    }
-
-    /// The hypothesis behind today's card, when one is loaded. Looked up by
-    /// `card.sourcePatternIds.first` — the daily card's payload (receipts,
-    /// the Then/Now pair, the exception's "what was different") leans on the
-    /// hypothesis for anything the card doc itself doesn't carry.
-    private var cardHypothesis: PatternHypothesis? {
-        guard let id = vm.mirrorCard?.sourcePatternIds.first else { return nil }
-        return vm.hypotheses.first { $0.id == id }
     }
 
     /// The question shown on the silence card: the top surfaceable
@@ -641,17 +632,18 @@ struct MirrorView: View {
         return seed.prompt
     }
 
-    /// True when at least one of the sections above (Today, This week,
-    /// Threads) has something to show, on its own terms — including its own
-    /// "not yet, here's what would unlock it" empty state. When every one of
-    /// them is genuinely silent, `mirrorEmptyStateCard` takes over instead of
-    /// falling straight through to `goDeepSection` unexplained.
+    /// True when at least one of the sections above (Today, What Spilr thinks
+    /// it knows, What it doesn't know yet) has something to show, on its own
+    /// terms — including its own "not yet" empty state for the model rows.
+    /// When every one of them is genuinely silent, `mirrorEmptyStateCard`
+    /// takes over instead of falling straight through to `goDeepSection`
+    /// unexplained.
     private var hasAnyDailyContent: Bool {
         vm.reading != nil
             || vm.cardLoadState == .working
             || vm.facts.isFresh
-            || !vm.threads.threads.isEmpty
-            || vm.maturity.canShowThreads
+            || !vm.personModelItems.isEmpty
+            || !vm.personModel.openHypotheses.isEmpty
     }
 
     /// Distinguishes the two reasons the screen can be this empty: a real
@@ -751,30 +743,33 @@ struct MirrorView: View {
                                 MirrorCardSkeletonView()
                             }
 
-                            // ── THIS WEEK, IN YOUR WORDS (§5.3) ───────────
-                            // Tier 0. No model, no thresholds, available from
-                            // the first entry — the part of this screen that
-                            // is never empty and never wrong.
-                            if vm.facts.isFresh {
-                                ThisWeekStripView(facts: vm.facts)
-                            }
-
-                            // ── THREADS (§5.4) ────────────────────────────
-                            // Max 3, and only at n>=3 with a contrast set.
-                            // Shown from the `unlock` rung so the empty state
-                            // ("threads need the same thing on three
-                            // different days") does the teaching.
-                            if vm.maturity.canShowThreads || !vm.threads.threads.isEmpty {
-                                ThreadsSectionView(
-                                    threads: vm.threads,
-                                    canShow: vm.maturity.canShowThreads,
-                                    unlockHint: vm.unlockHint,
-                                    onSelect: { thread in
-                                        selectedThread = thread
-                                        showProofSheet = true
+                            // ── WHAT SPILR THINKS IT KNOWS (§9) ───────────
+                            // The Person Model's signatures — v3.1's
+                            // replacement for the Threads section. Shown once
+                            // there is at least one item OR the account has
+                            // reached the point threads used to unlock at, so
+                            // the empty state ("nothing confirmed yet")
+                            // appears rather than the section just vanishing.
+                            if vm.maturity.canShowThreads || !vm.personModelItems.isEmpty {
+                                ModelRowsSectionView(
+                                    items: vm.personModelItems,
+                                    onSelect: { item in
+                                        exploreSeed = item.testQuestion ?? "Tell me more about: \(item.displayTitle)"
+                                        showExploreChat = true
                                     }
                                 )
                             }
+
+                            // ── WHAT IT DOESN'T KNOW YET (§9) ─────────────
+                            // 1-2 open hypotheses, tappable — data collection
+                            // and therapy are the same act (§6).
+                            OpenQuestionsSectionView(
+                                openHypotheses: vm.personModel.openHypotheses,
+                                onSelect: { hyp in
+                                    exploreSeed = hyp.testQuestion ?? hyp.hypothesis
+                                    showExploreChat = true
+                                }
+                            )
 
                             if vm.maturity.canShowFirstSketch && vm.firstSevenAvailable && !firstSketchSeen {
                                 firstSketchBanner
@@ -822,11 +817,13 @@ struct MirrorView: View {
             .sheet(isPresented: $showAsk) {
                 AskView(userId: vm.userId)
             }
-            // §5.2's proof sheet, shared by Today's "more…" and every thread
-            // row. `selectedThread` decides which proof is shown; it is
-            // cleared on dismiss so the next "more…" goes back to Today.
-            .sheet(isPresented: $showProofSheet, onDismiss: { selectedThread = nil }) {
-                if let reading = vm.reading, let proof = reading.proof, selectedThread == nil {
+            // §5.2's proof sheet, opened from Today's "more…". A v3.0 reading
+            // (source is an observation) has a numeric `proof`; a v3.1 line
+            // (source is a Person Model signature/because/say-do/exception)
+            // does not — its receipt and `wouldBeFalseIf` ARE the proof, so
+            // that case gets the lighter PersonModelReadingDetailView instead.
+            .sheet(isPresented: $showProofSheet) {
+                if let reading = vm.reading, let proof = reading.proof {
                     ProofSheetView(
                         line: reading.line,
                         proof: proof,
@@ -845,12 +842,15 @@ struct MirrorView: View {
                         },
                         onDismiss: { showProofSheet = false }
                     )
-                } else if let thread = selectedThread {
-                    ThreadProofSheetView(
-                        thread: thread,
+                } else if let reading = vm.reading {
+                    PersonModelReadingDetailView(
+                        reading: reading,
+                        onFeedback: { feedback, reason in
+                            vm.onReadingFeedback(feedback, reason: reason, reading: reading)
+                        },
                         onAsk: {
                             showProofSheet = false
-                            exploreSeed = thread.title
+                            exploreSeed = reading.line
                             showExploreChat = true
                         },
                         onTeach: {
@@ -866,10 +866,10 @@ struct MirrorView: View {
             // exclusions. The correction outranks the inference (PI-010).
             .sheet(isPresented: $showTeachSheet) {
                 TeachSpilrSheet(
-                    subject: selectedThread?.title ?? vm.reading?.line ?? "",
+                    subject: vm.reading?.line ?? "",
                     onSubmit: { text in
                         vm.submitCorrection(text,
-                                            hypothesisId: selectedThread?.hypothesisId,
+                                            hypothesisId: nil,
                                             observationId: vm.reading?.sourceId)
                         showTeachSheet = false
                     },
@@ -892,50 +892,6 @@ struct MirrorView: View {
             .fullScreenCover(item: $silenceSeedPrompt.asIdentifiablePrompt) { prompt in
                 SpillWriteView(userId: vm.userId, prompt: prompt.value) {
                     Task { await vm.load(showSpinner: false) }
-                }
-            }
-            .sheet(isPresented: $showMoreSheet) {
-                if let card = vm.mirrorCard {
-                    MirrorMoreSheet(
-                        onFeedback: { feedback in
-                            vm.onMirrorFeedback(feedback, card: card)
-                            showMoreSheet = false
-                        },
-                        onTeachSpilr: {
-                            showMoreSheet = false
-                            selectedHypothesis = cardHypothesis
-                            showEvidenceDrawer = true
-                        },
-                        onReadFullMirror: {
-                            showMoreSheet = false
-                            AnalyticsManager.shared.trackPatternExplored(
-                                archetype: card.patternName ?? "unknown"
-                            )
-                            exploreSeed = card.displayLine
-                            showExploreChat = true
-                        }
-                    )
-                    .presentationDetents([.medium])
-                }
-            }
-            .sheet(isPresented: $showEvidenceDrawer) {
-                if let h = selectedHypothesis {
-                    EvidenceDrawerView(
-                        hypothesis: h,
-                        card: h.id == cardHypothesis?.id ? vm.mirrorCard : nil,
-                        onDismiss: {
-                            showEvidenceDrawer = false
-                            selectedHypothesis = nil
-                        },
-                        onCorrect: { corrected in
-                            for i in vm.hypotheses.indices where vm.hypotheses[i].id == corrected.id {
-                                vm.hypotheses[i].status = .dismissed
-                            }
-                        },
-                        onHide: { hypothesisId in
-                            vm.onFeedback(hypothesisId: hypothesisId, status: .dismissed)
-                        }
-                    )
                 }
             }
             .navigationDestination(isPresented: $vm.showSelfModel) {
@@ -1141,9 +1097,10 @@ struct MirrorView: View {
 // The flat "Your patterns" list is gone. It rendered every surfaceable
 // hypothesis with a taxonomy label, a trend badge and a "Seen N×" count —
 // nineteen rows on the account in the 9 Sept screenshots, eighteen of them
-// seen once and six of them the same pattern reworded. Threads
-// (ThreadsSectionView, §5.4) replaces it: at most three, each requiring three
-// distinct days, a contrast set and a passed audit before it can appear.
+// seen once and six of them the same pattern reworded. v3's Threads section
+// replaced it (at most three, each requiring three distinct days, a contrast
+// set and a passed audit); v3.1 replaces THAT in turn with the Person
+// Model's signatures (ModelRowsSectionView, "what Spilr thinks it knows").
 
 
 // MARK: - Ask, AskView, MirrorMoreSheet, MirrorSilenceCardView live in their

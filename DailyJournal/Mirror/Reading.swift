@@ -128,6 +128,16 @@ struct Reading {
     let unlockHint: String?
     let userStatus: String
     let computedAt: Date
+    /// Mirror v3.1 (mirror-v3.1-person-model-2026-09-10.md §7-9). One of
+    /// SIGNATURE / BECAUSE / SAYDO / EXCEPTION when `source.kind ==
+    /// "personModel"`; nil for a v3.0 observation-only reading, which still
+    /// renders exactly as before.
+    let shape: String?
+    /// Prompt M's own falsifiability test — "name the entry that would have
+    /// made this line false." Shown, not just logged: collaborative
+    /// empiricism means the user gets to see what would change the model's
+    /// mind, not just that it has one.
+    let wouldBeFalseIf: String?
 
     init?(from data: [String: Any]) {
         guard let date = data["date"] as? String else { return nil }
@@ -149,9 +159,12 @@ struct Reading {
         self.unlockHint = data["unlockHint"] as? String
         self.userStatus = data["userStatus"] as? String ?? "unrated"
         self.computedAt = (data["computedAt"] as? Timestamp)?.dateValue() ?? Date()
+        self.shape = data["shape"] as? String
+        self.wouldBeFalseIf = data["wouldBeFalseIf"] as? String
     }
 
     var isConfirmed: Bool { userStatus == "this_is_me" }
+    var isHuh: Bool { userStatus == "huh" }
 
     /// The headline for a quiet day. Never apologetic — a silent day is the
     /// app being honest, and the copy should sound like it means it.
@@ -167,26 +180,32 @@ struct Reading {
 
 // MARK: - Feedback
 
-/// §5.2's two taps, plus the follow-up chips behind "Not quite".
+/// §9's three reactions on Today. `huh` is new in v3.1 — "new to me" — and is
+/// the one the "Didn't know that" metric (target >= 25%) is built from; it is
+/// weighted below `thisIsMe` (the strongest signal the model can get) but is
+/// not a rejection, so it never touches `notQuiteCount`.
 enum ReadingFeedback: String {
     case thisIsMe = "this_is_me"
+    case huh      = "huh"
     case almost   = "almost"
 }
 
 /// Why it missed — this is what makes "Not quite" teach the app something
 /// instead of just registering a complaint. Only `.tooMuch` lowers sharpness.
+/// §9: "'Not quite' -> three chips: Wrong (retire), Half (weaken + ask what's
+/// missing, one line), Too much (StylePreferences.sharpness -1)."
 enum ReadingMissReason: String, CaseIterable, Identifiable {
-    case tooMuch     = "too_much"
-    case wrong       = "wrong"
-    case alreadyKnew = "already_knew"
+    case tooMuch = "too_much"
+    case wrong   = "wrong"
+    case half    = "half"
 
     var id: String { rawValue }
 
     var label: String {
         switch self {
-        case .tooMuch:     return "Too much"
-        case .wrong:       return "Wrong"
-        case .alreadyKnew: return "Already knew"
+        case .tooMuch: return "Too much"
+        case .wrong:   return "Wrong"
+        case .half:    return "Half"
         }
     }
 }
