@@ -4151,6 +4151,78 @@ async function writeNextQuestionForUser(db, uid, now) {
   return { written: true, question, hypothesisId };
 }
 
+/**
+ * The whole v3.1 pass for one user: formulate (F), write today's line (M),
+ * pick tomorrow's question (Q).
+ *
+ * DELIBERATELY INDEPENDENT of the v2 miner's cadence gate. The first version
+ * of this nested the three calls inside `mineUserInsights`'s
+ * `if (!r.skipped)` branch, which sits behind an early `return` on
+ * `below_cadence_threshold` — so on any night the user had not written 3+ new
+ * entries, the Person Model never ran at all. That is exactly backwards:
+ * `formulatePersonModelForUser` carries its OWN cadence gate
+ * (`lastFormulateRunAt` / FORMULATE_MIN_NEW_ANALYSES) precisely so it can
+ * decide for itself, and Prompt M is a DAILY surface whose whole job is to
+ * say something about a model that may not have changed since last night.
+ *
+ * Reads the derived layer rather than recomputing it: `computeUserDerived`
+ * already ran `runDerivedForUser` for every user minutes earlier and
+ * tail-chained into this worker, so `derived/facts` and `observations/*` are
+ * fresh on disk. Recomputing them here would double the nightly Firestore
+ * cost for no new information.
+ */
+async function runPersonModelForUser(db, uid, now) {
+  const userRef = db.collection("users").doc(uid);
+  const [factsSnap, lifeCtxSnap, styleSnap] = await Promise.all([
+    userRef.collection("derived").doc("facts").get(),
+    userRef.collection("lifeContext").doc("current").get(),
+    userRef.collection("stylePreferences").doc("current").get(),
+  ]);
+  if (!factsSnap.exists) return { skipped: true, reason: "no_facts" };
+
+  const facts = factsSnap.data();
+  // The persisted list form back into the map shape every reader expects —
+  // same restore `runNightlyForUser` does when it skips the facts stage.
+  facts.firstSeen = firstSeenFromDoc(facts);
+  const tz = facts.timezone || "UTC";
+  const lifeContextStr = lifeCtxSnap.exists ? lifeContextBlock(lifeCtxSnap.data()) : "";
+  const stylePrefsObj = styleSnap.exists ? styleSnap.data() : null;
+
+  const [analysesSnap, observationsSnap] = await Promise.all([
+    userRef.collection("entryAnalyses")
+      .orderBy("createdAt", "desc").limit(DERIVED_READ_LIMIT).get(),
+    userRef.collection("observations").limit(OBSERVATION_KEEP).get(),
+  ]);
+  const analyses = analysesSnap.docs.map((d) => {
+    const x = d.data();
+    return {
+      ...x,
+      entryId: x.entryId || d.id,
+      createdAt: toDate(x.createdAt),
+      entryCreatedAt: toDate(x.entryCreatedAt),
+    };
+  });
+  const observations = observationsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+  const formulated = await formulatePersonModelForUser(
+    db, uid, now, facts, analyses, lifeContextStr, stylePrefsObj);
+
+  // M and Q run whether or not F did. F is "nightly, when >= 3 new analyses";
+  // M is "daily, one" — gating the line on the formulation having run is what
+  // would make today's Mirror go stale on every quiet day.
+  const line = await selectAndWriteMirrorLineForUser(
+    db, uid, now, tz, facts, observations, analyses, lifeContextStr, stylePrefsObj);
+  const question = await writeNextQuestionForUser(db, uid, now);
+
+  console.log("personModelPass", {
+    uid,
+    formulate: formulated.skipped ? `skipped:${formulated.reason}` : `written:${formulated.written}`,
+    line: line.written ? `written:${line.shape}` : `skipped:${line.reason}`,
+    question: question.written ? "written" : `skipped:${question.reason}`,
+  });
+  return { formulated, line, question };
+}
+
 /** mirrorAsk's cost ceiling: a plain daily cap, not the full token-budget
  *  ledger — this is a user-triggered, on-demand call (like bootstrapMirror /
  *  refreshDerived), and a generous fixed cap bounds the worst case without
@@ -4550,6 +4622,12 @@ exports.mineUserInsights = onTaskDispatched(
         console.error("dedup failed", { uid, error: String(e) });
       }
 
+      // The cadence gate guards the V2 MINE ONLY. It used to `return` out of
+      // the whole handler, which also skipped the v3.1 Person Model pass at
+      // the bottom — and since most nights have no new analyses, that meant
+      // Prompts F/M/Q never ran for anyone. The gate now sets a flag instead;
+      // the Person Model pass below carries its own, separate cadence.
+      let belowMineCadence = false;
       if (lastMineRunAt) {
         const newEntriesSnap = await db.collection("users").doc(uid)
           .collection("entryAnalyses")
@@ -4564,11 +4642,13 @@ exports.mineUserInsights = onTaskDispatched(
             uid, skipped: true, reason: "below_cadence_threshold",
             newAnalyses: newEntriesSnap.size, hoursSinceLastMine,
           });
-          return;
+          belowMineCadence = true;
         }
       }
 
-      const r = await mineHypothesesForUser(db, uid, now);
+      const r = belowMineCadence
+        ? { skipped: true, reason: "below_cadence_threshold" }
+        : await mineHypothesesForUser(db, uid, now);
 
       // Update lastMineRunAt after a genuine evaluation — but NOT one that
       // never reached the corpus at all ("immature": fewer than MIN_ANALYSES
@@ -4579,7 +4659,12 @@ exports.mineUserInsights = onTaskDispatched(
       // above AND bootstrapMirror's one-shot gate, silently disabling the
       // brand-new-user bootstrap for up to MINE_MAX_STALENESS_HOURS even
       // though nothing was ever actually mined for them.
-      if (!(r.skipped && r.reason === "immature")) {
+      //
+      // `belowMineCadence` is excluded for the same class of reason: the
+      // cadence skip means no mine was attempted, so stamping here would
+      // reset the staleness clock every single night and
+      // MINE_MAX_STALENESS_HOURS would never fire for a quiet journaler.
+      if (!belowMineCadence && !(r.skipped && r.reason === "immature")) {
         await db.collection("users").doc(uid).update({
           lastMineRunAt: admin.firestore.Timestamp.fromDate(now),
         });
@@ -4608,27 +4693,24 @@ exports.mineUserInsights = onTaskDispatched(
               stylePrefs: styleSnap.exists ? styleSnap.data() : null,
             });
           readingStep = reading.silence ? "silence" : (reading.lintPassed ? "reading" : "observation");
-
-          // Mirror v3.1 — the Person Model. Own try/catch per stage, same
-          // reasoning as the block above: none of this may make Cloud Tasks
-          // retry the mine or the v3.0 reading, both already committed.
-          const lifeContextStr = lifeCtxSnap.exists ? lifeContextBlock(lifeCtxSnap.data()) : "";
-          const stylePrefsObj = styleSnap.exists ? styleSnap.data() : null;
-          try {
-            const f = await formulatePersonModelForUser(
-              db, uid, now, derived.facts, derived.analyses, lifeContextStr, stylePrefsObj);
-            if (!f.skipped) {
-              await selectAndWriteMirrorLineForUser(
-                db, uid, now, derived.tz, derived.facts, derived.observations,
-                derived.analyses, lifeContextStr, stylePrefsObj);
-              await writeNextQuestionForUser(db, uid, now);
-            }
-          } catch (e) {
-            console.error("mineUserInsights: person model failed", { uid, error: String(e) });
-          }
         } catch (e) {
           console.error("mineUserInsights: derived/reading failed", { uid, error: String(e) });
         }
+      }
+
+      // Mirror v3.1 — the Person Model, OUTSIDE the v2 mine's cadence gate and
+      // outside `if (!r.skipped)`. See runPersonModelForUser's header: F has
+      // its own cadence, M is daily, and neither has anything to do with
+      // whether the v2 miner had enough new material tonight. Own try/catch:
+      // none of this may make Cloud Tasks retry the mine or the v3.0 reading,
+      // both of which are already committed by this point.
+      let personModelStep = null;
+      try {
+        const pm = await runPersonModelForUser(db, uid, now);
+        personModelStep = pm.skipped ? `skipped:${pm.reason}`
+          : (pm.line && pm.line.written ? `line:${pm.line.shape}` : "no_line");
+      } catch (e) {
+        console.error("mineUserInsights: person model failed", { uid, error: String(e) });
       }
 
       // The legacy per-hypothesis card deck. Still written for ONE release so a
@@ -4645,7 +4727,7 @@ exports.mineUserInsights = onTaskDispatched(
         }
       }
 
-      console.log("mineUserInsights", { uid, ...r, cardsWritten, readingStep });
+      console.log("mineUserInsights", { uid, ...r, cardsWritten, readingStep, personModelStep });
     } catch (e) {
       // Rethrow so Cloud Tasks retries with backoff. Swallowing here would
       // reproduce the old behaviour: a silent per-user failure nobody notices.
@@ -4772,33 +4854,23 @@ exports.bootstrapMirror = onRequest(
       let derivedOk = false;
       if (!r.skipped) {
         try {
-          const derived = await runDerivedForUser(db, uid, now);
+          await runDerivedForUser(db, uid, now);
           derivedOk = true;
-          // Person Model, best-effort — a brand-new user almost always has
-          // too few analyses yet (formulatePersonModelForUser's own
-          // MIN_ANALYSES gate skips as "immature"), so this is cheap when it
-          // has nothing to do and complete when it does.
-          try {
-            const [lifeCtxSnap, styleSnap] = await Promise.all([
-              db.collection("users").doc(uid).collection("lifeContext").doc("current").get(),
-              db.collection("users").doc(uid).collection("stylePreferences").doc("current").get(),
-            ]);
-            const lifeContextStr = lifeCtxSnap.exists ? lifeContextBlock(lifeCtxSnap.data()) : "";
-            const stylePrefsObj = styleSnap.exists ? styleSnap.data() : null;
-            const f = await formulatePersonModelForUser(
-              db, uid, now, derived.facts, derived.analyses, lifeContextStr, stylePrefsObj);
-            if (!f.skipped) {
-              await selectAndWriteMirrorLineForUser(
-                db, uid, now, derived.tz, derived.facts, derived.observations,
-                derived.analyses, lifeContextStr, stylePrefsObj);
-              await writeNextQuestionForUser(db, uid, now);
-            }
-          } catch (e) {
-            console.error("bootstrapMirror: person model failed", { uid, error: String(e) });
-          }
         } catch (e) {
           console.error("bootstrapMirror: derived failed", { uid, error: String(e) });
         }
+      }
+
+      // Person Model, on the same footing as in mineUserInsights: outside
+      // `if (!r.skipped)`, because its own gates (immature / cadence / crisis)
+      // are the ones that should decide, not the v2 miner's.
+      let personModelStep = null;
+      try {
+        const pm = await runPersonModelForUser(db, uid, now);
+        personModelStep = pm.skipped ? `skipped:${pm.reason}`
+          : (pm.line && pm.line.written ? `line:${pm.line.shape}` : "no_line");
+      } catch (e) {
+        console.error("bootstrapMirror: person model failed", { uid, error: String(e) });
       }
 
       let cardsWritten = 0;
@@ -4810,7 +4882,7 @@ exports.bootstrapMirror = onRequest(
         }
       }
 
-      console.log("bootstrapMirror", { uid, ...r, cardsWritten, derivedOk });
+      console.log("bootstrapMirror", { uid, ...r, cardsWritten, derivedOk, personModelStep });
       res.status(200).json({ ran: true, written: r.written || 0, cardsWritten });
     } catch (e) {
       console.error("bootstrapMirror error", { uid, error: String(e) });
@@ -5240,6 +5312,13 @@ exports.runNightlyForUser = onRequest(
       if (stages.includes("question")) {
         out.question = await writeNextQuestionForUser(db, uid, now);
         out.ran.push("question");
+      }
+      // The whole v3.1 pass in one stage, exactly as the nightly worker runs
+      // it — reads the persisted derived layer, so it needs `facts` to have
+      // been computed at some point but not in this same call.
+      if (stages.includes("personModel")) {
+        out.personModel = await runPersonModelForUser(db, uid, now);
+        out.ran.push("personModel");
       }
 
       res.status(200).json(out);
