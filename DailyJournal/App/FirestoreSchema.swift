@@ -154,6 +154,15 @@ enum FirestoreSchema {
     /// with the account.
     static let readings = "readings"
 
+    /// Mirror v3.1 — the Person Model (mirror-v3.1-person-model-2026-09-10.md
+    /// §4). `patternHypotheses`' successor: one doc per hypothesis item
+    /// (signature/rule/need/loop/distortion/person/coreBelief/value/strength),
+    /// written server-side by Prompt F. The client patches `userStatus`,
+    /// `shownAt`, `notQuiteCount` and `respondedAt` only (see firestore.rules).
+    /// The non-correctable aggregate (needs, openHypotheses, trajectory)
+    /// lives at `derived/personModel`, alongside `derived/facts`.
+    static let personModel = "personModel"
+
     /// Every user subcollection this app has ever written to.
     ///
     /// Account deletion walks this list. Order is irrelevant. Retired collections
@@ -183,6 +192,7 @@ enum FirestoreSchema {
         derived,
         observations,
         readings,
+        personModel,
     ]
 
     // MARK: - Storage

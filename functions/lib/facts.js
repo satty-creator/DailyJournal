@@ -109,6 +109,33 @@ function bump(map, key, by = 1) {
   map.set(key, (map.get(key) || 0) + by);
 }
 
+/**
+ * The user's own top-200 content-word vocabulary (mirror-v3.1 §8, lint rule
+ * 9, the swap test). Tokenises every plaintext field an EntryAnalysis holds
+ * — summary, tracked phrases, and each episode's situation — the same
+ * surface `unstatedBecause` in candidates.js is limited to, since the server
+ * never sees decrypted entry content. A line that, once its own quotes and
+ * numbers are stripped, still contains two or more of these words is
+ * grounded in THIS person's words; a line that doesn't could be about
+ * anyone.
+ */
+function computeVocabTop(analyses, n = 200) {
+  const counts = new Map();
+  const bumpWords = (text) => {
+    if (!text) return;
+    for (const w of normalise(text).split(/[^a-z0-9]+/)) {
+      if (w.length < 4 || STOP.has(w)) continue;
+      bump(counts, w);
+    }
+  };
+  for (const a of (analyses || [])) {
+    bumpWords(a.surfaceSummary);
+    for (const p of (a.phrasesToTrack || [])) bumpWords(p);
+    for (const e of (a.episodes || [])) bumpWords(e && e.situation);
+  }
+  return topN(counts, n, "word").map((r) => r.word);
+}
+
 /** Map → [{key, count}] sorted desc, capped. */
 function topN(map, n, keyName, countName = "count") {
   return [...map.entries()]
@@ -408,6 +435,7 @@ function computeFacts({ entries, analyses, tz, now, entriesTotal }) {
     entryMeta,
     firstSeen: firstSeenCapped,
     templateRuns,
+    vocabTop200: computeVocabTop(safeAnalyses, 200),
     unlock: unlockStateFor(
       typeof entriesTotal === "number" ? entriesTotal : safeEntries.length,
       counters
@@ -445,5 +473,6 @@ module.exports = {
   computeFacts,
   mergeFirstSeen,
   buildDayTerms,
+  computeVocabTop,
   unlockStateFor,
 };

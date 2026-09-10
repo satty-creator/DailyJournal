@@ -130,6 +130,17 @@ service cloud.firestore {
         allow create, delete: if false;
       }
 
+      // The Person Model (mirror-v3.1-person-model-2026-09-10.md §4) —
+      // patternHypotheses' successor. Same shape of promise: "This is me" /
+      // "Not quite" (and its Wrong/Half/Too much follow-up) are the user's
+      // to set; evidence, confidence, and the disconfirmation verdict are
+      // server truth, assembled by Prompt F and the gate in gate.js.
+      match /personModel/{docId} {
+        allow update: if isOwner(userId)
+                      && onlyChanges(['userStatus', 'shownAt', 'notQuiteCount', 'respondedAt']);
+        allow create, delete: if false;
+      }
+
       match /mirrorLetters/{docId} {
         allow update: if isOwner(userId) && onlyChanges(['openedAt']);
         allow create, delete: if false;

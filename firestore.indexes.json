@@ -68,6 +68,31 @@
       "collectionGroup": "derived",
       "fieldPath": "firstSeen",
       "indexes": []
+    },
+    {
+      "collectionGroup": "derived",
+      "fieldPath": "openHypotheses",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "derived",
+      "fieldPath": "needs",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "personModel",
+      "fieldPath": "embedding",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "personModel",
+      "fieldPath": "evidenceEntryIds",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "personModel",
+      "fieldPath": "counterEvidenceEntryIds",
+      "indexes": []
     }
   ]
 }
