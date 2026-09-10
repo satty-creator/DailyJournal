@@ -30,14 +30,28 @@ const {
   daysBetweenKeys, relativeLabel, shortDate,
 } = require("./lib/time");
 const {
-  computeFacts, mergeFirstSeen, LADDER,
+  computeFacts, mergeFirstSeen, LADDER, buildDayTerms,
 } = require("./lib/facts");
-const { computeObservations } = require("./lib/observations");
 const {
-  lintCopy, lintMirrorLine, tripsBannedLint, tripsLabelLint,
+  computeObservations, cooccurrences, exceptionsFrom,
+} = require("./lib/observations");
+const {
+  lintCopy, lintMirrorLine, lintMirrorM, tripsBannedLint, tripsLabelLint,
   HEDGE_WORDS, TRAIT_PHRASING, BANNED_SUBSTRINGS, BANNED_LABELS,
 } = require("./lib/lint");
 const { clusterHypotheses, normaliseVector } = require("./lib/identity");
+const { unstatedBecause, sayDoGaps, contextSplits } = require("./lib/candidates");
+const {
+  itemIdFor, confidenceBandFor, displayTitleFor, keyTextFor, levelForKind,
+  notMeShouldReturn, DO_NOT_INFER,
+} = require("./lib/personModel");
+const {
+  gateSignatureItem, gateBecauseCandidate, gateSayDoCandidate,
+  gateExceptionObservation, selectForToday,
+} = require("./lib/gate");
+const {
+  buildFormulationPrompt, buildNextQuestionPrompt, buildMirrorMPrompt, buildAskPrompt,
+} = require("./lib/prompts");
 
 admin.initializeApp();
 
@@ -3596,6 +3610,640 @@ Return ONLY valid JSON:
   };
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ *  MIRROR v3.1 — THE PERSON MODEL (mirror-v3.1-person-model-2026-09-10.md)
+ *
+ *  Four prompts on top of the v3.0 pipeline above: F formulates the model,
+ *  Q picks tomorrow's question, M writes today's line in one of four
+ *  shapes, ASK answers questions about the person FROM the model. The
+ *  legacy v2 path (mineHypothesesForUser / updateSelfModel / the mirrorCards
+ *  deck) still runs alongside this for one release (§ Phase 5 of the build
+ *  plan retires it) — nothing here reads from or writes to patternHypotheses.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const FORMULATE_PROMPT_VERSION = "mirror-formulate-v1";
+const QUESTION_PROMPT_VERSION = "mirror-question-v1";
+const MIRROR_LINE_V31_PROMPT_VERSION = "mirror-line-v2";
+const ASK_V31_PROMPT_VERSION = "mirror-ask-v1";
+
+const FORMULATE_MIN_NEW_ANALYSES = 3;   // same cadence shape as MIN_NEW_ANALYSES_TO_MINE
+const FORMULATE_MAX_STALENESS_HOURS = 72;
+const FORMULATE_ANALYSIS_LOOKBACK = 20; // most-recent N analyses handed to Prompt F
+const PERSON_MODEL_ITEM_LIMIT = 60;     // bounded read, same reasoning as patternHypotheses reads
+const ASKED_HYPOTHESES_KEEP = 20;
+const ASK_DAILY_CAP = 20;               // mirrorAsk's cost ceiling — see claimAskCall
+
+/** Prompt F's SIGNALS block — the most recent entries, with verbatim quotes
+ *  and dates, distilled the same way buildMinePrompt's notes already are. */
+function buildSignalsBlockForFormulation(analyses, entryDates, limit) {
+  const capped = [...(analyses || [])]
+    .sort((a, b) => (toDate(b.entryCreatedAt) || 0) - (toDate(a.entryCreatedAt) || 0))
+    .slice(0, limit);
+  const rendered = capped.map((a) => ({
+    entryId: a.entryId,
+    date: entryDates[a.entryId] || null,
+    situation: a.surfaceSummary || null,
+    quotes: (a.phrasesToTrack || []).slice(0, 4),
+    emotions: a.explicitEmotions || [],
+    moves: (a.protectiveStrategies || [])
+      .map((s) => (typeof s === "string" ? s : (s && s.strategy)))
+      .filter(Boolean),
+    needs: a.needs || [],
+    people: (a.people || []).map((p) => p && p.name).filter(Boolean),
+    bodySignals: a.bodySignals || [],
+    values: a.valuesPresent || [],
+    openLoops: a.openLoops || [],
+    episodes: (a.episodes || []).map((e) => ({
+      situation: e && e.situation, outcome: e && e.outcome,
+      move: e && (e.protectiveStrategy || e.move),
+    })),
+  }));
+  return JSON.stringify(rendered, null, 2);
+}
+
+/** Prompt F's CANDIDATES block — what statistics found (candidates.js +
+ *  observations.js's cooccurrences/exceptions), capped small per type. The
+ *  model decides what, if anything, these mean; it may reject any of them. */
+function buildCandidatesBlockForFormulation({ becauseCands, sayDoCands, splits, exceptions }) {
+  return JSON.stringify({
+    unstated_because: (becauseCands || []).slice(0, 5).map((c) => ({
+      subject: c.subject, object: c.object, n: c.n, k: c.k, lift: c.lift,
+    })),
+    say_do_pairs: (sayDoCands || []).slice(0, 5).map((c) => ({
+      want: c.wantTerm, did: c.didTerm, n: c.n,
+    })),
+    cross_context_splits: (splits || []).slice(0, 5).map((c) => ({
+      strategy: c.subject, contexts: c.contexts, n: c.n,
+    })),
+    exceptions: (exceptions || []).slice(0, 5).map((o) => ({
+      subject: o.subject, object: o.object, exceptionDays: o.exceptionDays, n: o.n, k: o.k,
+    })),
+  }, null, 2);
+}
+
+/** Prompt F's CURRENT MODEL block, and mirrorAsk's — existing items with the
+ *  user's own confirmations/corrections, so both prompts see what already
+ *  exists and outrank their own inference where it conflicts. */
+function buildCurrentModelBlockForFormulation(items) {
+  const rendered = (items || []).slice(0, 40).map((it) => ({
+    id: it.id, kind: it.kind, text: displayTitleFor(it),
+    confidence: confidenceBandFor(it), userStatus: it.userStatus || "unrated",
+    timesSeen: it.timesSeen || 0,
+  }));
+  return JSON.stringify(rendered, null, 2);
+}
+
+/**
+ * Writes Prompt F's output: upserts personModel items (deterministic id =
+ * itemIdFor(kind, keyText), so the SAME signature recomputed tonight merges
+ * into the same doc rather than forking), retires anything in `retire[]`
+ * (never a user-confirmed item), and writes the non-correctable aggregate
+ * (needs, openHypotheses) to derived/personModel.
+ */
+async function writeFormulationOutput(db, uid, now, output, existingById) {
+  const userRef = db.collection("users").doc(uid);
+  const batch = db.batch();
+  let written = 0;
+
+  const upsert = (kind, payload, evidenceEntryIds, testQuestion) => {
+    const keyText = keyTextFor({ kind, ...payload });
+    if (!keyText || !keyText.trim()) return null;
+    const id = itemIdFor(kind, keyText);
+    const prior = existingById[id] || {};
+    if (prior.userStatus === "not_me" && !notMeShouldReturn(prior, evidenceEntryIds)) {
+      return null; // retired, and not enough NEW contradicting evidence to return
+    }
+    const mergedEvidence = [...new Set([
+      ...(prior.evidenceEntryIds || []), ...(evidenceEntryIds || []),
+    ])].slice(-60);
+    const doc = {
+      schemaVersion: 1,
+      id, kind, level: levelForKind(kind),
+      ...payload,
+      evidenceEntryIds: mergedEvidence,
+      counterEvidenceEntryIds: prior.counterEvidenceEntryIds || [],
+      timesSeen: mergedEvidence.length,
+      userStatus: prior.userStatus || "unrated",
+      status: (prior.userStatus === "not_me" && prior.status === "retired") ? "retired" : "active",
+      disconfirmationVerdict: prior.disconfirmationVerdict || null,
+      firstSeenAt: prior.firstSeenAt || admin.firestore.Timestamp.fromDate(now),
+      lastEvidenceAt: admin.firestore.Timestamp.fromDate(now),
+      lastTestedAt: prior.lastTestedAt || null,
+      testQuestion: testQuestion || prior.testQuestion || null,
+      promptVersion: FORMULATE_PROMPT_VERSION,
+      derivedFrom: {
+        entryIds: (evidenceEntryIds || []).slice(0, 20),
+        computedAt: admin.firestore.Timestamp.fromDate(now),
+      },
+    };
+    batch.set(userRef.collection("personModel").doc(id), doc, { merge: true });
+    written++;
+    return id;
+  };
+
+  for (const s of (output.signatures || [])) {
+    upsert("signature", {
+      if: s.if || "", then: s.then || "", notWhen: s.not_when || "",
+      contexts: Array.isArray(s.contexts) ? s.contexts.slice(0, 6) : [],
+      crossContext: !!s.cross_context,
+    }, (s.evidence || []).map((e) => e && e.entryId).filter(Boolean));
+  }
+  for (const r of (output.rules || [])) {
+    upsert("rule", { rule: r.rule || "", fromThoughts: (r.from_thoughts || []).slice(0, 5) }, []);
+  }
+  for (const l of (output.maintenance_loops || [])) {
+    upsert("loop", { move: l.move || "", relief: l.relief || "", cost: l.cost || "" }, []);
+  }
+  for (const d of (output.distortions || [])) {
+    upsert("distortion", { plainName: d.plain_name || "", quote: d.quote || "" },
+      d.entryId ? [d.entryId] : []);
+  }
+  for (const p of (output.people || [])) {
+    upsert("person", {
+      name: p.name || "", roleTheyTake: p.role_they_take || "",
+      move: p.move || "", exception: p.exception || "",
+    }, []);
+  }
+  for (const st of (output.strengths || [])) {
+    upsert("strength", { capacity: st.capacity || "", shownWhen: st.shown_when || "" }, []);
+  }
+
+  for (const id of (output.retire || [])) {
+    const prior = existingById[id];
+    if (!prior || prior.userStatus === "this_is_me") continue; // never retire a confirmed item
+    batch.set(userRef.collection("personModel").doc(id), { status: "retired" }, { merge: true });
+  }
+
+  const openHypotheses = (output.open_hypotheses || []).slice(0, 8).map((h) => ({
+    id: itemIdFor("openHypothesis", `${h.hypothesis || ""}|${h.test_question || ""}`),
+    hypothesis: h.hypothesis || "",
+    wouldConfirm: h.would_confirm || "",
+    wouldReject: h.would_reject || "",
+    testQuestion: h.test_question || "",
+    value: typeof h.value === "number" ? Math.max(0, Math.min(1, h.value)) : 0.5,
+  })).sort((a, b) => b.value - a.value);
+
+  batch.set(userRef.collection("derived").doc("personModel"), {
+    schemaVersion: 1,
+    userId: uid,
+    needs: output.needs || null,
+    openHypotheses,
+    computedAt: admin.firestore.Timestamp.fromDate(now),
+    promptVersion: FORMULATE_PROMPT_VERSION,
+  }, { merge: true });
+
+  await batch.commit();
+  return { written, openHypotheses: openHypotheses.length };
+}
+
+/**
+ * Prompt F — nightly, when there is real new material (same cadence shape
+ * as the v2 miner). Builds the SIGNALS/CANDIDATES/CURRENT MODEL blocks,
+ * calls the model, and writes the update. The crisis gate runs BEFORE the
+ * model call, over the same corpus Prompt A already extracted — hard, not a
+ * hedge, matching PatternSafety.corpusHasCrisisSignal on the client.
+ */
+async function formulatePersonModelForUser(db, uid, now, facts, analyses, lifeContext, stylePrefs) {
+  const userRef = db.collection("users").doc(uid);
+
+  if ((analyses || []).length < MIN_ANALYSES) {
+    return { skipped: true, reason: "immature" };
+  }
+
+  const corpusText = analyses.map((a) => [
+    a.surfaceSummary, ...(a.phrasesToTrack || []),
+    ...((a.episodes || []).map((e) => e && e.situation)),
+  ].filter(Boolean).join(" ")).join(" ");
+  if (containsCrisisSignal(corpusText)) {
+    console.log("formulatePersonModel", { uid, skipped: true, reason: "crisis_signal" });
+    return { skipped: true, reason: "crisis_signal" };
+  }
+
+  const userSnap = await userRef.get();
+  const lastRunAt = userSnap.exists && userSnap.data().lastFormulateRunAt
+    ? userSnap.data().lastFormulateRunAt.toDate() : null;
+  if (lastRunAt) {
+    const newCount = analyses.filter((a) => {
+      const d = toDate(a.createdAt);
+      return d && d > lastRunAt;
+    }).length;
+    const hoursSince = (now.getTime() - lastRunAt.getTime()) / 3600000;
+    if (newCount < FORMULATE_MIN_NEW_ANALYSES && hoursSince < FORMULATE_MAX_STALENESS_HOURS) {
+      return { skipped: true, reason: "below_cadence_threshold" };
+    }
+  }
+
+  const { dayTerms, dayQuotes, termLabels } = buildDayTerms(analyses, facts.entryDates);
+  const activeDays = [...new Set(Object.values(facts.entryDates || {}))].sort();
+  const cooc = cooccurrences(dayTerms, activeDays, termLabels);
+  const exceptions = exceptionsFrom(cooc);
+  const becauseCands = unstatedBecause(cooc, dayQuotes);
+  const sayDoCands = sayDoGaps(analyses);
+  const splits = contextSplits(dayTerms, activeDays);
+
+  const existingSnap = await userRef.collection("personModel").limit(PERSON_MODEL_ITEM_LIMIT).get();
+  const existingItems = existingSnap.docs.map((d) => ({ id: d.id, ...d.data() }))
+    .filter((it) => it.status !== "retired");
+  const existingById = {};
+  for (const it of existingItems) existingById[it.id] = it;
+
+  const prompt = buildFormulationPrompt({
+    safetyRules: SAFETY_RULES, spilrVoice: SPILR_VOICE,
+    lifeContext: lifeContext || "", styleRules: styleRulesBlock(stylePrefs),
+    signalsBlock: buildSignalsBlockForFormulation(analyses, facts.entryDates, FORMULATE_ANALYSIS_LOOKBACK),
+    candidatesBlock: buildCandidatesBlockForFormulation({ becauseCands, sayDoCands, splits, exceptions }),
+    currentModelBlock: buildCurrentModelBlockForFormulation(existingItems),
+  });
+
+  let output;
+  try {
+    output = await callGeminiJSON(prompt, { maxTokens: 2200, temperature: 0.3 }, uid, "mirror_formulate");
+  } catch (e) {
+    console.error("formulatePersonModel: generation failed", { uid, error: String(e) });
+    return { skipped: true, reason: "generation_failed" };
+  }
+
+  const result = await writeFormulationOutput(db, uid, now, output || {}, existingById);
+  await userRef.set({ lastFormulateRunAt: admin.firestore.Timestamp.fromDate(now) }, { merge: true });
+  console.log("formulatePersonModel", { uid, ...result });
+  return { skipped: false, ...result };
+}
+
+/** The terms a signature is novelty-tracked and quote-looked-up by — its own
+ *  contexts (which double as domain terms) plus a stable per-item term so
+ *  two different signatures with overlapping contexts don't read as
+ *  identical for the 14-day novelty gate. */
+function signatureTermsFor(item) {
+  const contexts = (item.contexts || []).map((c) => `domain:${normalise(c)}`);
+  return [...contexts, `signature:${item.id}`];
+}
+
+/** Normalises the heterogeneous pool gate.js#selectForToday expects, from
+ *  confirmed signature items, this run's because/say-do candidates, and
+ *  this run's exception observations. */
+function buildGatePoolForToday(signatures, becauseCands, sayDoCands, exceptionObs) {
+  const pool = [];
+  for (const item of signatures) {
+    pool.push({
+      shape: "SIGNATURE", ref: item, gated: gateSignatureItem(item),
+      crossContext: !!item.crossContext, terms: signatureTermsFor(item),
+    });
+  }
+  for (const c of becauseCands) {
+    pool.push({ shape: "BECAUSE", ref: c, gated: gateBecauseCandidate(c), terms: c.terms });
+  }
+  for (const c of sayDoCands) {
+    pool.push({
+      shape: "SAYDO", ref: c, gated: gateSayDoCandidate(c),
+      terms: [`want:${normalise(c.wantTerm)}`, `did:${normalise(c.didTerm)}`],
+    });
+  }
+  for (const o of exceptionObs) {
+    pool.push({ shape: "EXCEPTION", ref: o, gated: gateExceptionObservation(o), terms: o.terms || [] });
+  }
+  return pool;
+}
+
+/** The JSON handed to Prompt M as "THE ITEM" — one shape per branch, holding
+ *  only what that shape's rule (§7) actually needs. */
+function itemBlockFor(shape, ref) {
+  switch (shape) {
+    case "SIGNATURE":
+      return JSON.stringify({
+        if: ref.if, then: ref.then, not_when: ref.notWhen, contexts: ref.contexts,
+      }, null, 2);
+    case "BECAUSE":
+      return JSON.stringify({
+        subject: ref.subject, object: ref.object, n: ref.n, k: ref.k, lift: ref.lift,
+      }, null, 2);
+    case "SAYDO":
+      return JSON.stringify({ want: ref.wantTerm, did: ref.didTerm, n: ref.n }, null, 2);
+    case "EXCEPTION":
+      return JSON.stringify({
+        subject: ref.subject, object: ref.object, exceptionDays: ref.exceptionDays,
+        n: ref.n, k: ref.k,
+      }, null, 2);
+    default:
+      return "{}";
+  }
+}
+
+/** Up to 3 deduped, dated quotes to hand Prompt M for this shape — from the
+ *  exception's own days, the candidate's own terms, or (for a signature) its
+ *  contexts. Best-effort: an empty list is valid and Prompt M is told so;
+ *  what it CANNOT do is invent a quote outside this list (checked after the
+ *  call — see the groundedness check in selectAndWriteMirrorLineForUser). */
+function quotesForShape(shape, ref, termQuotes, dayQuotes) {
+  let raw = [];
+  if (shape === "EXCEPTION") {
+    raw = (ref.exceptionDays || []).flatMap((d) => dayQuotes.get(d) || []);
+  } else if (shape === "SIGNATURE") {
+    for (const term of signatureTermsFor(ref)) raw = raw.concat(termQuotes.get(term) || []);
+  } else {
+    for (const term of (ref.terms || [])) raw = raw.concat(termQuotes.get(term) || []);
+  }
+  const seen = new Set();
+  const out = [];
+  for (const q of raw) {
+    if (!q || !q.text) continue;
+    const key = normalise(q.text);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(q);
+    if (out.length >= 3) break;
+  }
+  return out;
+}
+
+/**
+ * Prompt M — the gate, the call, the lint, the write. Selects the single
+ * best-ranked, gated candidate (gate.js#selectForToday), asks the model for
+ * one line in that shape, verifies the model's own receipt quote against
+ * what it was actually given (never trust a hallucinated quote), runs the
+ * full §8 lint, and on a pass writes `readings/{today}` — extending, not
+ * replacing, the doc `selectTodayFor` already wrote deterministically, so a
+ * lint failure here simply leaves that fallback in place.
+ */
+async function selectAndWriteMirrorLineForUser(db, uid, now, tz, facts, observations, analyses, lifeContext, stylePrefs) {
+  const userRef = db.collection("users").doc(uid);
+  const todayKey = localDateParts(now, tz).dateKey;
+
+  const { dayTerms, termQuotes, dayQuotes, termLabels } = buildDayTerms(analyses, facts.entryDates);
+  const activeDays = [...new Set(Object.values(facts.entryDates || {}))].sort();
+  const cooc = cooccurrences(dayTerms, activeDays, termLabels);
+  const becauseCands = unstatedBecause(cooc, dayQuotes);
+  const sayDoCands = sayDoGaps(analyses);
+  const exceptionObs = (observations || []).filter((o) => o.type === "exception");
+
+  const sigSnap = await userRef.collection("personModel").limit(PERSON_MODEL_ITEM_LIMIT).get();
+  const signatures = sigSnap.docs.map((d) => ({ id: d.id, ...d.data() }))
+    .filter((it) => it.kind === "signature" && it.status !== "retired");
+
+  const pool = buildGatePoolForToday(signatures, becauseCands, sayDoCands, exceptionObs);
+
+  const shownSnap = await userRef.collection("mirrorShown")
+    .where("shownAt", ">=", admin.firestore.Timestamp.fromDate(
+      new Date(now.getTime() - 30 * 86400000)))
+    .get();
+  const shownHistory = shownSnap.docs.map((d) => {
+    const x = d.data();
+    const daysAgo = x.shownAt && x.shownAt.toDate
+      ? Math.round((now.getTime() - x.shownAt.toDate().getTime()) / 86400000) : 999;
+    return { terms: Array.isArray(x.terms) ? x.terms : null, daysAgo };
+  });
+
+  const winner = selectForToday(pool, { shownHistory });
+  if (!winner) {
+    console.log("mirrorLineV31", { uid, picked: false, reason: "no_gated_candidate" });
+    return { written: false, reason: "no_gated_candidate" };
+  }
+
+  const quotes = quotesForShape(winner.shape, winner.ref, termQuotes, dayQuotes);
+  const quotesRendered = quotes.length
+    ? quotes.map((q, i) => `${i + 1}. "${q.text}" (${q.date ? shortDate(q.date) : "recently"})`).join("\n")
+    : "(none available — write from the item alone, and only quote if you genuinely can)";
+  const testQuestion = winner.ref.testQuestion ||
+    (winner.shape === "BECAUSE" ? "Have you ever put these two things in one sentence?" : null);
+
+  const prompt = buildMirrorMPrompt({
+    safetyRules: SAFETY_RULES, spilrVoice: SPILR_VOICE, styleRules: styleRulesBlock(stylePrefs),
+    itemBlock: itemBlockFor(winner.shape, winner.ref), shape: winner.shape,
+    quotesBlock: quotesRendered, testQuestion,
+  });
+
+  let output;
+  try {
+    output = await callGeminiJSON(prompt, { maxTokens: 300, temperature: 0.3 }, uid, "mirror_line");
+  } catch (e) {
+    console.log("mirrorLintReject", {
+      uid, surface: "mirror_line", rule: null, reason: "generation_failed", shape: winner.shape,
+    });
+    return { written: false, reason: "generation_failed" };
+  }
+  if (!output || !output.line) return { written: false, reason: "empty" };
+
+  const line = sentenceCased(deShout(String(output.line).trim()));
+  const question = output.question ? sentenceCased(String(output.question).trim()) : null;
+  const receiptQuote = output.receipt && output.receipt.quote ? String(output.receipt.quote) : null;
+
+  // Never trust a receipt the model wasn't actually given — ground it against
+  // the quotes it was handed, not the whole corpus, so it can't reach past
+  // what it was shown.
+  const grounded = !receiptQuote || quotes.some((q) => hasVerbatimOverlap(q.text, receiptQuote, 3));
+  const lint = grounded
+    ? lintMirrorM(
+      { line, shape: winner.shape, question, would_be_false_if: output.would_be_false_if },
+      { receiptQuote, vocabTop200: facts.vocabTop200 })
+    : { ok: false, rule: 2, reason: "receipt_not_grounded" };
+
+  if (!lint.ok) {
+    console.log("mirrorLintReject", {
+      uid, surface: "mirror_line", rule: lint.rule, reason: lint.reason,
+      shape: winner.shape, promptVersion: MIRROR_LINE_V31_PROMPT_VERSION,
+    });
+    return { written: false, reason: lint.reason };
+  }
+
+  const receipt = receiptQuote ? {
+    quote: receiptQuote,
+    date: (output.receipt && output.receipt.date) || null,
+    relativeLabel: (output.receipt && output.receipt.date)
+      ? relativeLabel(output.receipt.date, todayKey) : null,
+  } : null;
+
+  await userRef.collection("readings").doc(todayKey).set({
+    schemaVersion: 1,
+    date: todayKey,
+    userId: uid,
+    line,
+    shape: winner.shape,
+    question: (question && question.endsWith("?")) ? question : null,
+    wouldBeFalseIf: output.would_be_false_if || null,
+    receipt,
+    source: { kind: "personModel", shape: winner.shape, id: winner.ref.id || null },
+    lintPassed: true,
+    lintReason: null,
+    silence: false,
+    promptVersion: MIRROR_LINE_V31_PROMPT_VERSION,
+    computedAt: admin.firestore.Timestamp.fromDate(now),
+  }, { merge: true });
+
+  console.log("mirrorLineV31", { uid, picked: true, shape: winner.shape, score: winner.score });
+  return { written: true, shape: winner.shape, line };
+}
+
+/**
+ * Prompt Q — picks tomorrow's question from openHypotheses, skipping
+ * anything asked in the last 7 days. Feeds Mirror Seeds (not yet wired into
+ * the journaling-prompt surface — see the build plan) and the Mirror tab's
+ * "What it doesn't know yet" row.
+ */
+async function writeNextQuestionForUser(db, uid, now) {
+  const userRef = db.collection("users").doc(uid);
+  const aggSnap = await userRef.collection("derived").doc("personModel").get();
+  if (!aggSnap.exists) return { written: false, reason: "no_model" };
+  const agg = aggSnap.data();
+  const openHypotheses = agg.openHypotheses || [];
+  if (!openHypotheses.length) return { written: false, reason: "no_open_hypotheses" };
+
+  const askedRecently = (agg.askedHypotheses || []).filter((a) => {
+    const at = toDate(a.askedAt);
+    return at && (now.getTime() - at.getTime()) / 86400000 < 7;
+  });
+  const askedIds = new Set(askedRecently.map((a) => a.hypothesisId));
+  const candidates = openHypotheses.filter((h) => !askedIds.has(h.id));
+  if (!candidates.length) return { written: false, reason: "all_asked_recently" };
+
+  const openBlock = JSON.stringify(candidates.slice(0, 8).map((h) => ({
+    hypothesisId: h.id, hypothesis: h.hypothesis,
+    would_confirm: h.wouldConfirm, would_reject: h.wouldReject, value: h.value,
+  })), null, 2);
+  const askedBlock = askedRecently.map((a) => `- ${a.hypothesisId}`).join("\n");
+
+  const prompt = buildNextQuestionPrompt({
+    safetyRules: SAFETY_RULES, openHypothesesBlock: openBlock, askedRecentlyBlock: askedBlock,
+  });
+
+  let output;
+  try {
+    output = await callGeminiJSON(prompt, { maxTokens: 220, temperature: 0.5 }, uid, "mirror_question");
+  } catch (e) {
+    return { written: false, reason: "generation_failed" };
+  }
+  if (!output || !output.question) return { written: false, reason: "empty" };
+
+  const question = sentenceCased(String(output.question).trim());
+  const lint = lintCopy(question, { kind: "mirrorQuestion" });
+  if (!lint.ok) {
+    console.log("mirrorLintReject", { uid, surface: "mirror_question", rule: null, reason: lint.reason });
+    return { written: false, reason: lint.reason };
+  }
+  // Never a hallucinated id — fall back to the top candidate we actually offered.
+  const hypothesisId = candidates.some((h) => h.id === output.hypothesisId)
+    ? output.hypothesisId : candidates[0].id;
+
+  const nextAsked = [
+    ...(agg.askedHypotheses || []),
+    { hypothesisId, askedAt: admin.firestore.Timestamp.fromDate(now) },
+  ].slice(-ASKED_HYPOTHESES_KEEP);
+
+  await userRef.collection("derived").doc("personModel").set({
+    nextQuestion: {
+      question, hypothesisId,
+      scoring: output.scoring || null,
+      seedLabel: output.seed_label || null,
+      createdAt: admin.firestore.Timestamp.fromDate(now),
+    },
+    askedHypotheses: nextAsked,
+    questionPromptVersion: QUESTION_PROMPT_VERSION,
+  }, { merge: true });
+
+  console.log("mirrorQuestion", { uid, hypothesisId, question });
+  return { written: true, question, hypothesisId };
+}
+
+/** mirrorAsk's cost ceiling: a plain daily cap, not the full token-budget
+ *  ledger — this is a user-triggered, on-demand call (like bootstrapMirror /
+ *  refreshDerived), and a generous fixed cap bounds the worst case without
+ *  wiring a new surface into the client-relay budget system that only
+ *  geminiProxy uses. */
+async function claimAskCall(db, uid, now) {
+  const ref = db.collection("users").doc(uid);
+  const today = utcDayKey(now);
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const data = snap.exists ? snap.data() : {};
+    const count = data.askCallDay === today ? (data.askCallCount || 0) : 0;
+    if (count >= ASK_DAILY_CAP) return false;
+    tx.set(ref, { askCallDay: today, askCallCount: count + 1 }, { merge: true });
+    return true;
+  });
+}
+
+/**
+ * Prompt ASK, server-side (engineering-decisions §1: the client sends
+ * structured input, never a prompt). Answers a question about the person
+ * FROM the Person Model, with receipts — never by re-reading raw entries.
+ */
+exports.mirrorAsk = onRequest(
+  {
+    region: REGION,
+    secrets: [GEMINI_KEY],
+    cors: true,
+    timeoutSeconds: 30,
+    memory: "256MiB",
+    maxInstances: 10,
+    invoker: "public",
+  },
+  async (req, res) => {
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "POST only" });
+      return;
+    }
+    const match = String(req.headers.authorization || "").match(/^Bearer (.+)$/);
+    if (!match) {
+      res.status(401).json({ error: "Missing Authorization bearer token" });
+      return;
+    }
+    let uid;
+    try {
+      const decoded = await admin.auth().verifyIdToken(match[1]);
+      uid = decoded.uid;
+      if (decoded.firebase.sign_in_provider === "anonymous") {
+        res.status(403).json({ error: "Account required for AI features" });
+        return;
+      }
+    } catch (e) {
+      res.status(401).json({ error: "Invalid or expired token" });
+      return;
+    }
+
+    const question = String((req.body && req.body.question) || "").slice(0, 300).trim();
+    if (!question) {
+      res.status(400).json({ error: "question required" });
+      return;
+    }
+
+    const db = admin.firestore();
+
+    // Rule 8, same as everywhere else: crisis content gets no reflection —
+    // the question is user-authored text and gets the same gate an entry
+    // does. No model call at all.
+    if (containsCrisisSignal(question)) {
+      res.status(200).json({
+        answer: "That's a heavier question than I can answer from the entries alone.",
+        citations: [],
+      });
+      return;
+    }
+
+    const claimed = await claimAskCall(db, uid, new Date());
+    if (!claimed) {
+      res.status(402).json({ error: "Daily Ask limit reached" });
+      return;
+    }
+
+    try {
+      const userRef = db.collection("users").doc(uid);
+      const itemsSnap = await userRef.collection("personModel").limit(PERSON_MODEL_ITEM_LIMIT).get();
+      const items = itemsSnap.docs.map((d) => ({ id: d.id, ...d.data() }))
+        .filter((it) => it.status !== "retired");
+      const modelBlock = buildCurrentModelBlockForFormulation(items);
+
+      const prompt = buildAskPrompt({ safetyRules: SAFETY_RULES, question, modelBlock });
+      const output = await callGeminiJSON(prompt, { maxTokens: 400, temperature: 0.2 }, uid, "mirror_ask_v31");
+      res.status(200).json({
+        answer: (output && output.answer) || "",
+        citations: Array.isArray(output && output.citations) ? output.citations.slice(0, 3) : [],
+        promptVersion: ASK_V31_PROMPT_VERSION,
+      });
+    } catch (e) {
+      console.error("mirrorAsk error", { uid, error: String(e) });
+      res.status(500).json({ error: "Ask failed" });
+    }
+  }
+);
+
 /* ── First seven (M8) ────────────────────────────────────────────────────── */
 
 /**
@@ -3684,7 +4332,7 @@ async function runDerivedForUser(db, uid, now) {
   const reading = await selectTodayFor(db, uid, now, facts, observations, tz,
     { allowModel: false });
   await buildFirstSevenFor(db, uid, now, facts, threads, observations);
-  return { facts, observations, threads, reading, tz };
+  return { facts, observations, threads, reading, tz, analyses };
 }
 
 exports.computeUserDerived = onTaskDispatched(
@@ -3951,6 +4599,24 @@ exports.mineUserInsights = onTaskDispatched(
               stylePrefs: styleSnap.exists ? styleSnap.data() : null,
             });
           readingStep = reading.silence ? "silence" : (reading.lintPassed ? "reading" : "observation");
+
+          // Mirror v3.1 — the Person Model. Own try/catch per stage, same
+          // reasoning as the block above: none of this may make Cloud Tasks
+          // retry the mine or the v3.0 reading, both already committed.
+          const lifeContextStr = lifeCtxSnap.exists ? lifeContextBlock(lifeCtxSnap.data()) : "";
+          const stylePrefsObj = styleSnap.exists ? styleSnap.data() : null;
+          try {
+            const f = await formulatePersonModelForUser(
+              db, uid, now, derived.facts, derived.analyses, lifeContextStr, stylePrefsObj);
+            if (!f.skipped) {
+              await selectAndWriteMirrorLineForUser(
+                db, uid, now, derived.tz, derived.facts, derived.observations,
+                derived.analyses, lifeContextStr, stylePrefsObj);
+              await writeNextQuestionForUser(db, uid, now);
+            }
+          } catch (e) {
+            console.error("mineUserInsights: person model failed", { uid, error: String(e) });
+          }
         } catch (e) {
           console.error("mineUserInsights: derived/reading failed", { uid, error: String(e) });
         }
@@ -4097,8 +4763,30 @@ exports.bootstrapMirror = onRequest(
       let derivedOk = false;
       if (!r.skipped) {
         try {
-          await runDerivedForUser(db, uid, now);
+          const derived = await runDerivedForUser(db, uid, now);
           derivedOk = true;
+          // Person Model, best-effort — a brand-new user almost always has
+          // too few analyses yet (formulatePersonModelForUser's own
+          // MIN_ANALYSES gate skips as "immature"), so this is cheap when it
+          // has nothing to do and complete when it does.
+          try {
+            const [lifeCtxSnap, styleSnap] = await Promise.all([
+              db.collection("users").doc(uid).collection("lifeContext").doc("current").get(),
+              db.collection("users").doc(uid).collection("stylePreferences").doc("current").get(),
+            ]);
+            const lifeContextStr = lifeCtxSnap.exists ? lifeContextBlock(lifeCtxSnap.data()) : "";
+            const stylePrefsObj = styleSnap.exists ? styleSnap.data() : null;
+            const f = await formulatePersonModelForUser(
+              db, uid, now, derived.facts, derived.analyses, lifeContextStr, stylePrefsObj);
+            if (!f.skipped) {
+              await selectAndWriteMirrorLineForUser(
+                db, uid, now, derived.tz, derived.facts, derived.observations,
+                derived.analyses, lifeContextStr, stylePrefsObj);
+              await writeNextQuestionForUser(db, uid, now);
+            }
+          } catch (e) {
+            console.error("bootstrapMirror: person model failed", { uid, error: String(e) });
+          }
         } catch (e) {
           console.error("bootstrapMirror: derived failed", { uid, error: String(e) });
         }
@@ -4488,15 +5176,20 @@ exports.runNightlyForUser = onRequest(
         }));
         out.ran.push("threads");
       }
-      if (stages.includes("reading") && facts) {
+      const needsLifeStyle = ["reading", "formulate", "line"].some((s) => stages.includes(s));
+      let lifeContextStr = ""; let stylePrefsObj = null;
+      if (needsLifeStyle) {
         const [lifeCtxSnap, styleSnap] = await Promise.all([
           db.collection("users").doc(uid).collection("lifeContext").doc("current").get(),
           db.collection("users").doc(uid).collection("stylePreferences").doc("current").get(),
         ]);
+        lifeContextStr = lifeCtxSnap.exists ? lifeContextBlock(lifeCtxSnap.data()) : "";
+        stylePrefsObj = styleSnap.exists ? styleSnap.data() : null;
+      }
+      if (stages.includes("reading") && facts) {
         const reading = await selectTodayFor(db, uid, now, facts, observations, tz, {
           allowModel: body.dryRun !== true,
-          lifeContext: lifeCtxSnap.exists ? lifeContextBlock(lifeCtxSnap.data()) : "",
-          stylePrefs: styleSnap.exists ? styleSnap.data() : null,
+          lifeContext: lifeContextStr, stylePrefs: stylePrefsObj,
         });
         out.reading = {
           date: reading.date, silence: reading.silence, reason: reading.reason,
@@ -4513,6 +5206,31 @@ exports.runNightlyForUser = onRequest(
       if (stages.includes("letter")) {
         out.letter = await buildWeeklyLetterFor(db, uid, now);
         out.ran.push("letter");
+      }
+      // Mirror v3.1 — the Person Model. "formulate" needs `facts`+`analyses`
+      // (run the "facts" stage first, or this reads the persisted analyses
+      // freshly, same fallback the "observations" stage above uses).
+      if (stages.includes("formulate") && facts) {
+        if (!analyses.length) {
+          const aSnap = await db.collection("users").doc(uid).collection("entryAnalyses")
+            .orderBy("createdAt", "desc").limit(200).get();
+          analyses = aSnap.docs.map((d) => {
+            const x = d.data();
+            return { ...x, entryId: x.entryId || d.id, createdAt: toDate(x.createdAt), entryCreatedAt: toDate(x.entryCreatedAt) };
+          });
+        }
+        out.formulate = await formulatePersonModelForUser(
+          db, uid, now, facts, analyses, lifeContextStr, stylePrefsObj);
+        out.ran.push("formulate");
+      }
+      if (stages.includes("line") && facts) {
+        out.line = await selectAndWriteMirrorLineForUser(
+          db, uid, now, tz, facts, observations, analyses, lifeContextStr, stylePrefsObj);
+        out.ran.push("line");
+      }
+      if (stages.includes("question")) {
+        out.question = await writeNextQuestionForUser(db, uid, now);
+        out.ran.push("question");
       }
 
       res.status(200).json(out);

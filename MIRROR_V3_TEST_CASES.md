@@ -502,3 +502,40 @@ jsonPayload.message="unlockNudge"        -- the rate-limited push
    3-of-4 buildable.
 6. **No Xcode test target.** Deliberate — mid-feature project surgery is a risk
    multiplier. The 38 Node tests cover the arithmetic, which is ~90% of v3.
+
+---
+
+## 11. Mirror v3.1 — the Person Model stages
+
+`runNightlyForUser` gained three stages on top of the ones above:
+`"formulate"` (Prompt F — needs `"facts"` in the same call, or it re-reads
+`entryAnalyses` itself the same way `"observations"` does), `"line"` (Prompt
+M — needs `"facts"` and `"observations"`), and `"question"` (Prompt Q — reads
+`derived/personModel`, no dependency on the others). Example:
+
+```
+curl -X POST .../runNightlyForUser -H "Authorization: Bearer $TOKEN" \
+  -d '{"stages":["facts","observations","formulate","line","question"]}'
+```
+
+Check `users/{uid}/personModel/*` and `users/{uid}/derived/personModel` in
+the console afterward. `out.line` in the response is `{written, shape, line}`
+or `{written:false, reason}` — `"no_gated_candidate"` is the expected result
+until a signature has cleared its own gate (n>=3 entries + a contrast), which
+will not happen on night one any more than v3.0's threads did.
+
+**New log lines to watch, same discipline as §9:** `formulatePersonModel`
+(`{uid, written, openHypotheses}` or `{uid, skipped, reason}`), `mirrorLineV31`
+(`{uid, picked, shape, score}` or `{uid, picked:false, reason}`),
+`mirrorQuestion` (`{uid, hypothesisId, question}`), and `mirrorLintReject` now
+also fires with `surface: "mirror_line"` / `"mirror_question"` carrying a
+`rule` number for the line failures (§8's nine rules) alongside the existing
+`surface: "reading"` ones.
+
+**Known gap, same shape as #2 above:** there is no mocked-Gemini integration
+test for `formulatePersonModelForUser` / `selectAndWriteMirrorLineForUser` /
+`writeNextQuestionForUser` — `mockFirestore.js` doesn't stub `fetch`, so these
+three are covered by the pure-logic tests one layer down (`gate.test.js`,
+`personModel.test.js`, `candidates.test.js`, `lintM.test.js`,
+`prompts.test.js`) plus the `runNightlyForUser` curl above, not by an
+automated end-to-end test. Worth building before this ships past a dev build.
