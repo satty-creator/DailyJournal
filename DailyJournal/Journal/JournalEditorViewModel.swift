@@ -173,7 +173,6 @@ final class JournalEditorViewModel: ObservableObject {
                 hasAI: !bullets.isEmpty,
                 duration: Date().timeIntervalSince(entry.createdAt)
             )
-            SessionManager.shared.recordEntryWritten()
         }
 
         // The entry is committed — drop any saved draft so it doesn't resurface.
@@ -181,55 +180,22 @@ final class JournalEditorViewModel: ObservableObject {
 
         didSaveSuccessfully = true
 
-        // Capture locals for detached tasks (avoids capturing self across concurrency boundary)
-        let svc            = service
-        let uid            = userId
         let entryCreatedAt = savedEntry?.createdAt ?? Date()
-        let isNewEntry     = existingEntry == nil  // only extract echoes for new entries
+        // Only a genuinely new entry gets an Echo extraction and counts toward
+        // the session's entries-written total — editing an existing entry
+        // shouldn't re-extract (the original extraction already ran) or
+        // double-count a session that already recorded it once.
+        let isNewEntry = existingEntry == nil
 
-        // Background Gemini enrichment — never blocks save or UI
-        Task.detached(priority: .utility) {
-            guard let insights = try? await AIService.shared.generateInsights(from: trimmed) else { return }
-            svc.updateEntryInsights(entryId: savedId, userId: uid, insights: insights)
-        }
-
-        // Echo extraction — only on new entries (editing an existing one shouldn't
-        // re-extract; the original extraction already ran when it was first saved)
-        if isNewEntry {
-            Task.detached(priority: .background) {
-                await EchoExtractionService.shared.extractAndStore(
-                    entryText:      trimmed,
-                    entryId:        savedId,
-                    userId:         uid,
-                    entryCreatedAt: entryCreatedAt
-                )
-            }
-        }
-
-        // Mirror analysis (Prompt A) — produces the structured EntryAnalysis that
-        // the whole Mirror / Self-Model / pattern-mining chain depends on. Runs on
-        // every save (new or edited) so re-edited text re-analyses. analyzeEntry
-        // never throws (returns a local fallback) and persists itself to
-        // users/{uid}/entryAnalyses/{entryId}, so this is pure fire-and-forget.
-        Task.detached(priority: .background) {
-            _ = await AIService.shared.analyzeEntry(
-                entryId: savedId,
-                userId:  uid,
-                text:    trimmed
-            )
-        }
-
-        // Photo upload — best-effort, never blocks the save. Patches the entry
-        // with the download URL once the upload completes.
-        if let photo {
-            Task.detached(priority: .utility) {
-                if let url = await PhotoUploadService.shared.uploadEntryPhoto(
-                    photo, userId: uid, entryId: savedId
-                ) {
-                    svc.updateEntryPhotoURL(entryId: savedId, userId: uid, url: url)
-                }
-            }
-        }
+        EntryEnrichment.run(
+            entryId: savedId,
+            userId: userId,
+            entryCreatedAt: entryCreatedAt,
+            text: trimmed,
+            photo: photo,
+            service: service,
+            extractEcho: isNewEntry
+        )
     }
 
     // MARK: - Delete

@@ -18,16 +18,35 @@ struct TemplateRunnerView: View {
     let userId: String
     let template: JournalTemplate
     let onSave: () -> Void
+    /// Called (before `dismiss()`) on every way out of the runner that is
+    /// NOT a completed save — the X button with no answers yet, "Save for
+    /// later", "Discard answers", and the review screen's "Discard". The
+    /// gallery this template was picked from (`TemplateGalleryView`, pushed
+    /// on the start sheet's own `NavigationStack`) is already gone by the
+    /// time this view is on screen — see `HomeView.handlePendingStart` — so
+    /// without this callback every exit lands on Home instead of back where
+    /// the user was browsing. A completed save still goes to Home, same as
+    /// every other composer.
+    let onExitWithoutSaving: () -> Void
 
     @Environment(\.dismiss) private var dismiss
     @StateObject private var vm: TemplateRunnerViewModel
     @FocusState private var isFocused: Bool
     @State private var showExitConfirm = false
+    /// Transient "Draft restored" note — mirrors `SpillWriteView`'s
+    /// `showDraftRestored`, shown once when `vm.didRestoreDraft` is true.
+    @State private var showDraftRestored = false
 
-    init(userId: String, template: JournalTemplate, onSave: @escaping () -> Void) {
+    init(
+        userId: String,
+        template: JournalTemplate,
+        onSave: @escaping () -> Void,
+        onExitWithoutSaving: @escaping () -> Void
+    ) {
         self.userId = userId
         self.template = template
         self.onSave = onSave
+        self.onExitWithoutSaving = onExitWithoutSaving
         _vm = StateObject(wrappedValue: TemplateRunnerViewModel(userId: userId, template: template))
     }
 
@@ -38,6 +57,9 @@ struct TemplateRunnerView: View {
             VStack(spacing: 0) {
                 header
                 progressBar
+                if showDraftRestored {
+                    draftRestoredBanner
+                }
 
                 ScrollView {
                     questionArea
@@ -50,6 +72,15 @@ struct TemplateRunnerView: View {
 
             stickyFooter
         }
+        .onAppear {
+            if vm.didRestoreDraft {
+                showDraftRestored = true
+                Task {
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                    withAnimation { showDraftRestored = false }
+                }
+            }
+        }
         .sheet(isPresented: $vm.showReview) {
             TemplateReviewView(
                 template: template,
@@ -58,19 +89,47 @@ struct TemplateRunnerView: View {
                     onSave()
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { dismiss() }
                 },
-                onDiscard: { dismiss() },
+                onDiscard: {
+                    onExitWithoutSaving()
+                    dismiss()
+                },
                 onBack: { vm.showReview = false }
             )
+            // The only ways out are the sheet's own Keep going / Save /
+            // Discard — a swipe-to-dismiss would otherwise drop the user's
+            // edits to the woven prose with no confirmation (see A1).
+            .interactiveDismissDisabled()
         }
         .alert("Leave this exercise?", isPresented: $showExitConfirm) {
+            Button("Save for later") {
+                // The draft autosaves on every answer, so there's nothing
+                // extra to persist here — just leave it in place.
+                onExitWithoutSaving()
+                dismiss()
+            }
             Button("Discard answers", role: .destructive) {
                 vm.discard()
+                onExitWithoutSaving()
                 dismiss()
             }
             Button("Keep going", role: .cancel) {}
         } message: {
-            Text("Your answers won't be saved.")
+            Text("Pick up where you left off later, or clear your answers now.")
         }
+    }
+
+    private var draftRestoredBanner: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "arrow.uturn.backward")
+                .font(.system(size: 10))
+            Text("Draft restored")
+                .font(AppTheme.mono(size: 10))
+                .tracking(1)
+        }
+        .foregroundStyle(AppTheme.terracotta)
+        .padding(.horizontal, 22)
+        .padding(.bottom, 8)
+        .transition(.opacity)
     }
 
     // MARK: - Header
@@ -79,7 +138,12 @@ struct TemplateRunnerView: View {
         HStack {
             Button {
                 isFocused = false
-                if vm.hasAnyAnswer { showExitConfirm = true } else { dismiss() }
+                if vm.hasAnyAnswer {
+                    showExitConfirm = true
+                } else {
+                    onExitWithoutSaving()
+                    dismiss()
+                }
             } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 14, weight: .semibold))
@@ -151,11 +215,18 @@ struct TemplateRunnerView: View {
             stepControl
                 .padding(.top, 4)
 
-            if template.evidence.kind == .clinical {
-                whyAskThisCard
+            if let whyThis = vm.currentStep.whyThis {
+                whyAskThisCard(whyThis)
             }
         }
         .id(vm.stepIndex) // fresh identity per step keeps focus/animation clean
+        .onAppear {
+            // Autofocus text steps only — a chip/scale step has nothing to type
+            // into, and stealing focus there would just pop the keyboard away.
+            if case .text = vm.currentStep.kind {
+                isFocused = true
+            }
+        }
     }
 
     @ViewBuilder
@@ -239,6 +310,7 @@ struct TemplateRunnerView: View {
                         )
                 }
                 .buttonStyle(.plain)
+                .accessibilityAddTraits(isSelected ? .isSelected : [])
             }
         }
     }
@@ -271,6 +343,8 @@ struct TemplateRunnerView: View {
                             .foregroundStyle(isSelected ? AppTheme.ink : AppTheme.inkSoft)
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("\(v) out of 10")
+                    .accessibilityAddTraits(isSelected ? .isSelected : [])
                 }
             }
             Text("Use an approximate number. The point is comparison, not precision.")
@@ -279,15 +353,18 @@ struct TemplateRunnerView: View {
         }
     }
 
-    // MARK: - "Why ask this?" (clinical templates only)
+    // MARK: - "Why ask this?" (only on steps that supply their own rationale —
+    // see `TemplateStep.whyThis`. Deliberately NOT the template-level evidence
+    // blurb on every step; that repeated one paragraph verbatim across a
+    // 7-step template and duplicated the review screen's Framework card.)
 
-    private var whyAskThisCard: some View {
+    private func whyAskThisCard(_ text: String) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             Text("WHY ASK THIS?")
                 .font(AppTheme.mono(size: 9))
                 .tracking(1.5)
                 .foregroundStyle(AppTheme.inkSoft)
-            Text(template.evidence.blurb)
+            Text(text)
                 .font(AppTheme.editorialBody(size: 12.5))
                 .foregroundStyle(AppTheme.inkSoft)
                 .lineSpacing(2)

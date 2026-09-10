@@ -6,17 +6,20 @@
 //
 //  Each template is a short sequence of `TemplateStep`s run by
 //  `TemplateRunnerView`, then woven into one journal entry (see
-//  `AIService+Template.swift`). The five sessions below keep the app's
+//  `AIService+Template.swift`). The original five sessions keep the app's
 //  existing titles, accents and ids, but their steps are adapted from
 //  published frameworks — see `TemplateContent.swift` for the content and
 //  `TemplateEvidence` for what's actually cited.
 //
-//  Integrity note: only `after-a-hard-conversation`, `untangle-a-decision`
-//  and `gratitude-gently` carry a `.clinical` evidence claim, each backed by
-//  a real source in `TemplateEvidenceLibrary`. `morning-pages` and
-//  `wind-down` are `.practice` — no clinical trial supports either format,
-//  and their copy says so. Never move a template to `.clinical` without a
-//  source to put in its `TemplateEvidence`.
+//  Integrity note: only `after-a-hard-conversation`, `untangle-a-decision`,
+//  `gratitude-gently` and `best-possible-self` carry a `.clinical` evidence
+//  claim, each backed by a real source in `TemplateEvidenceLibrary` (the
+//  Best Possible Self citation was checked directly against the PubMed
+//  abstract, not just carried over from the source prototype — see
+//  `TemplateEvidenceLibrary.bestPossibleSelfMetaAnalysis`). `morning-pages`
+//  and `wind-down` are `.practice` — no clinical trial supports either
+//  format, and their copy says so. Never move a template to `.clinical`
+//  without a source to put in its `TemplateEvidence`.
 //
 
 import SwiftUI
@@ -47,16 +50,65 @@ struct TemplateStep: Identifiable, Hashable {
     let question: String
     let helper: String
     let kind: Kind
+    /// Per-step rationale shown in `TemplateRunnerView`'s "Why ask this?" card —
+    /// distinct from `TemplateEvidence.blurb`, which is the template-level
+    /// citation shown once on the review screen. `nil` means the step shows no
+    /// card, even on a `.clinical` template; most steps leave this unset.
+    let whyThis: String?
+
+    init(id: String, label: String, question: String, helper: String, kind: Kind, whyThis: String? = nil) {
+        self.id = id
+        self.label = label
+        self.question = question
+        self.helper = helper
+        self.kind = kind
+        self.whyThis = whyThis
+    }
 }
 
 // MARK: - Answers
 
 /// One answered (or skipped) step. A separate type from `String` so a chip
 /// selection and a 0–10 rating don't have to round-trip through text.
-enum TemplateAnswer: Equatable {
+///
+/// `Codable` backs `TemplateRunnerViewModel`'s draft persistence — an explicit
+/// `kind`-discriminated encoding rather than the synthesized form, so the
+/// on-disk shape stays legible (and stable) if a case is ever added.
+enum TemplateAnswer: Equatable, Codable {
     case text(String)
     case choice(String)
     case scale(Int)
+
+    private enum CodingKeys: String, CodingKey {
+        case kind, value
+    }
+    private enum Kind: String, Codable {
+        case text, choice, scale
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(Kind.self, forKey: .kind) {
+        case .text:   self = .text(try container.decode(String.self, forKey: .value))
+        case .choice: self = .choice(try container.decode(String.self, forKey: .value))
+        case .scale:  self = .scale(try container.decode(Int.self, forKey: .value))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .text(let s):
+            try container.encode(Kind.text, forKey: .kind)
+            try container.encode(s, forKey: .value)
+        case .choice(let s):
+            try container.encode(Kind.choice, forKey: .kind)
+            try container.encode(s, forKey: .value)
+        case .scale(let n):
+            try container.encode(Kind.scale, forKey: .kind)
+            try container.encode(n, forKey: .value)
+        }
+    }
 
     var displayValue: String {
         switch self {
@@ -151,10 +203,11 @@ struct JournalTemplate: Identifiable {
 }
 
 extension JournalTemplate {
-    /// The five sessions shown in the mockup. Order matches: the featured
-    /// card first, then the four-card grid in its original order. Titles,
-    /// ids and accents are unchanged from the original catalog — only the
-    /// steps and evidence are new (see `TemplateContent.swift`).
+    /// The sessions shown in the gallery. Order matches: the featured card
+    /// first, then the grid in its original order, with "Best possible self"
+    /// appended last. Titles, ids and accents for the original five are
+    /// unchanged from the original catalog — only the steps and evidence are
+    /// new (see `TemplateContent.swift`).
     static let all: [JournalTemplate] = [
         JournalTemplate(
             id: "after-a-hard-conversation",
@@ -210,6 +263,17 @@ extension JournalTemplate {
             isFeatured: false,
             steps: TemplateContent.windDown,
             evidence: TemplateEvidenceLibrary.productPattern
+        ),
+        JournalTemplate(
+            id: "best-possible-self",
+            title: "Best possible self",
+            blurb: "Picture a future where things went as well as they reasonably could.",
+            minutes: 8,
+            tags: ["clarity"],
+            accent: \.sun,
+            isFeatured: false,
+            steps: TemplateContent.bestPossibleSelf,
+            evidence: TemplateEvidenceLibrary.bestPossibleSelfMetaAnalysis
         )
     ]
 }

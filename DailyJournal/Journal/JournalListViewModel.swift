@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import FirebaseFirestore
 
 @MainActor
 final class JournalListViewModel: ObservableObject {
@@ -45,6 +46,19 @@ final class JournalListViewModel: ObservableObject {
     private let userId: String
     private var photoObserver: NSObjectProtocol?
     private var searchLogTask: Task<Void, Never>?
+    /// The background continuation from `loadEntries()` that keeps paging
+    /// past the first screenful. Held so a second `loadEntries()` call
+    /// (pull-to-refresh, the editor's `onDismiss`) can cancel a stale walk
+    /// before starting its own — two walks appending into `entries`
+    /// concurrently would interleave into duplicates or drop entries.
+    private var pagingTask: Task<Void, Never>?
+
+    /// Entries after this many are still fetched, just not on the critical
+    /// path for first paint. Same 300 ceiling `fetchEntries` always used —
+    /// this only changes WHEN the fetch happens, not how much of the
+    /// corpus is ultimately loaded.
+    private static let firstPageSize = 10
+    private static let totalCap = 300
 
     init(userId: String) {
         self.userId = userId
@@ -71,6 +85,7 @@ final class JournalListViewModel: ObservableObject {
 
     deinit {
         if let photoObserver { NotificationCenter.default.removeObserver(photoObserver) }
+        pagingTask?.cancel()
     }
 
     // MARK: - Computed
@@ -125,15 +140,54 @@ final class JournalListViewModel: ObservableObject {
 
     // MARK: - Actions
 
+    /// First paint from a small first page (fast, even cold), then keeps
+    /// paging in the background until the whole (capped) corpus is in
+    /// `entries`. Stopping at the first page would silently break search,
+    /// `availableTags` and the header count — they all compute over
+    /// `entries`, not over whatever's on screen — so the background
+    /// continuation isn't optional, just off the paint critical path.
     func loadEntries() async {
+        pagingTask?.cancel()
         isLoading = true
         errorMessage = nil
+
         do {
-            entries = try await service.fetchEntries(for: userId)
+            let firstPage = try await service.fetchEntriesPage(
+                for: userId, limit: Self.firstPageSize, after: nil)
+            entries = firstPage.entries
+            isLoading = false
+
+            // A short first page (the common case while this bug was live —
+            // small, newer accounts) already has everything; don't spend a
+            // second round trip confirming that.
+            if firstPage.entries.count == Self.firstPageSize {
+                pagingTask = Task { [weak self] in
+                    await self?.loadRemainingPages(after: firstPage.lastDoc)
+                }
+            }
         } catch {
             errorMessage = "Couldn't load entries. Pull to refresh."
+            isLoading = false
         }
-        isLoading = false
+    }
+
+    /// Pages 100 at a time (Firestore's own reasonable batch size, not the
+    /// UI's) until the first page's cursor runs out, the response comes back
+    /// short (the true end of the collection), or the same 300-entry ceiling
+    /// `fetchEntries` always enforced is reached.
+    private func loadRemainingPages(after firstCursor: DocumentSnapshot?) async {
+        guard var cursor = firstCursor else { return }
+        let pageSize = 100
+        while entries.count < Self.totalCap {
+            guard !Task.isCancelled else { return }
+            guard let page = try? await service.fetchEntriesPage(
+                for: userId, limit: pageSize, after: cursor)
+            else { return }
+            guard !Task.isCancelled else { return }
+            entries.append(contentsOf: page.entries)
+            guard let next = page.lastDoc, page.entries.count == pageSize else { return }
+            cursor = next
+        }
     }
 
     func delete(_ entry: JournalEntry) {

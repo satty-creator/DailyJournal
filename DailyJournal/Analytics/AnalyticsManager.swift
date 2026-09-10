@@ -181,10 +181,11 @@ final class AnalyticsManager {
         logEvent(.onboardingStarted)
     }
 
-    func trackOnboardingCompleted(totalSteps: Int, duration: TimeInterval) {
+    func trackOnboardingCompleted(totalSteps: Int, duration: TimeInterval, wroteFirstEntry: Bool = true) {
         logEvent(.onboardingCompleted, parameters: [
             "total_steps": totalSteps,
-            "duration_seconds": Int(duration)
+            "duration_seconds": Int(duration),
+            "wrote_first_entry": wroteFirstEntry
         ])
     }
 

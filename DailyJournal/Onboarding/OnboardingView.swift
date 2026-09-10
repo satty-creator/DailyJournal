@@ -10,7 +10,11 @@
 //              question, answered by typing or talking — landing directly
 //              in the first guided session (DailyChatView). Completing that
 //              session (weaving + saving an entry) is what finishes
-//              onboarding; there is no separate "done" tap.
+//              onboarding — but it's not the ONLY way to finish it: a quiet
+//              "I'll do this later" under the two answer buttons also
+//              completes onboarding, with no entry written. Without it, a
+//              user who backs out of the chat (or never wants to answer
+//              right now) had no way to reach the app at all.
 //
 //  Theme picking and AI-insights consent are deliberately NOT asked here —
 //  both move to after the first entry: theme stays changeable any time from
@@ -341,41 +345,60 @@ struct OnboardingView: View {
                 .padding(.horizontal, 24)
             }
 
-            HStack(spacing: 11) {
-                Button {
-                    chatStartsWithDictation = false
-                    showingChat = true
-                } label: {
-                    Text("Answer it")
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(AppTheme.cream)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 17)
-                        .background(
-                            LinearGradient(colors: [AppTheme.terracotta, AppTheme.terracottaDeep],
-                                           startPoint: .leading, endPoint: .trailing)
-                        )
-                        .clipShape(Capsule())
-                        .shadow(color: AppTheme.terracotta.opacity(0.35), radius: 14, x: 0, y: 7)
-                }
-                .buttonStyle(.plain)
+            VStack(spacing: 0) {
+                HStack(spacing: 11) {
+                    Button {
+                        chatStartsWithDictation = false
+                        showingChat = true
+                    } label: {
+                        Text("Answer it")
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(AppTheme.cream)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 17)
+                            .background(
+                                LinearGradient(colors: [AppTheme.terracotta, AppTheme.terracottaDeep],
+                                               startPoint: .leading, endPoint: .trailing)
+                            )
+                            .clipShape(Capsule())
+                            .shadow(color: AppTheme.terracotta.opacity(0.35), radius: 14, x: 0, y: 7)
+                    }
+                    .buttonStyle(.plain)
 
+                    Button {
+                        chatStartsWithDictation = true
+                        showingChat = true
+                    } label: {
+                        Image(systemName: "mic.fill")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(AppTheme.cream)
+                            .frame(width: 54, height: 54)
+                            .background(AppTheme.ink)
+                            .clipShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Answer by talking")
+                }
+                .padding(.horizontal, 24)
+
+                // The escape hatch. Onboarding used to have no way out short
+                // of actually weaving and saving a first entry in
+                // DailyChatView — closing that sheet just returns here. A
+                // user who doesn't want to write yet (or can't right now)
+                // was stuck. This never disables and never gates on
+                // anything; it's deliberately the quieter of the two paths
+                // so "Answer it" still reads as the intended one.
                 Button {
-                    chatStartsWithDictation = true
-                    showingChat = true
+                    finishOnboarding(wroteEntry: false)
                 } label: {
-                    Image(systemName: "mic.fill")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(AppTheme.cream)
-                        .frame(width: 54, height: 54)
-                        .background(AppTheme.ink)
-                        .clipShape(Circle())
+                    Text("I'll do this later")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(AppTheme.inkSoft)
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Answer by talking")
+                .padding(.top, 14)
             }
-            .padding(.horizontal, 24)
-            .padding(.bottom, 48)
+            .padding(.bottom, 34)
             .padding(.top, 12)
             .background(
                 AppTheme.paper
@@ -400,11 +423,12 @@ struct OnboardingView: View {
     /// opens on below.
     private var firstQuestion: String { AIService.chatOpener(for: .normal) }
 
-    private func finishOnboarding() {
+    private func finishOnboarding(wroteEntry: Bool = true) {
         UserDefaults.standard.onboardingCompleted = true
         AnalyticsManager.shared.trackOnboardingCompleted(
             totalSteps: 3,
-            duration: Date().timeIntervalSince(startedAt)
+            duration: Date().timeIntervalSince(startedAt),
+            wroteFirstEntry: wroteEntry
         )
         onComplete()
     }

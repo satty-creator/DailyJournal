@@ -50,6 +50,15 @@ final class AIService {
     static let mirrorBootstrapURLString =
         "https://us-central1-spilr-100f7.cloudfunctions.net/bootstrapMirror"
 
+    /// The on-demand derived-layer recompute for an account that already
+    /// exists but has no `derived/facts` yet — see `functions/index.js`
+    /// `exports.refreshDerived` and `AIService+Mirror.swift`'s
+    /// `refreshDerived(userId:)`. Unlike `bootstrapMirror`, this is pure
+    /// arithmetic — no `GEMINI_KEY`, no model cost — so it's safe to call
+    /// any time the derived layer is stale or missing, not just once ever.
+    static let refreshDerivedURLString =
+        "https://us-central1-spilr-100f7.cloudfunctions.net/refreshDerived"
+
     /// AI is available when the user is signed in AND has given consent for
     /// their journal text to be sent to Google Gemini (Guideline 5.1.2(i)).
     /// Returns false for users who declined consent during onboarding — all

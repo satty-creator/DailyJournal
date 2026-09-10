@@ -64,8 +64,21 @@ final class RollupService {
         return await backfill(for: userId)
     }
 
+    /// On a cold install with no rollup doc yet, a `countEntries` failure
+    /// (offline, or just not online yet — App Attest is being minted for the
+    /// first time in this exact window) used to be swallowed by `?? 0` and
+    /// then PERSISTED as `entryCount: 0` — silently flattening a real
+    /// account's `MirrorMaturity` back to `.seed` until its next entry write.
+    /// Only write the backfill when the count actually came back; on failure,
+    /// return an unpersisted zero so the caller has *something* to render
+    /// this pass without corrupting Firestore's copy for the next one.
     private func backfill(for userId: String) async -> RollupStats {
-        let count = (try? await journalService.countEntries(for: userId)) ?? 0
+        guard let count = try? await journalService.countEntries(for: userId) else {
+            return RollupStats(
+                userId: userId, entryCount: 0, lastEntryAt: nil,
+                updatedAt: Date(), schemaVersion: RollupStats.currentSchemaVersion
+            )
+        }
         let stats = RollupStats(
             userId: userId, entryCount: count, lastEntryAt: nil,
             updatedAt: Date(), schemaVersion: RollupStats.currentSchemaVersion

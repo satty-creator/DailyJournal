@@ -18,6 +18,27 @@ const { defineSecret } = require("firebase-functions/params");
 const admin = require("firebase-admin");
 const { getFunctions } = require("firebase-admin/functions");
 
+// Pure logic lives in ./lib so it can be unit-tested without emulators or
+// network (`npm test` → node:test). Mirror v3 is almost entirely arithmetic,
+// and arithmetic that can't be tested is arithmetic nobody can trust.
+const {
+  normalise, contentWords, jaccard, hasVerbatimOverlap, sentenceCased,
+  deShout, readingGrade,
+} = require("./lib/text");
+const {
+  localDateParts, localWeekdayAndHour, recentDateKeys, weekBounds,
+  daysBetweenKeys, relativeLabel, shortDate,
+} = require("./lib/time");
+const {
+  computeFacts, mergeFirstSeen, LADDER,
+} = require("./lib/facts");
+const { computeObservations } = require("./lib/observations");
+const {
+  lintCopy, lintMirrorLine, tripsBannedLint, tripsLabelLint,
+  HEDGE_WORDS, TRAIT_PHRASING, BANNED_SUBSTRINGS, BANNED_LABELS,
+} = require("./lib/lint");
+const { clusterHypotheses, normaliseVector } = require("./lib/identity");
+
 admin.initializeApp();
 
 const REGION = "us-central1";
@@ -204,7 +225,9 @@ const KNOWN_SURFACES = new Set([
   "chat_turn", "chat_turn_cbt", "chat_weave_entry", "chat_weave_thought_journal",
   "chat_session_state",
   "todays_read_client",
-  "mirror_ask", "mirror_analyze_entry", "mirror_narrative",
+  // "mirror_narrative" removed — Prompt F was deleted client-side in Mirror
+  // v3 (the weekly letter replaces it), so the tag can no longer be sent.
+  "mirror_ask", "mirror_analyze_entry",
   "template_weave_entry",
   "unknown",
 ]);
@@ -616,25 +639,9 @@ const SAFETY_RULES = `NON-NEGOTIABLE SAFETY RULES. These override every other in
 // retired), so this is a constant rather than a per-user lookup.
 const WEEKLY_LETTER_HOUR = 18;
 
-/** Local weekday (0=Sun) and hour for `instant` in IANA `tz`. A minimal,
- *  scoped-to-exactly-this-job reimplementation — the fuller localDateParts
- *  this used to share with the (now-retired) daily read generator is gone
- *  from this file. */
-function localWeekdayAndHour(instant, tz) {
-  try {
-    const parts = new Intl.DateTimeFormat("en-US", {
-      timeZone: tz || "UTC", weekday: "short", hour: "numeric", hour12: false,
-    }).formatToParts(instant);
-    const weekdayShort = (parts.find((p) => p.type === "weekday") || {}).value;
-    const hourRaw = (parts.find((p) => p.type === "hour") || {}).value;
-    const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const weekday = days.indexOf(weekdayShort);
-    const hour = hourRaw != null ? parseInt(hourRaw, 10) % 24 : instant.getUTCHours();
-    return { weekday: weekday >= 0 ? weekday : instant.getUTCDay(), hour };
-  } catch (e) {
-    return { weekday: instant.getUTCDay(), hour: instant.getUTCHours() };
-  }
-}
+// `localWeekdayAndHour` now comes from ./lib/time, where it is a thin wrapper
+// over the fuller `localDateParts` the derived jobs need (dateKey + band +
+// weekday). One implementation, one set of timezone bugs.
 
 /**
  * The resumable pager. Processes one page of users for one job, enqueues the
@@ -684,9 +691,14 @@ exports.dispatchUserWork = onTaskDispatched(
     // page stops enumeration for every user after it. Enqueueing first makes
     // the walk survive a fan-out failure; dedup ids make the retry safe.
     if (nextCursor) await enqueueNextPage(job, nextCursor, runDate);
-    const enqueued = await enqueueForUsers("mineUserInsights",
+    // Fans out to the DETERMINISTIC worker now, not straight to the mine.
+    // computeUserDerived writes the facts/observations/threads every user
+    // needs every night, then tail-chains into mineUserInsights (which has its
+    // own cadence gate and usually returns early). The job string stays "mine"
+    // so tasks enqueued by an earlier cron, before this deploy, still route.
+    const enqueued = await enqueueForUsers("computeUserDerived",
       docs.map((d) => d.id), (uid) => ({ uid, runDate }), runDate);
-    console.log("dispatch mine page", { size: docs.length, enqueued, nextCursor });
+    console.log("dispatch derived page", { size: docs.length, enqueued, nextCursor });
   }
 );
 
@@ -736,7 +748,14 @@ const MAX_ABSENCE_CANDIDATES = 4; // hand the model a shortlist, not a haystack.
 // falsify it — the model is grading its own homework on the same page. The CE
 // pass re-reads notes the hypothesis did NOT cite and asks only: does this
 // support, contradict, or not bear on the claim?
-const CE_MAX_HYPOTHESES = 2;    // cost ceiling: only the most salient get tested.
+// Was CE_MAX_HYPOTHESES = 2, selected by SALIENCE before identity resolution.
+// That combination is why 17 of 19 cards carried "Not checked against other
+// entries yet": the audit tested the two loudest claims, everything else was
+// written with `disconfirmation: null`, and the UI rendered the absence of QA
+// as a caption. Selection now happens AFTER identity resolution and is
+// restricted to claims that could actually become a thread — so the audit is
+// spent on the small number of hypotheses that are allowed to surface at all.
+const AUDIT_MAX_PER_RUN = 3;
 const CE_NOTES_PER_CALL = 12;   // unseen notes handed to the CE pass.
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -771,10 +790,7 @@ const CRISIS_PHRASES = [
   "pills to cope", "getting high to",
 ];
 
-function normalise(t) {
-  return (t || "").toLowerCase().replace(/’/g, "'")
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-}
+// `normalise` comes from ./lib/text — see the require block at the top.
 function containsCrisisSignal(text) {
   const h = normalise(text);
   return CRISIS_PHRASES.some((p) => h.includes(p));
@@ -787,19 +803,7 @@ function containsCrisisSignal(text) {
 // The two lists had already drifted once — server-approved text was being
 // suppressed on the client and vice versa, which produces the worst kind of bug
 // report: "it said this yesterday and now it won't".
-const BANNED_SUBSTRINGS = [
-  "you are someone who", "you're someone who", "you always", "you never",
-  "you are a person who", "this is who you are", "the kind of person who",
-  "attachment style", "defense mechanism", "defence mechanism",
-  "dissociation", "dissociat", "trauma", "disorder", "diagnos",
-  "depression", "depressed", "anxiety disorder", "bipolar", "ptsd", "ocd",
-  "narcissi", "codependen", "burnout", "burnt out", "self-sabotage",
-  "dysregulat", "gaslighting",
-];
-function tripsBannedLint(text) {
-  const h = normalise(text);
-  return BANNED_SUBSTRINGS.some((p) => h.includes(p));
-}
+// BANNED_SUBSTRINGS / tripsBannedLint come from ./lib/lint.
 
 // The POP-PSYCHOLOGY LABEL LINT — the anti-horoscope guard's second half.
 //
@@ -813,26 +817,7 @@ function tripsBannedLint(text) {
 //
 // The rule is: the taxonomy may be used to FIND the pattern, never to STATE it.
 // The insight must be the move, in their own vocabulary.
-const BANNED_LABELS = [
-  "catastrophis", "catastrophiz", "all-or-nothing", "all or nothing thinking",
-  "black-and-white thinking", "black and white thinking", "mind reading",
-  "mind-reading", "overgeneralis", "overgeneraliz", "should statement",
-  "emotional reasoning", "personalis", "personaliz",
-  "cognitive distortion", "thinking trap", "thinking error", "core belief",
-  "limiting belief", "negative self-talk", "inner critic",
-  "people pleas", "people-pleas", "perfectionis", "imposter syndrome",
-  "impostor syndrome", "fear of failure", "fear of abandonment",
-  "fear of success", "scarcity mindset", "growth mindset", "fixed mindset",
-  "your worth is tied", "worth is tied to", "tied to your productivity",
-  "seeking external validation", "conflict avoidant", "conflict-avoidant",
-  "emotionally unavailable", "boundary issues", "attachment wound",
-  "inner child", "shadow work", "love language", "trigger warning",
-  "high-functioning", "high functioning",
-];
-function tripsLabelLint(text) {
-  const h = normalise(text);
-  return BANNED_LABELS.some((p) => h.includes(p));
-}
+// BANNED_LABELS / tripsLabelLint come from ./lib/lint.
 
 // PatternType → PatternArchetype, matching AIService+Mirror.archetypeFor.
 const ARCHETYPE_FOR = {
@@ -1215,7 +1200,16 @@ function resolveHypothesisId(existing, patternType, evidenceIds, title, now) {
   let best = null;
   let bestScore = 0;
   for (const e of existing) {
-    if (e.patternType !== patternType) continue;
+    // NO patternType RESTRICTION (Mirror v3 M2).
+    //
+    // This one `continue` was the largest single cause of the six-variants
+    // problem: the same observation filed as `protectiveLoop` one night and
+    // `valuesConflict` the next could never match itself, so it minted a fresh
+    // id and appeared as a second "Seen 1x" card. The pattern TYPE is the
+    // model's opinion about a claim; the EVIDENCE is the claim's identity.
+    // Matching on evidence across all types is what lets a rewording rejoin
+    // its own history instead of forking it.
+    if (e.status === "merged" || e.mergedInto) continue;
     const prev = new Set([
       ...(e.evidence || []).map((x) => x.entryId),
       ...(e.evidenceEntryIdsAllTime || []),
@@ -1453,27 +1447,50 @@ async function mineHypothesesForUser(db, uid, now) {
     });
   }
 
-  // ── Stage 2: disconfirmation pass on the most salient claims ──────────
-  // Ordered by salience because the loudest claim is the one that most needs
-  // to survive an audit before the user ever reads it.
+  // ── Stage 2a: resolve identity FIRST, so `timesSeen` is known ─────────
+  //
+  // This ordering is the fix for "A hunch · Not checked against other entries
+  // yet" on 17 of 19 cards. The audit used to pick its two candidates by
+  // SALIENCE, before any identity resolution had happened — so `timesSeen` was
+  // unknown at audit time, and the claims that got audited were the loudest
+  // ones rather than the ones close to becoming a thread. Everything else was
+  // written with `disconfirmation: null`, and the UI printed the absence of QA
+  // as a caption on the card.
+  //
+  // Now: resolve, then audit the candidates that could actually become threads
+  // (timesSeen >= THREAD_MIN_TIMES_SEEN). `claimedIds` is still empty here, so
+  // this is a read-only preview of what Stage 3 will resolve to.
   candidates.sort((a, b) => b.salience - a.salience);
-  for (const c of candidates.slice(0, CE_MAX_HYPOTHESES)) {
+  for (const c of candidates) {
     const evidenceIds = c.evidence.map((e) => e.entryId);
-
-    // Skip the audit entirely when this claim was already tested and nothing
-    // new has arrived since. `claimedIds` is still empty here (Stage 3 hasn't
-    // run yet), so this identity lookup is a pure read-only preview of what
-    // Stage 3 will resolve to — see ai-cost-audit-2026-09-06.md cut #7. Leaving
-    // `c.ceRan` unset makes Stage 3 fall back to `pd.disconfirmation` (the
-    // existing "audit unavailable" path), so the prior verdict is preserved
-    // rather than lost.
     const preMatch = resolveHypothesisId(existing, c.patternType, evidenceIds, c.title, now);
-    const priorForAudit = preMatch.prior;
-    if (priorForAudit && priorForAudit.disconfirmation && priorForAudit.disconfirmation.ranAt) {
-      const allTimeIds = new Set(priorForAudit.evidenceEntryIdsAllTime || []);
-      if (evidenceIds.every((id) => allTimeIds.has(id))) continue;
-    }
+    c.priorForAudit = preMatch.prior;
+    const priorAllTime = new Set([
+      ...((preMatch.prior && preMatch.prior.evidenceEntryIdsAllTime) || []),
+      ...(((preMatch.prior && preMatch.prior.evidence) || []).map((e) => e.entryId)),
+      ...evidenceIds,
+    ].filter(Boolean));
+    c.projectedTimesSeen = priorAllTime.size;
+  }
 
+  // ── Stage 2b: disconfirmation pass on thread CANDIDATES ───────────────
+  const auditQueue = candidates
+    .filter((c) => {
+      if (c.projectedTimesSeen < THREAD_MIN_TIMES_SEEN) return false;
+      // Already tested, and nothing new has arrived since? Skip — leaving
+      // `c.ceRan` unset makes Stage 3 fall back to the prior verdict rather
+      // than losing it.
+      const prior = c.priorForAudit;
+      if (prior && prior.disconfirmation && prior.disconfirmation.ranAt) {
+        const allTimeIds = new Set(prior.evidenceEntryIdsAllTime || []);
+        if (c.evidence.map((e) => e.entryId).every((id) => allTimeIds.has(id))) return false;
+      }
+      return true;
+    })
+    .slice(0, AUDIT_MAX_PER_RUN);
+
+  for (const c of auditQueue) {
+    const evidenceIds = c.evidence.map((e) => e.entryId);
     const cited = new Set(evidenceIds);
     const unseen = analysesForModel.filter((a) => !cited.has(a.entry_id))
       .slice(0, CE_NOTES_PER_CALL)
@@ -1657,23 +1674,11 @@ async function mineHypothesesForUser(db, uid, now) {
   }
 
   // ── Stage 4: decay ────────────────────────────────────────────────────
-  // decayAfterDays used to be stored and never read. A hypothesis with no new
-  // supporting entry for DECAY_DAYS is retired, which is what lets the profile
-  // describe a season instead of accumulating everything the user has ever been.
-  for (const e of existing) {
-    if (claimedIds.has(e.id) || e.stability === "retired") continue;
-    if (e.userStatus === "this_is_me") continue;   // user vouched for it; keep.
-    const lastMs = e.lastEvidenceAt && e.lastEvidenceAt.toDate
-      ? e.lastEvidenceAt.toDate().getTime()
-      : (e.firstSeenAt && e.firstSeenAt.toDate ? e.firstSeenAt.toDate().getTime() : null);
-    if (lastMs == null) continue;
-    const ageDays = (now.getTime() - lastMs) / 86400000;
-    if (ageDays < DECAY_DAYS) continue;
-    batch.set(hypCol.doc(e.id), {
-      stability: "retired", lifecycle: "retired",
-      salienceScore: Math.min(num(e.salienceScore, 0), 0.1),
-    }, { merge: true });
-  }
+  // MOVED to `decayHypothesesFor`, which runs on the deterministic nightly
+  // worker (computeUserDerived). Decay is pure arithmetic over
+  // `lastEvidenceAt`, and running it here meant it only happened inside a
+  // SUCCESSFUL mine — so a dormant user, exactly the person whose profile most
+  // needs to stop describing a season that has ended, never decayed at all.
 
   await batch.commit();
   console.log("mine", { uid, written, weakened, dropped, absences: absences.length });
@@ -1717,7 +1722,7 @@ async function updateSelfModel(db, uid, entryCount, now) {
   const priorById = {};
   if (prior) {
     for (const key of ["coreRules", "protectiveStrategies", "values",
-      "contradictions", "whatHelps", "absences", "relationshipRoles"]) {
+      "contradictions", "whatHelps", "absences", "bodySignals", "relationshipRoles"]) {
       for (const item of (prior[key] || [])) {
         if (item && item.id) priorById[item.id] = item;
       }
@@ -1747,8 +1752,10 @@ async function updateSelfModel(db, uid, entryCount, now) {
       title: String(h.userFacingTitle || "").slice(0, 80),
       hypothesis: String(h.coreHypothesis || ""),
       confidence: clamp01(confidence),
-      scope: h.scope || "recurring",
-      stability: h.stability || "emerging",
+      // No fallback here — the `live` filter above already requires both
+      // fields to be present, so guessing one from the other is never needed.
+      scope: h.scope,
+      stability: h.stability,
       // Trust the lifecycle the miner computed — it has the evidence counts and
       // the audit verdict. Recomputing it here from timesSeen alone made
       // "weakened" and "user_confirmed" unreachable states.
@@ -1785,7 +1792,18 @@ async function updateSelfModel(db, uid, entryCount, now) {
 
   // Retired hypotheses must not reach the profile — that is the whole point of
   // decay. Previously nothing filtered them.
-  const live = hyps.filter((h) => h.stability !== "retired" && h.lifecycle !== "retired");
+  //
+  // Also require scope/stability to be present. Stage 3 of the miner always
+  // writes both (functions/index.js ~:1599-1603), so a doc missing either is
+  // either pre-dating those fields or written by the client. The old code
+  // defaulted a missing scope to "recurring" (the STRONGEST value) while
+  // defaulting a missing stability to "emerging" (the WEAKEST) — that
+  // asymmetry is what put "1 entry" and "recurring" on the same card
+  // (mirror-v3-prd-2026-09-10.md §1). Skipping instead of guessing means a
+  // malformed doc simply doesn't surface until the next mine repairs it.
+  const live = hyps.filter((h) =>
+    h.stability !== "retired" && h.lifecycle !== "retired" &&
+    !!h.scope && !!h.stability);
 
   // Bucketing, corrected. protective_loop was landing in coreRules, which is
   // why the Protective section of the Mirror was permanently empty while
@@ -1796,9 +1814,34 @@ async function updateSelfModel(db, uid, entryCount, now) {
     h.patternType === "protective_loop").map(toProtective);
   const values = live.filter((h) => h.patternType === "values_conflict").map(toSMHyp);
   const contradictions = live.filter((h) => h.patternType === "avoided_subject").map(toSMHyp);
+  // whatHelps was the only non-exclusive bucket: `|| h.actionOutcome` is
+  // truthy for ANY patternType that earned an action->outcome pair, so a
+  // protective_loop with one landed in BOTH protectiveStrategies ("Protective
+  // moves") and here ("What softens it") — the source of the "RULE YOU MAY
+  // CARRY" cards mislabelled as exceptions (mirror-v3-prd-2026-09-10.md §1).
+  // Exclude protective_loop from the actionOutcome arm; exception hypotheses
+  // still qualify unconditionally.
   const whatHelps = live.filter((h) =>
-    h.patternType === "exception" || h.actionOutcome).map(toSMHyp);
+    h.patternType === "exception" ||
+    (h.actionOutcome && h.patternType !== "protective_loop")).map(toSMHyp);
   const absencesOut = live.filter((h) => h.patternType === "absence").map(toSMHyp);
+  // body_signal and vocabulary_fingerprint were valid VALID_PATTERN_TYPES with
+  // no bucket at all — mined, scored, and then silently dropped before ever
+  // reaching the self model.
+  const bodySignals = live.filter((h) => h.patternType === "body_signal").map(toSMHyp);
+  const vocabFromHyps = live.filter((h) => h.patternType === "vocabulary_fingerprint").map((h) => ({
+    word: String(h.userFacingTitle || "").slice(0, 40),
+    personalMeaning: String(h.coreHypothesis || ""),
+    confidence: toSMHyp(h).confidence,
+    exampleUsage: (h.evidence && h.evidence[0] && h.evidence[0].quote) || "",
+  }));
+  const priorVocab = prior ? (prior.vocabulary || []) : [];
+  const minedVocabWords = new Set(vocabFromHyps.map((v) => v.word.toLowerCase()));
+  // Mined entries win over whatever was previously carried forward for the
+  // same word; anything else prior already had is preserved, capped at 20.
+  const vocabulary = vocabFromHyps
+    .concat(priorVocab.filter((v) => !minedVocabWords.has(String((v && v.word) || "").toLowerCase())))
+    .slice(0, 20);
   const relationshipRoles = live.filter((h) => h.patternType === "relationship_role")
     .map((h) => ({
       id: h.id,
@@ -1826,8 +1869,9 @@ async function updateSelfModel(db, uid, entryCount, now) {
     whatHelps,
     // NEW — "what's gone quiet". Arithmetically derived, never guessed.
     absences: absencesOut,
+    bodySignals,
     relationshipRoles,
-    vocabulary: prior ? (prior.vocabulary || []) : [],
+    vocabulary,
     doNotInfer: ["diagnosis", "trauma_origin", "attachment_style", "mental_disorder"],
     // Written by the server pipeline only, so the client can detect and refuse
     // to clobber a fresher server model with a thinner locally-assembled one.
@@ -1858,7 +1902,6 @@ async function updateSelfModel(db, uid, entryCount, now) {
  *  client-side with a device-local key).
  * ────────────────────────────────────────────────────────────────────────── */
 const MIRROR_WRITE_PROMPT_VERSION = "mirror-line-v1";
-const MIRROR_GUARD_PROMPT_VERSION = "mirror-line-v1+guard";
 const MIRROR_DECK_SIZE = 3;             // must be >1 to survive a fatigue-driven rotation.
 const MIRROR_CARD_ANALYSES_LIMIT = 14;  // matches MirrorGraphService.loadRecentAnalyses's caller.
 const MIRROR_HYPOTHESES_LIMIT = 20;     // matches MirrorGraphService.loadHypotheses.
@@ -1868,22 +1911,8 @@ const MIRROR_HYPOTHESES_LIMIT = 20;     // matches MirrorGraphService.loadHypoth
  *  SAFETY_RULES above is kept in sync with SpilrVoice.safetyRules: this is
  *  the client's OUTPUT-side enforcement for "standard sentence case", and
  *  this file is now a second writer of the same kind of user-facing text. */
-const SENTENCE_START_SKIP = new Set(["\"", "'", "“", "”", "‘", "’", "(", "["]);
-function sentenceCased(text) {
-  if (!text) return text;
-  const chars = Array.from(String(text));
-  let atStart = true;
-  for (let i = 0; i < chars.length; i++) {
-    const c = chars[i];
-    if (/\s/.test(c) || SENTENCE_START_SKIP.has(c)) continue;
-    if (atStart && /\p{L}/u.test(c)) {
-      const upper = c.toUpperCase();
-      if (Array.from(upper).length === 1) chars[i] = upper;
-    }
-    atStart = (c === "." || c === "!" || c === "?");
-  }
-  return chars.join("");
-}
+// `sentenceCased` comes from ./lib/text (with `deShout`, which fixes the
+// ALL-CAPS case this function structurally cannot).
 
 /** Port of MirrorMaturity.current(totalEntries:) — MirrorMaturity.swift. */
 function mirrorMaturityFor(totalEntries) {
@@ -1967,85 +1996,21 @@ function mirrorRepetitionFatigue(h, now) {
  *  quiet" without guessing.
  * ────────────────────────────────────────────────────────────────────────── */
 
-const HEDGE_WORDS = /\b(may|might|seems?|perhaps|possibly)\b/gi;
-const TRAIT_PHRASING =
-  /\byou (are|'re) (someone|a person|the kind of person) who\b|\byou always\b|\byou never\b|\bthis is who you are\b/i;
+// HEDGE_WORDS and TRAIT_PHRASING come from ./lib/lint, where TRAIT_PHRASING
+// is extended with §6's "you tend" / "your (need|inability|fear)".
 
 // Small, deliberately generic — this is a client-independent, best-effort
 // paraphrase check against an EntryAnalysis summary, not a cross-language
 // parity point with the Swift side (unlike mirrorScore/mirrorMaturityFor,
 // which MUST match DailyJournal/Mirror/MirrorScore.swift byte-for-byte
 // because the client picks from cards this file wrote).
-const MIRROR_STOPWORDS = new Set([
-  "this", "that", "with", "have", "from", "were", "been", "your", "their",
-  "there", "about", "into", "just", "like", "really", "would", "could",
-  "should", "when", "what", "them", "then", "than", "over", "want", "know",
-  "feel", "felt", "think", "thing", "things", "time", "today", "week",
-  "going", "getting", "make", "made", "back", "does", "doing",
-]);
+// MIRROR_STOPWORDS / contentWords / jaccard come from ./lib/text.
 
-function contentWords(text) {
-  return new Set(
-    normalise(text)
-      .split(/[^a-z0-9]+/)
-      .filter((w) => w.length >= 4 && !MIRROR_STOPWORDS.has(w))
-  );
-}
+// `hasVerbatimOverlap` comes from ./lib/text.
 
-function jaccard(a, b) {
-  if (a.size === 0 || b.size === 0) return 0;
-  let intersection = 0;
-  for (const w of a) if (b.has(w)) intersection++;
-  const union = a.size + b.size - intersection;
-  return union === 0 ? 0 : intersection / union;
-}
-
-/** Does `line` contain a run of at least `minWords` consecutive words that
- *  also appear, in order, in `quote`? A proxy for "quotes the person's own
- *  words" that's stricter than sharing any content word and looser than
- *  requiring the exact full phrase. */
-function hasVerbatimOverlap(line, quote, minWords = 3) {
-  const lineNorm = normalise(line);
-  const quoteWords = normalise(quote).split(/\s+/).filter(Boolean);
-  if (quoteWords.length === 0) return false;
-  if (quoteWords.length < minWords) {
-    return lineNorm.includes(quoteWords.join(" "));
-  }
-  for (let i = 0; i + minWords <= quoteWords.length; i++) {
-    if (lineNorm.includes(quoteWords.slice(i, i + minWords).join(" "))) return true;
-  }
-  return false;
-}
-
-/** `receiptQuote` and `sourceSummary` are both optional — a rule that needs
- *  data it wasn't given passes rather than blocks, so a hypothesis mined
- *  before this lint existed (no matching evidence, no matching analysis)
- *  degrades to the OLD banned-term-only gate instead of being suppressed on
- *  missing data. */
-function lintMirrorLine(line, { receiptQuote, sourceSummary } = {}) {
-  const trimmed = (line || "").trim();
-  if (!trimmed) return { ok: false, reason: "empty" };
-  if (trimmed.length > 140) return { ok: false, reason: "too_long" };
-
-  const sentenceEnders = (trimmed.match(/[.!?](?=\s|$)/g) || []).length;
-  if (sentenceEnders > 1) return { ok: false, reason: "multi_sentence" };
-
-  const hedgeCount = (trimmed.match(HEDGE_WORDS) || []).length;
-  if (hedgeCount > 1) return { ok: false, reason: "over_hedged" };
-
-  if (TRAIT_PHRASING.test(trimmed)) return { ok: false, reason: "trait_phrasing" };
-
-  if (receiptQuote && !hasVerbatimOverlap(trimmed, receiptQuote)) {
-    return { ok: false, reason: "no_receipt_anchor" };
-  }
-
-  if (sourceSummary) {
-    const overlap = jaccard(contentWords(trimmed), contentWords(sourceSummary));
-    if (overlap > 0.7) return { ok: false, reason: "paraphrase" };
-  }
-
-  return { ok: true, reason: null };
-}
+// `lintMirrorLine` now delegates to ./lib/lint's `lintCopy`, which adds the
+// §6 rules (specificity, reading level, metaphor, ends-negative) on top of
+// the original seven and is shared with the reading/letter/thread surfaces.
 
 /* ──────────────────────────────────────────────────────────────────────────
  *  MIRROR LINE — Stage 1 (Select, deterministic) + Stage 2 (Write, LLM) of
@@ -2388,20 +2353,13 @@ async function writeMirrorCardFor(uid, hypothesis, recentAnalyses, maturity, now
   });
 
   if (guardGen.decision === "approve") return draft;
-  if (guardGen.decision === "rewrite") {
-    const saferLine = sentenceCased(String(guardGen.safer_line || draft.line));
-    if (!saferLine) return null;
-    return {
-      ...draft,
-      line: saferLine,
-      mirrorSentence: saferLine,
-      readText: saferLine,
-      shareSafeText: saferLine,
-      shareSafeSummary: saferLine,
-      promptVersion: MIRROR_GUARD_PROMPT_VERSION,
-    };
-  }
-  return null; // "suppress" or anything unrecognised.
+  // "rewrite" used to return `safer_line` straight from the guard call with no
+  // re-lint — a decision made by the SAME call that is supposed to be
+  // catching problems could reintroduce a banned term or trip
+  // lintMirrorLine and ship anyway. Treat it the same as "suppress": the
+  // hypothesis is skipped this run rather than shown with unverified text
+  // (mirror-v3-prd-2026-09-10.md §6 — "not softened and retried").
+  return null; // "rewrite", "suppress", or anything unrecognised.
 }
 
 /**
@@ -2561,41 +2519,72 @@ function weekKeyFor(date) {
   return d.toISOString().slice(0, 10);
 }
 
-function buildMirrorLetterPrompt(weekAnalyses, topHypotheses, now) {
+/**
+ * The weekly letter prompt — Mirror v3 §5.5.
+ *
+ * Rebuilt around FACTS AND ONE OBSERVATION rather than a list of hypothesis
+ * titles. The old version handed the model three mined titles and asked it to
+ * find a theme, which is how a letter ends up sounding like the pattern engine
+ * talking. Now it gets: the week's dominant word with its real count and the
+ * day it broke, exactly one observation with its numbers and quotes, and
+ * nothing else to embroider.
+ */
+function buildMirrorLetterPrompt(weekAnalyses, facts, observation, now) {
   const summaries = weekAnalyses.map((a) => {
     const d = a.createdAt && a.createdAt.toDate ? a.createdAt.toDate() : now;
     const weekday = d.toLocaleDateString("en-US", { weekday: "short", timeZone: "UTC" });
     return `${weekday}: ${a.surfaceSummary || ""}`;
   }).join("\n");
 
-  const patternsRendered = topHypotheses.map((h) =>
-    `- ${h.userFacingTitle}${h.evidence && h.evidence[0] ? ` — "${h.evidence[0].quote}"` : ""}`
-  ).join("\n");
+  const week = (facts && facts.week) || {};
+  const factLines = [];
+  if (week.entries) {
+    factLines.push(`- ${week.entries} entries on ${week.activeDays} days${
+      week.wordsKnown ? `, ${week.words} words` : ""}.`);
+  }
+  if (week.topEmotion) {
+    factLines.push(`- The week's most repeated word: '${week.topEmotion.word}' (${
+      week.topEmotion.count} times${
+      week.topEmotion.clusteredOn ? `, every one of them on ${
+        String(week.topEmotion.clusteredOn).replace("domain:", "")} days` : ""}).`);
+  }
+  if ((week.people || []).length) {
+    factLines.push(`- People named: ${week.people.map((p) => `${p.name} (${p.mentions})`).join(", ")}.`);
+  }
+
+  const obsBlock = observation ? `${observation.templateText}
+Numbers: n=${observation.n} m=${observation.m} k=${observation.k} j=${observation.j}
+Their words: ${(observation.quotes || []).map((q) => `"${q.text}"`).join(" / ") || "(none)"}`
+    : "(none this week)";
 
   return `${SAFETY_RULES}
 
 TASK: Write this person's weekly Mirror letter — the one place density is
-allowed, because they opened it on purpose. Three short sentences, at most 80
-words total.
+allowed, because they opened it on purpose. At most 80 words, and it MUST end
+with a question mark.
 
-1. Name the week's dominant tone AND the day it broke (an exception) — use
-   the weekday labels below.
-2. Name ONE theme, anchored in a verbatim quote from the patterns below.
+1. Name the week's dominant word and, if there was one, the day it broke.
+2. Say the ONE observation below in plain words, keeping its numbers intact.
 3. Ask one open question the week is asking them — <= 20 words.
+
+THIS WEEK, COUNTED (these numbers are facts — do not change them):
+${factLines.join("\n") || "(quiet week)"}
+
+THE ONE OBSERVATION:
+${obsBlock}
 
 THIS WEEK'S ENTRIES (weekday: summary):
 ${summaries || "(none)"}
 
-PATTERNS SEEN THIS WEEK:
-${patternsRendered || "(none)"}
-
 Rules: hedge everything inferred, never a diagnosis, never "you always" /
-"you never", plain language, 8th-grade reading level, no metaphor.
+"you never", never "you tend to", plain language, 8th-grade reading level, no
+metaphor. End on the question.
 
 Return ONLY valid JSON:
 {
-  "letter": "the three sentences, as one piece of prose, <= 80 words total",
-  "quote": "the verbatim quote your theme sentence used, or null"
+  "letter": "the three sentences, as one piece of prose, <= 80 words, ending in a question",
+  "quote": "the verbatim quote your theme sentence used, or null",
+  "question": "the closing question on its own"
 }`;
 }
 
@@ -2611,46 +2600,75 @@ async function buildWeeklyLetterFor(db, uid, now) {
     .orderBy("createdAt", "asc")
     .get();
   const weekAnalyses = analysesSnap.docs.map((d) => d.data());
-  if (weekAnalyses.length < WEEKLY_LETTER_MIN_ANALYSES) {
-    return { written: false, reason: "below_threshold" };
+
+  // Read the derived layer this letter is built on. It is recomputed nightly
+  // at 04:00 UTC while the letter fires at each user's local Sunday 18:00, so
+  // for every timezone the facts land first — but be defensive rather than
+  // trusting a cron ordering: stale numbers in a dated artefact the user keeps
+  // is exactly the kind of wrong that is discovered weeks later.
+  const userRef = db.collection("users").doc(uid);
+  let factsSnap = await userRef.collection("derived").doc("facts").get();
+  let facts = factsSnap.exists ? factsSnap.data() : null;
+  if (facts) facts.firstSeen = firstSeenFromDoc(facts);
+  const factsAge = facts && facts.computedAt && facts.computedAt.toDate
+    ? (now.getTime() - facts.computedAt.toDate().getTime()) / 3600000 : Infinity;
+  if (!facts || factsAge > 36) {
+    try {
+      const recomputed = await computeFactsForUser(db, uid, now);
+      facts = recomputed.facts;
+    } catch (e) {
+      console.error("weeklyLetter: facts recompute failed", { uid, error: String(e) });
+    }
   }
 
-  const hypSnap = await db.collection("users").doc(uid)
-    .collection("patternHypotheses")
-    .orderBy("salienceScore", "desc").limit(MIRROR_HYPOTHESES_LIMIT).get();
-  const topHypotheses = hypSnap.docs.map((d) => d.data())
-    .filter((h) => h && h.status === "pending" && h.stability !== "retired")
-    .map((h) => ({ h, score: mirrorScore(h, now) }))
-    .filter((x) => x.score > 0.5)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 3)
-    .map((x) => x.h);
+  // §5.5 gates on ENTRIES, not analyses. An entry that never got analysed (AI
+  // was down, or the text was too short) still happened, and telling someone
+  // they didn't write enough for a letter when they wrote four times is the
+  // kind of miscount that makes the whole surface untrustworthy.
+  const weekEntries = (facts && facts.week && facts.week.entries) || weekAnalyses.length;
+  if (weekEntries < WEEKLY_LETTER_MIN_ANALYSES) {
+    return { written: false, reason: "below_threshold", weekEntries };
+  }
+
+  // Exactly ONE observation, the highest-scoring one whose window overlaps
+  // this week — not three hypothesis titles.
+  const obsSnap = await userRef.collection("observations")
+    .orderBy("score", "desc").limit(10).get();
+  const observation = obsSnap.docs.map((d) => d.data())
+    .filter((o) => o && o.templateText && num(o.notQuiteCount, 0) < 2)[0] || null;
 
   let gen;
   try {
     gen = await callGeminiJSON(
-      buildMirrorLetterPrompt(weekAnalyses, topHypotheses, now),
-      { maxTokens: 260, temperature: 0.4 },
+      buildMirrorLetterPrompt(weekAnalyses, facts, observation, now),
+      { maxTokens: 300, temperature: 0.4 },
       uid, "mirror_letter");
   } catch (e) {
     return { written: false, reason: "generation_failed" };
   }
   if (!gen) return { written: false, reason: "generation_failed" };
 
-  const letter = sentenceCased(String(gen.letter || ""));
+  const letter = sentenceCased(deShout(String(gen.letter || "").trim()));
   if (!letter) return { written: false, reason: "empty" };
 
-  // The 140-char cap in lintMirrorLine doesn't fit an 80-word letter, so this
-  // checks the banned-term/trait-phrasing rules directly rather than reusing
-  // that function's length gate.
-  if (tripsBannedLint(letter) || tripsLabelLint(letter) || TRAIT_PHRASING.test(letter)) {
-    console.log("mirrorLintReject", { uid, reason: "letter_banned_term_or_trait", promptVersion: MIRROR_LETTER_PROMPT_VERSION });
-    return { written: false, reason: "lint_rejected" };
+  // The full §6 contract at letter length: <= 80 words, must end in a
+  // question, quote/number containment, reading level, metaphor, trait voice.
+  // Previously only the banned-term and trait checks ran here — the 80-word
+  // cap was asked of the model and enforced nowhere.
+  const lint = lintCopy(letter, { kind: "letter", observation });
+  if (!lint.ok) {
+    console.log("mirrorLintReject", {
+      uid, surface: "letter", rule: lint.reason, term: lint.term || null,
+      promptVersion: MIRROR_LETTER_PROMPT_VERSION,
+    });
+    return { written: false, reason: "lint_rejected", rule: lint.reason };
   }
 
-  await db.collection("users").doc(uid).collection("mirrorLetters").doc(weekKeyFor(now)).set({
+  await userRef.collection("mirrorLetters").doc(weekKeyFor(now)).set({
     letter,
     quote: gen.quote ? String(gen.quote) : null,
+    question: gen.question ? sentenceCased(String(gen.question)) : null,
+    observationId: observation ? observation.id : null,
     generatedAt: admin.firestore.Timestamp.fromDate(now),
     promptVersion: MIRROR_LETTER_PROMPT_VERSION,
     openedAt: null,
@@ -2693,6 +2711,1017 @@ async function sendPushToUser(db, uid, { title, body, data }) {
   }
 }
 
+/* ──────────────────────────────────────────────────────────────────────────
+ *  DEDUP — hypothesis identity across the whole corpus (Mirror v3 M2).
+ *
+ *  Runs BEFORE the mine, on its own cheap gate, so it still happens on the
+ *  many nights the mine's cadence check skips the user. `resolveHypothesisId`
+ *  stops the fork at the source; this cleans up the history that forked before
+ *  the fix — the nineteen hypotheses, six of which are one pattern.
+ *
+ *  Sequenced in two halves, per the plan:
+ *    4a. DETERMINISTIC — evidence containment across all patternTypes, plus a
+ *        content-word title key. Free, and correct whenever it fires.
+ *    4b. EMBEDDINGS — only for the residue: variants that share no evidence
+ *        entry AND whose titles do not overlap. Enabled by DEDUP_USE_EMBEDDINGS
+ *        once 4a's dry-run numbers say how much residue there actually is.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+const EMBED_MODEL = "gemini-embedding-001";
+const EMBED_DIM = 768;          // 3072 would be 24KB/doc for no gain at n<=400
+const EMBED_BATCH = 100;        // batchEmbedContents ceiling
+const DEDUP_MIN_HYPOTHESES = 2;
+const DEDUP_STALE_DAYS = 7;
+// Ship the first night with DEDUP_DRY_RUN=1: it logs the full merge plan and
+// writes nothing, so the cosine/containment histogram can be read off real
+// data before anything is irreversibly merged.
+const DEDUP_DRY_RUN = () => String(process.env.DEDUP_DRY_RUN || "") === "1";
+const DEDUP_USE_EMBEDDINGS = () => String(process.env.DEDUP_USE_EMBEDDINGS || "") === "1";
+
+/**
+ * Embed short texts. A genuinely new call path — `callGeminiJSON` hardcodes
+ * `:generateContent`, and embeddings are a different endpoint with a different
+ * response shape and NO `usageMetadata`, so the existing `logAIUsage` does not
+ * apply and this logs its own counter instead.
+ */
+async function callGeminiEmbed(texts, uid, surface) {
+  const key = GEMINI_KEY.value();
+  if (!key) throw new Error("GEMINI_KEY missing");
+  const out = [];
+  for (let i = 0; i < texts.length; i += EMBED_BATCH) {
+    const slice = texts.slice(i, i + EMBED_BATCH);
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${EMBED_MODEL}:batchEmbedContents?key=${encodeURIComponent(key)}`;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        requests: slice.map((t) => ({
+          model: `models/${EMBED_MODEL}`,
+          content: { parts: [{ text: String(t).slice(0, 2000) }] },
+          taskType: "SEMANTIC_SIMILARITY",
+          outputDimensionality: EMBED_DIM,
+        })),
+      }),
+    });
+    if (!resp.ok) {
+      throw new Error(`embed ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+    }
+    const json = await resp.json();
+    for (const e of (json.embeddings || [])) out.push((e && e.values) || null);
+    console.log("aiEmbedUsage", {
+      uid, surface, texts: slice.length,
+      chars: slice.reduce((s, t) => s + String(t).length, 0),
+    });
+  }
+  return out;
+}
+
+/**
+ * Cluster and merge one user's hypotheses.
+ *
+ * Losers become TOMBSTONES, not deletions. `mirrorCards/{hypothesisId}`,
+ * `patternCallbacks`, `mirrorShown.evidenceEntryIds` and the client's own
+ * in-memory arrays all still hold the old id; a tombstone with `mergedInto`
+ * lets every one of those late writers follow the pointer instead of silently
+ * writing to a document that no longer means anything.
+ */
+async function dedupHypothesesForUser(db, uid, now) {
+  const userRef = db.collection("users").doc(uid);
+  const col = userRef.collection("patternHypotheses");
+  // Unordered: an orderBy silently excludes docs missing the field.
+  const snap = await col.limit(400).get();
+  const hyps = snap.docs.map((d) => ({ id: d.id, ...d.data() }))
+    .filter((h) => h.status !== "merged" && !h.mergedInto);
+  if (hyps.length < DEDUP_MIN_HYPOTHESES) return { skipped: true, reason: "too_few" };
+
+  // 4b — embeddings, for the residue only, and cached by content hash so the
+  // steady state is 0-6 embeddings per user per night rather than 400.
+  if (DEDUP_USE_EMBEDDINGS()) {
+    const stale = hyps.filter((h) => {
+      const text = `${h.userFacingTitle || ""}\n${h.coreHypothesis || ""}`;
+      const hash = require("crypto").createHash("sha1").update(text).digest("hex");
+      h._embedText = text;
+      h._embedHash = hash;
+      return !(h.embedding && h.embedding.textHash === hash &&
+        Array.isArray(h.embedding.v) && h.embedding.v.length === EMBED_DIM);
+    });
+    if (stale.length) {
+      try {
+        const vectors = await callGeminiEmbed(
+          stale.map((h) => h._embedText), uid, "hypothesis_embed");
+        const batch = db.batch();
+        stale.forEach((h, i) => {
+          const v = vectors[i];
+          if (!v) return;
+          h.embedding = {
+            v, model: EMBED_MODEL, dim: EMBED_DIM,
+            textHash: h._embedHash,
+            computedAt: admin.firestore.Timestamp.fromDate(now),
+          };
+          batch.set(col.doc(h.id), { embedding: h.embedding }, { merge: true });
+        });
+        await batch.commit();
+      } catch (e) {
+        // No embeddings this run ⇒ fall back to deterministic keys only. A
+        // dedup that does less is always safe; a dedup that guesses is not.
+        console.error("dedup embed failed", { uid, error: String(e) });
+      }
+    }
+  }
+
+  const { merges, plan } = clusterHypotheses(hyps, { now });
+
+  if (merges.length === 0) {
+    await userRef.set({
+      lastDedupAt: admin.firestore.Timestamp.fromDate(now),
+    }, { merge: true });
+    return { merged: 0, clusters: 0 };
+  }
+
+  console.log("dedupPlan", {
+    uid, dryRun: DEDUP_DRY_RUN(), clusters: plan.length,
+    detail: plan.map((p) => ({
+      survivor: p.survivor.id,
+      survivorTitle: String(p.survivor.title || "").slice(0, 60),
+      absorbs: p.losers.length,
+      timesSeen: `${p.survivor.timesSeen} -> ${p.mergedTimesSeen}`,
+      killed: p.killedStatus || null,
+      via: p.edges.map((e) => `${e.via}:${
+        e.via.startsWith("cosine") ? (e.sim.cosine || 0).toFixed(3)
+          : e.sim.evidence.toFixed(2)}`),
+    })),
+  });
+
+  if (DEDUP_DRY_RUN()) {
+    return { merged: 0, clusters: merges.length, dryRun: true };
+  }
+
+  const batch = db.batch();
+  let loserCount = 0;
+  for (const m of merges) {
+    const patch = { ...m.patch };
+    if (patch.firstSeenAt) patch.firstSeenAt = admin.firestore.Timestamp.fromMillis(patch.firstSeenAt);
+    else delete patch.firstSeenAt;
+    if (patch.lastEvidenceAt) patch.lastEvidenceAt = admin.firestore.Timestamp.fromMillis(patch.lastEvidenceAt);
+    else delete patch.lastEvidenceAt;
+    // Re-derive the label fields from the merged count, so a cluster that
+    // crosses the recurrence threshold says so immediately.
+    patch.lifecycle = patch.userStatus === "this_is_me" ? "user_confirmed"
+      : patch.timesSeen >= RECURRING_AT ? "recurring"
+        : patch.timesSeen >= 2 ? "emerging" : "observed_once";
+    patch.scope = patch.timesSeen >= RECURRING_AT ? "recurring"
+      : patch.timesSeen >= 2 ? "this_month" : "this_week";
+    batch.set(col.doc(m.survivorId), patch, { merge: true });
+
+    for (const loserId of m.loserIds) {
+      batch.set(col.doc(loserId), {
+        mergedInto: m.survivorId,
+        status: "merged",
+        stability: "retired",
+        lifecycle: "retired",
+        salienceScore: 0,
+        mergedAt: admin.firestore.Timestamp.fromDate(now),
+      }, { merge: true });
+      // The loser's card is now unreachable and would otherwise sit in the
+      // deck competing for a slot it can never legitimately win.
+      batch.delete(userRef.collection("mirrorCards").doc(loserId));
+      loserCount++;
+    }
+  }
+  batch.set(userRef, {
+    lastDedupAt: admin.firestore.Timestamp.fromDate(now),
+  }, { merge: true });
+  await batch.commit();
+
+  console.log("dedupJob", { uid, clusters: merges.length, retired: loserCount });
+  return { merged: loserCount, clusters: merges.length };
+}
+
+/** Should dedup run tonight? Cheap enough to run often, but not every night
+ *  for a corpus that hasn't changed. */
+function dedupIsDue(userData, hypothesisCount, now) {
+  if (hypothesisCount < DEDUP_MIN_HYPOTHESES) return false;
+  const last = userData && userData.lastDedupAt && userData.lastDedupAt.toDate
+    ? userData.lastDedupAt.toDate() : null;
+  if (!last) return true;
+  return (now.getTime() - last.getTime()) / 86400000 >= DEDUP_STALE_DAYS;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  MIRROR v3 — THE DERIVED PIPELINE (mirror-v3-prd-2026-09-10.md §8)
+ *
+ *  entryAnalyses (existing)
+ *    -> FactsJob        deterministic  -> derived/facts
+ *    -> ObservationsJob deterministic  -> observations/*
+ *    -> DecayJob        deterministic  -> retires stale hypotheses
+ *    -> ThreadsJob      deterministic  -> derived/threads
+ *    -> TodayJob        deterministic  -> readings/{yyyy-MM-dd}
+ *    -> (mineUserInsights, separately: DedupJob + mine + audit + ReadingJob)
+ *
+ *  WHY THIS IS A SEPARATE WORKER FROM mineUserInsights
+ *  --------------------------------------------------
+ *  Everything above is arithmetic and costs zero model tokens, so it can and
+ *  must run for EVERY user EVERY night. `mineUserInsights` sits behind
+ *  MIN_NEW_ANALYSES_TO_MINE / MINE_MAX_STALENESS_HOURS and returns early on
+ *  most nights — correct for a job that spends money, fatal for the facts
+ *  strip, which would otherwise show last week's counts and quietly lie.
+ *
+ *  It also holds no GEMINI_KEY. A job that makes no model call should not be
+ *  able to, which is the same reasoning dispatchUserWork already applies.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+const DERIVED_LOOKBACK_DAYS = 90;   // how far back facts read
+const DERIVED_READ_LIMIT = 200;     // hard cap on docs pulled per collection
+const OBSERVATION_WINDOW_DAYS = 30; // §4: "30-day rolling window unless stated"
+const OBSERVATION_KEEP = 120;       // most-recently-scored observations retained
+const OBSERVATION_RETENTION_DAYS = 60;
+const OBSERVATION_DELETE_CAP = 200; // per night, so this can never run long
+const TODAY_SCORE_FLOOR = 0.8;      // below this, the day goes quiet on purpose
+const THREAD_CAP = 3;               // §5.4 — three rows, no more
+const THREAD_MIN_TIMES_SEEN = 3;    // §4 Tier 3: n >= 3 distinct entries
+const DOT_STRIP_DAYS = 30;
+const FIRST_SEVEN_AT = 7;
+const UNLOCK_NUDGE_DAYS = 14;       // rate limit on the "here's what's next" push
+
+// Keep writing the legacy per-hypothesis `mirrorCards` deck for ONE release,
+// so a client that predates `readings/{date}` still has something to render.
+// Flipping this to false is where §8's promised cost reduction actually lands:
+// MIRROR_DECK_SIZE write calls + the same number of guard calls collapse to
+// one reading call.
+const MIRROR_LEGACY_DECK = true;
+
+/** Render `lifeContext/current` into a prompt block. The client has its own
+ *  copy of this for the surfaces it still builds prompts for
+ *  (AIService.cacheLifeContext); this is the server side of the same idea, and
+ *  it is user-SUPPLIED context, never inferred. */
+function lifeContextBlock(ctx) {
+  if (!ctx) return "";
+  const lines = [];
+  if (ctx.currentSeason) lines.push(`- Season: ${String(ctx.currentSeason).replace(/_/g, " ")}`);
+  if (ctx.primaryFocus) lines.push(`- Focus right now: ${String(ctx.primaryFocus).slice(0, 120)}`);
+  const people = Array.isArray(ctx.peopleLikelyToAppear) ? ctx.peopleLikelyToAppear.slice(0, 5) : [];
+  if (people.length) lines.push(`- People who come up: ${people.join(", ")}`);
+  const off = Array.isArray(ctx.sensitiveTopicsDisabled) ? ctx.sensitiveTopicsDisabled : [];
+  if (off.length) lines.push(`- DO NOT raise: ${off.join(", ")}`);
+  if (ctx.preferredDepth) lines.push(`- Preferred depth: ${ctx.preferredDepth}`);
+  if (!lines.length) return "";
+  return `\nLIFE CONTEXT (user-supplied, shape tone accordingly):\n${lines.join("\n")}\n`;
+}
+
+/** Read `firstSeen` back out of a persisted facts doc. Accepts both the
+ *  `firstSeenList` array form written now and the legacy map form, so the
+ *  first run after this ships does not lose every term's true first date. */
+function firstSeenFromDoc(doc) {
+  if (!doc) return {};
+  if (Array.isArray(doc.firstSeenList)) {
+    const out = {};
+    for (const item of doc.firstSeenList) {
+      if (item && item.t && item.d) out[item.t] = item.d;
+    }
+    return out;
+  }
+  return doc.firstSeen || {};
+}
+
+/** Firestore Timestamp -> Date, tolerating a plain Date or null. */
+function toDate(ts) {
+  if (!ts) return null;
+  if (ts instanceof Date) return ts;
+  if (typeof ts.toDate === "function") return ts.toDate();
+  return null;
+}
+
+/* ── FactsJob (Tier 0) ───────────────────────────────────────────────────── */
+
+/**
+ * Recompute `users/{uid}/derived/facts`.
+ *
+ * Reads three cheap things: the user doc (for `timezone`), a projection of
+ * `entries` that never transfers the encrypted body, and `entryAnalyses`.
+ *
+ * QUERY RULE, learned the hard way elsewhere in this file (see the
+ * `lastEvidenceAt` note in mineHypothesesForUser): never range-query on
+ * `entryCreatedAt` or `wordCount`. Firestore SILENTLY EXCLUDES documents that
+ * lack the ordered field, so filtering on a field that only exists on newer
+ * docs would drop every older entry from the corpus without any error. Query
+ * on `createdAt`, which is always present, and bucket in memory.
+ */
+async function computeFactsForUser(db, uid, now) {
+  const userRef = db.collection("users").doc(uid);
+  const userSnap = await userRef.get();
+  const tz = (userSnap.exists && userSnap.data().timezone) || "UTC";
+  const since = admin.firestore.Timestamp.fromDate(
+    new Date(now.getTime() - DERIVED_LOOKBACK_DAYS * 86400000));
+
+  const [entriesSnap, analysesSnap, entriesTotal, priorFactsSnap] = await Promise.all([
+    userRef.collection("entries")
+      .where("createdAt", ">=", since)
+      .orderBy("createdAt", "desc")
+      .limit(DERIVED_READ_LIMIT)
+      // `.select()` keeps the ciphertext on the server side of the wire. The
+      // body is encrypted with a device-local key and unreadable here anyway;
+      // not downloading it is a cost and latency win, not a privacy one.
+      .select("createdAt", "sessionType", "tags", "mood", "templateId",
+        "templateScaleBefore", "templateScaleAfter", "wordCount")
+      .get(),
+    userRef.collection("entryAnalyses")
+      .where("createdAt", ">=", since)
+      .orderBy("createdAt", "desc")
+      .limit(DERIVED_READ_LIMIT)
+      .get(),
+    totalEntryCountFor(db, uid),
+    userRef.collection("derived").doc("facts").get(),
+  ]);
+
+  const entries = entriesSnap.docs.map((d) => {
+    const x = d.data();
+    return {
+      id: d.id,
+      createdAt: toDate(x.createdAt),
+      sessionType: x.sessionType || "freeWrite",
+      tags: x.tags || [],
+      mood: x.mood || null,
+      templateId: x.templateId || null,
+      templateScaleBefore: typeof x.templateScaleBefore === "number" ? x.templateScaleBefore : null,
+      templateScaleAfter: typeof x.templateScaleAfter === "number" ? x.templateScaleAfter : null,
+      wordCount: typeof x.wordCount === "number" ? x.wordCount : null,
+    };
+  }).filter((e) => e.createdAt);
+
+  const analyses = analysesSnap.docs.map((d) => {
+    const x = d.data();
+    return {
+      ...x,
+      entryId: x.entryId || d.id,
+      createdAt: toDate(x.createdAt),
+      entryCreatedAt: toDate(x.entryCreatedAt),
+    };
+  });
+
+  const facts = computeFacts({ entries, analyses, tz, now, entriesTotal });
+
+  // Carry forward the earliest first-appearance for every term. The window
+  // slides, so without this a term first written 100 days ago would appear to
+  // have started on the oldest day still in range — and "first time since"
+  // copy would be confidently wrong.
+  const prior = priorFactsSnap.exists ? priorFactsSnap.data() : null;
+  facts.firstSeen = mergeFirstSeen(firstSeenFromDoc(prior), facts.firstSeen);
+  facts.userId = uid;
+  facts.computedAt = admin.firestore.Timestamp.fromDate(now);
+
+  // `firstSeen` is a map keyed by TERM in memory, which is the right shape for
+  // every reader. It cannot be persisted that way: terms include the person's
+  // own phrases, and a phrase containing "." — "i'm done." — would become a
+  // Firestore field name with a dot in it. That is at best unqueryable and at
+  // worst silently reinterpreted as a nested path. Persist as a list of
+  // {t, d} pairs, which has no field-name restrictions at all, and convert
+  // back on read.
+  // `.set()` without merge replaces the document wholesale, so dropping the
+  // key here is enough to retire the legacy map form.
+  const toWrite = { ...facts };
+  delete toWrite.firstSeen;
+  toWrite.firstSeenList = Object.entries(facts.firstSeen).map(([t, d]) => ({ t, d }));
+
+  await userRef.collection("derived").doc("facts").set(toWrite);
+  console.log("factsJob", {
+    uid,
+    entries: facts.coverage.entriesInWindow,
+    analyses: facts.coverage.analysesInWindow,
+    wordCountKnown: facts.coverage.wordCountKnown,
+    peopleKnown: facts.coverage.peopleKnown,
+    stage: facts.unlock.stage,
+  });
+  return { facts, tz, analyses };
+}
+
+/* ── ObservationsJob (Tier 1) ────────────────────────────────────────────── */
+
+/**
+ * Recompute `users/{uid}/observations/*`.
+ *
+ * Ids are DETERMINISTIC — sha1(type + sorted terms) — which is the whole point:
+ * the counts change every night but the id does not, so `shownAt`, `userStatus`
+ * and `notQuiteCount` survive a recompute. An observation the user marked "not
+ * quite" twice stays retired instead of coming back tomorrow wearing the same
+ * face, which is the single most corrosive thing a daily surface can do.
+ */
+async function computeObservationsForUser(db, uid, now, facts, analyses, tz) {
+  const userRef = db.collection("users").doc(uid);
+  const todayKey = localDateParts(now, tz).dateKey;
+  const wb = weekBounds(now, tz);
+  const weekKeys = recentDateKeys(now, daysBetweenKeys(wb.start, wb.end) + 1, tz);
+  const windowDays = recentDateKeys(now, OBSERVATION_WINDOW_DAYS, tz);
+
+  // What was actually SHOWN recently, for the novelty term. `mirrorShown` is
+  // client-written; users on older builds have no `terms`/`observationId`
+  // field, and a missing field must read as MAXIMUM novelty, never zero —
+  // treating "unknown" as "identical to everything" would silence them.
+  const shownSnap = await userRef.collection("mirrorShown")
+    .where("shownAt", ">=", admin.firestore.Timestamp.fromDate(
+      new Date(now.getTime() - 30 * 86400000)))
+    .get();
+  const shownHistory = shownSnap.docs.map((d) => {
+    const x = d.data();
+    return {
+      date: d.id,
+      observationId: x.observationId || null,
+      terms: Array.isArray(x.terms) ? x.terms : null,
+    };
+  });
+
+  const computed = computeObservations(facts, analyses, {
+    now, todayKey, weekKeys, windowDays, shownHistory,
+  });
+
+  const priorSnap = await userRef.collection("observations").limit(300).get();
+  const priorById = {};
+  priorSnap.docs.forEach((d) => { priorById[d.id] = d.data(); });
+
+  const batch = db.batch();
+  const keep = computed.slice(0, OBSERVATION_KEEP);
+  let written = 0;
+  for (const o of keep) {
+    const p = priorById[o.id] || {};
+    batch.set(userRef.collection("observations").doc(o.id), {
+      ...o,
+      userId: uid,
+      computedAt: admin.firestore.Timestamp.fromDate(now),
+      // Preserve everything the USER owns across a recompute.
+      firstComputedAt: p.firstComputedAt || admin.firestore.Timestamp.fromDate(now),
+      shownAt: p.shownAt || null,
+      userStatus: p.userStatus || "unrated",
+      notQuiteCount: num(p.notQuiteCount, 0),
+    }, { merge: true });
+    written++;
+  }
+
+  // Retention: an observation nobody ever saw, whose window has rolled past,
+  // is dead weight. Bounded per night so this can never become a long job.
+  const keepIds = new Set(keep.map((o) => o.id));
+  const cutoff = new Date(now.getTime() - OBSERVATION_RETENTION_DAYS * 86400000);
+  let deleted = 0;
+  for (const d of priorSnap.docs) {
+    if (keepIds.has(d.id)) continue;
+    const x = d.data();
+    const computedAt = toDate(x.computedAt);
+    if (x.shownAt) continue;                       // it was shown; keep the record
+    if (computedAt && computedAt > cutoff) continue;
+    if (deleted >= OBSERVATION_DELETE_CAP) break;
+    batch.delete(d.ref);
+    deleted++;
+  }
+
+  await batch.commit();
+  const byType = {};
+  for (const o of keep) byType[o.type] = (byType[o.type] || 0) + 1;
+  console.log("observationsJob", { uid, emitted: written, deleted, byType });
+  return keep;
+}
+
+/* ── DecayJob ────────────────────────────────────────────────────────────── */
+
+/**
+ * Retire hypotheses with no new evidence for DECAY_DAYS.
+ *
+ * MOVED HERE from Stage 4 of mineHypothesesForUser. Decay used to run only
+ * inside a SUCCESSFUL mine, so a dormant user — precisely the person whose
+ * profile most needs to stop describing a season that ended — never decayed at
+ * all. It is pure arithmetic over `lastEvidenceAt`, so it belongs on the
+ * deterministic worker that runs for everyone nightly.
+ */
+async function decayHypothesesFor(db, uid, now) {
+  const col = db.collection("users").doc(uid).collection("patternHypotheses");
+  // Unordered on purpose — see the note in mineHypothesesForUser: an orderBy
+  // silently excludes docs missing the field.
+  const snap = await col.limit(400).get();
+  const batch = db.batch();
+  let retired = 0;
+  for (const d of snap.docs) {
+    const e = d.data();
+    if (!e || e.stability === "retired") continue;
+    if (e.status === "merged") continue;
+    if (e.userStatus === "this_is_me") continue;   // the user vouched for it
+    const last = toDate(e.lastEvidenceAt) || toDate(e.firstSeenAt);
+    if (!last) continue;
+    const ageDays = (now.getTime() - last.getTime()) / 86400000;
+    if (ageDays < DECAY_DAYS) continue;
+    batch.set(d.ref, {
+      stability: "retired",
+      lifecycle: "retired",
+      salienceScore: Math.min(num(e.salienceScore, 0), 0.1),
+    }, { merge: true });
+    retired++;
+  }
+  if (retired) await batch.commit();
+  if (retired) console.log("decayJob", { uid, retired });
+  return retired;
+}
+
+/* ── ThreadsJob (Tier 3) ─────────────────────────────────────────────────── */
+
+/**
+ * Rebuild `users/{uid}/derived/threads` — at most three.
+ *
+ * A thread is a hypothesis that RECURRED (>= 3 distinct entries), has a
+ * contrast set, and survived the counter-evidence audit — or that the user
+ * confirmed outright, which bypasses all of it. Everything else stays in
+ * `patternHypotheses` as substrate: invisible, still accruing evidence, still
+ * decaying at 45 days. That is the answer to "what happens to the other 16" —
+ * they are the corpus, not a surface.
+ *
+ * Labels are derived from counts ONLY: once / twice / recurring / confirmed.
+ * No type label, no lifecycle chip, no confidence caption. The taxonomy may be
+ * used to FIND a thread; it is never shown to name one.
+ */
+async function buildThreadsFor(db, uid, now, facts, observations) {
+  const userRef = db.collection("users").doc(uid);
+  const snap = await userRef.collection("patternHypotheses")
+    .orderBy("salienceScore", "desc").limit(40).get();
+  const hyps = snap.docs.map((d) => ({ id: d.id, ...d.data() }))
+    .filter((h) => h && h.status !== "merged" && h.status !== "muted" &&
+      h.status !== "dismissed" && h.status !== "closed" &&
+      h.stability !== "retired" && h.lifecycle !== "retired");
+
+  // An observation whose terms overlap the hypothesis's evidence is an
+  // independent, deterministic contrast set — the statistics found the same
+  // structure the model named.
+  const obsByEntry = new Map();
+  for (const o of (observations || [])) {
+    for (const id of (o.entryIds || [])) {
+      if (!obsByEntry.has(id)) obsByEntry.set(id, []);
+      obsByEntry.get(id).push(o);
+    }
+  }
+
+  const eligible = [];
+  for (const h of hyps) {
+    const confirmed = h.userStatus === "this_is_me";
+    const timesSeen = num(h.timesSeen, 1);
+    const evidenceIds = [
+      ...((h.evidence || []).map((e) => e && e.entryId)),
+      ...(h.evidenceEntryIdsAllTime || []),
+    ].filter(Boolean);
+    const linkedObs = [...new Set(evidenceIds.flatMap((id) => obsByEntry.get(id) || []))];
+    const hasContrast = (h.counterEvidenceEntryIds || []).length >= 1 ||
+      linkedObs.some((o) => o.type === "cooccurrence" || o.type === "exception");
+    const audited = !!(h.disconfirmation && h.disconfirmation.ranAt &&
+      h.disconfirmation.verdict !== "drop");
+
+    if (!confirmed) {
+      if (timesSeen < THREAD_MIN_TIMES_SEEN) continue;
+      if (!hasContrast) continue;
+      if (!audited) continue;
+    }
+    eligible.push({ h, linkedObs, timesSeen, confirmed });
+  }
+
+  eligible.sort((a, b) => mirrorScore(b.h, now) - mirrorScore(a.h, now));
+  const chosen = eligible.slice(0, THREAD_CAP);
+
+  const dotDays = recentDateKeys(now, DOT_STRIP_DAYS, facts.timezone);
+  const threads = chosen.map(({ h, linkedObs, timesSeen, confirmed }) => {
+    const evidenceIds = new Set([
+      ...((h.evidence || []).map((e) => e && e.entryId)),
+      ...(h.evidenceEntryIdsAllTime || []),
+    ].filter(Boolean));
+    const daysWithEvidence = new Set(
+      [...evidenceIds].map((id) => facts.entryDates[id]).filter(Boolean));
+
+    const exception = linkedObs.find((o) => o.type === "exception");
+    const dates = [...daysWithEvidence].sort();
+
+    return {
+      hypothesisId: h.id,
+      // §5.4: plain English, <= 45 chars, observational voice. Until the LLM
+      // title writer runs (it is gated to once a week per thread), fall back to
+      // the mined title, de-shouted and sentence-cased.
+      title: threadTitleFor(h),
+      titleSource: h.threadTitle ? "llm" : "hypothesis",
+      label: confirmed ? "confirmed"
+        : timesSeen >= 3 ? "recurring" : timesSeen === 2 ? "twice" : "once",
+      n: timesSeen,
+      sinceDate: dates[0] || null,
+      lastDate: dates[dates.length - 1] || null,
+      // The dot strip: one dot per local day, filled when the thread appeared.
+      // The single most information-dense, least interpretive element
+      // available — it shows recurrence AND exceptions at a glance, and it is
+      // what makes "n 9" credible rather than a number to be taken on faith.
+      dots: dotDays.map((d) => ({
+        d,
+        f: daysWithEvidence.has(d),
+        x: !!(exception && (exception.exceptionDays || []).includes(d)),
+      })),
+      exceptionDate: exception ? (exception.exceptionDays || [])[0] || null : null,
+      observationIds: linkedObs.slice(0, 4).map((o) => o.id),
+      auditVerdict: (h.disconfirmation && h.disconfirmation.verdict) || null,
+      counterEvidenceCount: (h.counterEvidenceEntryIds || []).length,
+    };
+  });
+
+  const doc = {
+    schemaVersion: 1,
+    userId: uid,
+    computedAt: admin.firestore.Timestamp.fromDate(now),
+    count: threads.length,
+    threads,
+    emptyReason: threads.length === 0
+      ? (hyps.length === 0 ? "no_hypotheses" : "needs_three_days")
+      : null,
+  };
+  await db.collection("users").doc(uid).collection("derived").doc("threads").set(doc);
+  console.log("threadsJob", {
+    uid, threads: threads.length, eligible: eligible.length, candidates: hyps.length,
+  });
+  return threads;
+}
+
+/** <= 45 chars, sentence case, no shouting, no trailing period. */
+function threadTitleFor(h) {
+  const raw = h.threadTitle || h.userFacingTitle || "";
+  const cleaned = sentenceCased(deShout(String(raw).trim())).replace(/[.]+$/, "");
+  return cleaned.length <= 45 ? cleaned : `${cleaned.slice(0, 44).trimEnd()}…`;
+}
+
+/* ── TodayJob + ReadingJob (Tier 2) ──────────────────────────────────────── */
+
+/**
+ * Choose today's one thing and write `users/{uid}/readings/{yyyy-MM-dd}`.
+ *
+ * §5.2's selection order, in code, because selection is a decision and the
+ * model does not get to make decisions:
+ *   1. an exception or delta that is NEW today            (R6 — exceptions win)
+ *   2. a callback computed today                          ("it remembers")
+ *   3. the top observation WITH a model line that passes lint
+ *   4. the top observation alone
+ *   5. silence, plus the unlock hint
+ *
+ * Silence is a valid outcome, not a failure. A healthy silence-day rate is
+ * 15-35%: a surface that always has something to say is a surface that is
+ * making things up.
+ */
+async function selectTodayFor(db, uid, now, facts, observations, tz, opts = {}) {
+  const userRef = db.collection("users").doc(uid);
+  const todayKey = localDateParts(now, tz).dateKey;
+  const isNewToday = (o) => {
+    const f = toDate(o.firstComputedAt);
+    return !f || localDateParts(f, tz).dateKey === todayKey;
+  };
+
+  const live = (observations || []).filter((o) =>
+    o.userStatus !== "not_me" && num(o.notQuiteCount, 0) < 2);
+
+  let chosen = null;
+  let step = 0;
+
+  // 1. exception / delta, new today
+  chosen = live.filter((o) => (o.type === "exception" || o.type === "delta") && isNewToday(o))
+    .sort((a, b) => b.score - a.score)[0] || null;
+  if (chosen) step = 1;
+
+  // 2. callback computed today
+  if (!chosen) {
+    chosen = live.filter((o) => o.type === "callback")
+      .sort((a, b) => b.score - a.score)[0] || null;
+    if (chosen) step = 2;
+  }
+
+  // 3/4. the top-scoring observation, with or without a model line
+  if (!chosen) {
+    chosen = live.filter((o) => o.score >= TODAY_SCORE_FLOOR)
+      .sort((a, b) => b.score - a.score)[0] || null;
+    if (chosen) step = 4;
+  }
+
+  // 5. silence
+  if (!chosen) {
+    const reason = live.length === 0
+      ? (facts.coverage.analysesInWindow === 0 ? "no_analyses" : "no_observations")
+      : "below_threshold";
+    const doc = {
+      schemaVersion: 1,
+      date: todayKey,
+      userId: uid,
+      source: null,
+      line: null,
+      move: null,
+      question: null,
+      lintPassed: false,
+      lintReason: null,
+      templateText: null,
+      receipt: null,
+      proof: null,
+      silence: true,
+      reason,
+      unlockHint: (facts.unlock && facts.unlock.next && facts.unlock.next.hint) || null,
+      shownAt: null,
+      userStatus: "unrated",
+      followUp: null,
+      computedAt: admin.firestore.Timestamp.fromDate(now),
+    };
+    await userRef.collection("readings").doc(todayKey).set(doc, { merge: true });
+    console.log("readingSelect", { uid, step: 5, silence: true, reason });
+    return doc;
+  }
+
+  // Tier 2 — the one model call. Skipped entirely when the caller has no key
+  // (the deterministic worker), which is what makes step 4 the normal path on
+  // that worker and step 3 the normal path on the mining worker.
+  let line = null;
+  let move = null;
+  let question = null;
+  let lintReason = null;
+  if (opts.allowModel) {
+    const written = await writeReadingFor(uid, chosen, now, opts.lifeContext, opts.stylePrefs);
+    if (written && written.ok) {
+      line = written.line; move = written.move; question = written.question;
+      step = 3;
+    } else if (written) {
+      lintReason = written.reason;
+    }
+  }
+
+  const quotes = (chosen.quotes || []).filter((q) => q && q.text);
+  const receipt = quotes.length ? {
+    quote: quotes[0].text,
+    entryId: quotes[0].entryId || null,
+    date: quotes[0].date || null,
+    relativeLabel: quotes[0].date ? relativeLabel(quotes[0].date, todayKey) : null,
+  } : null;
+
+  const doc = {
+    schemaVersion: 1,
+    date: todayKey,
+    userId: uid,
+    source: { kind: "observation", id: chosen.id, type: chosen.type },
+    // The observation's own sentence is ALWAYS stored, even when a model line
+    // exists — it is the fallback the client renders if anything downstream is
+    // wrong, and §6's rule is that a failed line is not retried, it is replaced
+    // by the observation.
+    templateText: chosen.templateText,
+    line: line || chosen.templateText,
+    move: move || null,
+    question: question || null,
+    lintPassed: !!line,
+    lintReason,
+    receipt,
+    proof: {
+      n: chosen.n, m: chosen.m, k: chosen.k, j: chosen.j,
+      lift: chosen.lift,
+      type: chosen.type,
+      quotes: quotes.slice(0, 3),
+      exception: chosen.exceptionDays ? { days: chosen.exceptionDays } : null,
+      counterEvidence: [],
+      entryIds: (chosen.entryIds || []).slice(0, 10),
+      contrastEntryIds: (chosen.contrastEntryIds || []).slice(0, 10),
+      ...(chosen.pct !== undefined ? { pct: chosen.pct } : {}),
+      ...(chosen.band ? { band: chosen.band } : {}),
+      ...(chosen.thenQuote ? { thenQuote: chosen.thenQuote, nowQuote: chosen.nowQuote, daysApart: chosen.daysApart } : {}),
+      ...(chosen.before !== undefined ? { before: chosen.before, after: chosen.after, runLength: chosen.runLength } : {}),
+    },
+    silence: false,
+    reason: null,
+    unlockHint: (facts.unlock && facts.unlock.next && facts.unlock.next.hint) || null,
+    shownAt: null,
+    userStatus: "unrated",
+    followUp: null,
+    computedAt: admin.firestore.Timestamp.fromDate(now),
+  };
+  await userRef.collection("readings").doc(todayKey).set(doc, { merge: true });
+  console.log("readingSelect", {
+    uid, step, observationId: chosen.id, type: chosen.type,
+    score: chosen.score, lintPassed: !!line, lintReason,
+  });
+  return doc;
+}
+
+const READING_PROMPT_VERSION = "mirror-reading-v1";
+
+/**
+ * Tier 2 — the ONE model call. One sentence, on top of one observation.
+ *
+ * The model receives the observation's numbers and quotes, the user's
+ * LifeContext and StylePreferences — and nothing else. Not the raw entries,
+ * not the hypothesis list. It cannot invent a fact because it is not given the
+ * material to invent one from; its whole job is phrasing something already
+ * true.
+ */
+async function writeReadingFor(uid, observation, now, lifeContext, stylePrefs) {
+  const quotes = (observation.quotes || []).filter((q) => q && q.text).slice(0, 3);
+  const quotesRendered = quotes.map((q, i) =>
+    `${i + 1}. "${q.text}" (${q.date ? shortDate(q.date) : "recently"})`).join("\n");
+
+  const prompt = `${SAFETY_RULES}
+${SPILR_VOICE}
+${styleRulesBlock(stylePrefs)}${lifeContext || ""}
+
+TASK: Write ONE sentence on top of the observation below.
+
+The observation is already TRUE — it was computed from this person's own
+entries by counting, not by guessing. You are not being asked whether it is
+right, or to find a different one. You are being asked to say it in a way that
+sounds like a person noticed it.
+
+THE OBSERVATION
+${observation.templateText}
+
+THE NUMBERS BEHIND IT (do not contradict these, do not invent others)
+n=${observation.n} m=${observation.m} k=${observation.k} j=${observation.j}
+
+THEIR OWN WORDS (quote one of these verbatim if you can)
+${quotesRendered || "(none available)"}
+
+HARD RULES
+- ONE sentence. At most 140 characters.
+- It must contain either a number from above or a verbatim phrase from their
+  own words. A sentence that could be about anyone is a failure.
+- Observational voice: "on the days you wrote...", never "you are someone
+  who", never "you always", never "you tend to".
+- At most one hedge word (may / might / seems / perhaps).
+- Plain words. 8th-grade reading level. NO metaphor — no armor, no terror, no
+  ledger, no landscape, no journey, no nervous system.
+- Do not end on the bad half. Finish on the comparison, the exception, or a
+  question.
+
+Return ONLY valid JSON:
+{
+  "line": "the one sentence",
+  "move": "TENSION" | "UNDERNEATH" | "ABSENCE" | "REFRAME" | "PATTERN",
+  "question": "one short question, or null"
+}`;
+
+  let gen;
+  try {
+    gen = await callGeminiJSON(prompt, { maxTokens: 200, temperature: 0.4 },
+      uid, "mirror_reading");
+  } catch (e) {
+    console.log("mirrorLintReject", {
+      uid, surface: "reading", rule: "generation_failed",
+      observationType: observation.type, promptVersion: READING_PROMPT_VERSION,
+    });
+    return { ok: false, reason: "generation_failed" };
+  }
+  if (!gen || !gen.line) return { ok: false, reason: "empty" };
+
+  // deShout BEFORE sentenceCased: sentenceCased only ever raises case, so an
+  // ALL-CAPS line survives it untouched.
+  const line = sentenceCased(deShout(String(gen.line).trim()));
+  const lint = lintCopy(line, {
+    kind: "reading",
+    observation,
+    // "Never end on the negative" ships log-only for one week — it is the
+    // fuzziest rule in §6 and will produce false rejects. Flip this to true
+    // once the reject histogram says the rate is acceptable.
+    enforceEndsNegative: false,
+  });
+  if (!lint.ok) {
+    console.log("mirrorLintReject", {
+      uid, surface: "reading", rule: lint.reason, term: lint.term || null,
+      observationType: observation.type, promptVersion: READING_PROMPT_VERSION,
+    });
+    return { ok: false, reason: lint.reason };
+  }
+  if (lint.endsNegative) {
+    console.log("mirrorLintObserve", {
+      uid, surface: "reading", rule: "ends_negative", enforced: false,
+      observationType: observation.type,
+    });
+  }
+
+  const question = gen.question ? sentenceCased(String(gen.question).trim()) : null;
+  return {
+    ok: true,
+    line,
+    move: typeof gen.move === "string" ? gen.move.toUpperCase() : null,
+    question: question && question.endsWith("?") ? question : null,
+  };
+}
+
+/* ── First seven (M8) ────────────────────────────────────────────────────── */
+
+/**
+ * `users/{uid}/derived/firstSeven` — written once, when the user crosses 7
+ * entries. Replaces First Sketch, which showed a truncated hypothesis and a
+ * declarative statement with "?" glued on the end.
+ *
+ * Three Tier-0 facts with real numbers, one thread IF one exists, and the
+ * question ONLY if it is actually a question.
+ */
+async function buildFirstSevenFor(db, uid, now, facts, threads, observations) {
+  const ref = db.collection("users").doc(uid).collection("derived").doc("firstSeven");
+  const existing = await ref.get();
+  if (existing.exists) return null;
+  if ((facts.entriesTotal || 0) < FIRST_SEVEN_AT) return null;
+
+  const m = facts.month;
+  const cards = [];
+  if (m.wordsKnown && m.words > 0) {
+    cards.push({
+      eyebrow: "how much",
+      text: `${m.words.toLocaleString("en-US")} words in ${m.entries} entries.`,
+    });
+  }
+  if (m.topEmotion) {
+    const band = ["morning", "afternoon", "evening", "late"]
+      .map((b) => [b, m.byBand[b] || 0])
+      .sort((a, b) => b[1] - a[1])[0];
+    cards.push({
+      eyebrow: "your word",
+      text: `'${m.topEmotion.word}' — ${m.topEmotion.count} times${
+        band && band[1] > 0 ? `, most often ${BAND_SPEECH[band[0]] || "then"}` : ""}.`,
+    });
+  }
+  if (m.people.length) {
+    const top = m.people[0];
+    cards.push({
+      eyebrow: "who is here",
+      text: `${m.people.length} ${m.people.length === 1 ? "person" : "people"}, ${top.name} in ${top.mentions}.`,
+    });
+  } else if (m.topDomains.length) {
+    cards.push({
+      eyebrow: "where your head is",
+      text: `${m.topDomains[0].domain} in ${m.topDomains[0].count} of ${m.entries} entries.`,
+    });
+  }
+
+  const thread = (threads || [])[0] || null;
+  const topObs = (observations || []).filter((o) => o.score >= TODAY_SCORE_FLOOR)[0] || null;
+
+  const doc = {
+    schemaVersion: 1,
+    userId: uid,
+    generatedAt: admin.firestore.Timestamp.fromDate(now),
+    entriesAtUnlock: facts.entriesTotal,
+    cards: cards.slice(0, 3),
+    thread: thread ? { title: thread.title, n: thread.n, sinceDate: thread.sinceDate } : null,
+    // Labelled honestly as an observation when no thread has formed — at 7
+    // entries most people have none, and saying so is what earns belief at 30.
+    observation: !thread && topObs
+      ? { text: topObs.templateText, type: topObs.type, id: topObs.id }
+      : null,
+    // M8: the question card is OMITTED unless it is genuinely a question.
+    question: null,
+  };
+  await ref.set(doc);
+  console.log("firstSevenJob", { uid, cards: doc.cards.length, hasThread: !!thread });
+  return doc;
+}
+
+const BAND_SPEECH = {
+  morning: "before noon",
+  afternoon: "in the afternoon",
+  evening: "in the evening",
+  late: "after 9pm",
+};
+
+/* ── the deterministic worker ────────────────────────────────────────────── */
+
+/** Everything above, in dependency order, for one user. No model calls. */
+async function runDerivedForUser(db, uid, now) {
+  const { facts, tz, analyses } = await computeFactsForUser(db, uid, now);
+  const observations = await computeObservationsForUser(db, uid, now, facts, analyses, tz);
+  await decayHypothesesFor(db, uid, now);
+  const threads = await buildThreadsFor(db, uid, now, facts, observations);
+  const reading = await selectTodayFor(db, uid, now, facts, observations, tz,
+    { allowModel: false });
+  await buildFirstSevenFor(db, uid, now, facts, threads, observations);
+  return { facts, observations, threads, reading, tz };
+}
+
+exports.computeUserDerived = onTaskDispatched(
+  {
+    region: REGION,
+    // NO GEMINI_KEY. Every job in here is arithmetic; a worker that cannot
+    // make a model call cannot accidentally start costing money.
+    timeoutSeconds: 120,
+    memory: "512MiB",
+    retryConfig: { maxAttempts: 3, minBackoffSeconds: 30, maxDoublings: 2 },
+    // Much higher concurrency than the mining worker: the ceiling here is
+    // Firestore, not a per-minute model quota.
+    rateLimits: { maxConcurrentDispatches: 20, maxDispatchesPerSecond: 10 },
+  },
+  async (req) => {
+    const uid = req.data && req.data.uid;
+    if (!uid) return;
+    const now = req.data.runDate ? new Date(req.data.runDate) : new Date();
+    const db = admin.firestore();
+    try {
+      await runDerivedForUser(db, uid, now);
+    } catch (e) {
+      console.error("computeUserDerived error", { uid, error: String(e) });
+      throw e; // let Cloud Tasks retry with backoff
+    }
+    // Tail-chain into the (model-using) mining worker. Separate tasks so a
+    // mine failure can never take the facts down with it, and so the facts are
+    // already written when the mine's own cadence gate skips the user.
+    try {
+      await enqueueForUsers("mineUserInsights", [uid],
+        (u) => ({ uid: u, runDate: req.data.runDate }), req.data.runDate || "");
+    } catch (e) {
+      console.error("computeUserDerived: chain to mine failed", { uid, error: String(e) });
+    }
+  }
+);
+
 exports.generateWeeklyLetters = onSchedule(
   {
     // Hourly, not a fixed Sunday-evening UTC cron — dispatchUserWork's
@@ -2711,6 +3740,39 @@ exports.generateWeeklyLetters = onSchedule(
     console.log("generateWeeklyLetters kicked off");
   }
 );
+
+/** Sends `facts.unlock.next.hint` as a push, at most once every
+ *  UNLOCK_NUDGE_DAYS. Never throws — a push failure must not fail the job. */
+async function maybeSendUnlockNudge(db, uid, now) {
+  try {
+    const userRef = db.collection("users").doc(uid);
+    const [userSnap, factsSnap] = await Promise.all([
+      userRef.get(),
+      userRef.collection("derived").doc("facts").get(),
+    ]);
+    if (!factsSnap.exists) return;
+    const facts = factsSnap.data();
+    const hint = facts.unlock && facts.unlock.next && facts.unlock.next.hint;
+    if (!hint) return;
+    // Never nudge someone who has written nothing at all — there is no
+    // "two more entries" to promise when the answer is "start".
+    if (!facts.entriesTotal) return;
+    const last = userSnap.exists && userSnap.data().lastUnlockNudgeAt &&
+      userSnap.data().lastUnlockNudgeAt.toDate
+      ? userSnap.data().lastUnlockNudgeAt.toDate() : null;
+    if (last && (now.getTime() - last.getTime()) / 86400000 < UNLOCK_NUDGE_DAYS) return;
+
+    await sendPushToUser(db, uid, {
+      title: "Spilr", body: hint, data: { type: "unlock_hint" },
+    });
+    await userRef.set({
+      lastUnlockNudgeAt: admin.firestore.Timestamp.fromDate(now),
+    }, { merge: true });
+    console.log("unlockNudge", { uid, hint });
+  } catch (e) {
+    console.error("maybeSendUnlockNudge failed", { uid, error: String(e) });
+  }
+}
 
 /** The per-user worker for the weekly letter. One user, one invocation. */
 exports.buildUserWeeklyLetter = onTaskDispatched(
@@ -2735,6 +3797,12 @@ exports.buildUserWeeklyLetter = onTaskDispatched(
           body: "Your week, in three sentences.",
           data: { type: "weekly_letter" },
         });
+      } else if (r.reason === "below_threshold") {
+        // §5.5: when there is no letter, the notification IS the unlock hint.
+        // Rate-limited hard — the PRD doesn't say to, but a weekly "you didn't
+        // write enough" push to someone who is already not writing is a nag,
+        // and nagging is how a journaling app gets deleted.
+        await maybeSendUnlockNudge(db, uid, now);
       }
       console.log("buildUserWeeklyLetter", { uid, ...r });
     } catch (e) {
@@ -2783,7 +3851,7 @@ exports.mineUserInsights = onTaskDispatched(
     },
     rateLimits: {
       // The real ceiling is the Gemini quota, not Cloud Functions. Each user
-      // costs 1 mine call plus up to CE_MAX_HYPOTHESES disconfirmation calls,
+      // costs 1 mine call plus up to AUDIT_MAX_PER_RUN disconfirmation calls,
       // so keep concurrency well under the per-minute request limit.
       maxConcurrentDispatches: 8,
       maxDispatchesPerSecond: 2,
@@ -2805,6 +3873,25 @@ exports.mineUserInsights = onTaskDispatched(
       const lastMineRunAt = userSnap.exists && userSnap.data().lastMineRunAt
         ? userSnap.data().lastMineRunAt.toDate()
         : null;
+
+      // DEDUP RUNS BEFORE THE CADENCE GATE, on its own schedule.
+      //
+      // It has to: the whole point is to repair a corpus that has already
+      // forked, and a user whose fork happened weeks ago is exactly the user
+      // whose mine gets skipped every night for lack of new material. Cheap
+      // (one bounded read, no model call unless DEDUP_USE_EMBEDDINGS), so it
+      // is safe to run ahead of the gate. It is also what makes
+      // `timesSeen >= 3` reachable at all — six variants each holding n=1 can
+      // never individually cross the thread threshold.
+      try {
+        const hypCount = (await db.collection("users").doc(uid)
+          .collection("patternHypotheses").limit(400).select().get()).size;
+        if (dedupIsDue(userSnap.exists ? userSnap.data() : null, hypCount, now)) {
+          await dedupHypothesesForUser(db, uid, now);
+        }
+      } catch (e) {
+        console.error("dedup failed", { uid, error: String(e) });
+      }
 
       if (lastMineRunAt) {
         const newEntriesSnap = await db.collection("users").doc(uid)
@@ -2841,12 +3928,41 @@ exports.mineUserInsights = onTaskDispatched(
         });
       }
 
-      // Generate the Mirror card deck off freshly (re-)mined hypotheses. Its
-      // own try/catch: a card failure must never make Cloud Tasks retry the
-      // whole mine — the hypotheses above are already committed, and a retry
-      // would just re-run mineHypothesesForUser for no reason.
-      let cardsWritten = 0;
+      // The hypotheses just changed, so the threads view and today's pick are
+      // both stale. Recompute the deterministic layers over the new corpus and
+      // then — and only then — spend ONE model call phrasing the single
+      // observation that won. This is Tier 2: at most one reading per day.
+      //
+      // Own try/catch throughout: none of this may make Cloud Tasks retry the
+      // mine, whose hypotheses are already committed.
+      let readingStep = null;
       if (!r.skipped) {
+        try {
+          const derived = await runDerivedForUser(db, uid, now);
+          const [lifeCtxSnap, styleSnap] = await Promise.all([
+            db.collection("users").doc(uid).collection("lifeContext").doc("current").get(),
+            db.collection("users").doc(uid).collection("stylePreferences").doc("current").get(),
+          ]);
+          const reading = await selectTodayFor(
+            db, uid, now, derived.facts, derived.observations, derived.tz,
+            {
+              allowModel: true,
+              lifeContext: lifeCtxSnap.exists ? lifeContextBlock(lifeCtxSnap.data()) : "",
+              stylePrefs: styleSnap.exists ? styleSnap.data() : null,
+            });
+          readingStep = reading.silence ? "silence" : (reading.lintPassed ? "reading" : "observation");
+        } catch (e) {
+          console.error("mineUserInsights: derived/reading failed", { uid, error: String(e) });
+        }
+      }
+
+      // The legacy per-hypothesis card deck. Still written for ONE release so a
+      // pre-v3 client (which reads `mirrorCards/{hypothesisId}`, not
+      // `readings/{date}`) keeps rendering — the same one-release rule this
+      // file already applies to the legacy card fields. Delete both once the
+      // v3 build is the floor.
+      let cardsWritten = 0;
+      if (!r.skipped && MIRROR_LEGACY_DECK) {
         try {
           cardsWritten = (await generateMirrorDeck(db, uid, now)).written;
         } catch (e) {
@@ -2854,7 +3970,7 @@ exports.mineUserInsights = onTaskDispatched(
         }
       }
 
-      console.log("mineUserInsights", { uid, ...r, cardsWritten });
+      console.log("mineUserInsights", { uid, ...r, cardsWritten, readingStep });
     } catch (e) {
       // Rethrow so Cloud Tasks retries with backoff. Swallowing here would
       // reproduce the old behaviour: a silent per-user failure nobody notices.
@@ -2921,7 +4037,7 @@ exports.bootstrapMirror = onRequest(
     region: REGION,
     secrets: [GEMINI_KEY],
     cors: true,
-    // Chains one mine call (plus up to CE_MAX_HYPOTHESES disconfirmation
+    // Chains one mine call (plus up to AUDIT_MAX_PER_RUN disconfirmation
     // calls) and up to MIRROR_DECK_SIZE card generations — materially longer
     // than geminiProxy's single round trip.
     timeoutSeconds: 180,
@@ -2974,8 +4090,22 @@ exports.bootstrapMirror = onRequest(
         });
       }
 
-      let cardsWritten = 0;
+      // A brand-new user's very first Mirror must include the v3 layers, not
+      // just hypotheses — otherwise the tab shows an empty strip and no Today
+      // card until the next 04:00 UTC run, which is the worst possible first
+      // impression and precisely what this endpoint exists to prevent.
+      let derivedOk = false;
       if (!r.skipped) {
+        try {
+          await runDerivedForUser(db, uid, now);
+          derivedOk = true;
+        } catch (e) {
+          console.error("bootstrapMirror: derived failed", { uid, error: String(e) });
+        }
+      }
+
+      let cardsWritten = 0;
+      if (!r.skipped && MIRROR_LEGACY_DECK) {
         try {
           cardsWritten = (await generateMirrorDeck(db, uid, now)).written;
         } catch (e) {
@@ -2983,11 +4113,121 @@ exports.bootstrapMirror = onRequest(
         }
       }
 
-      console.log("bootstrapMirror", { uid, ...r, cardsWritten });
+      console.log("bootstrapMirror", { uid, ...r, cardsWritten, derivedOk });
       res.status(200).json({ ran: true, written: r.written || 0, cardsWritten });
     } catch (e) {
       console.error("bootstrapMirror error", { uid, error: String(e) });
       res.status(500).json({ error: "Bootstrap failed" });
+    }
+  }
+);
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  refreshDerived — on-demand recompute of the derived layer (facts/threads/
+ *  firstSeven/reading) for one user, for a RETURNING account that
+ *  `bootstrapMirror` refuses to touch.
+ *
+ *  `bootstrapMirror` above is a genuine one-shot: `claimMirrorBootstrap`
+ *  refuses any account where `lastMineRunAt` is already set — which is every
+ *  account the nightly cron (or a prior bootstrap) has ever mined for. That
+ *  is correct for the mine + card-write chain it guards (it calls Gemini and
+ *  the one-shot claim IS the cost ceiling), but it leaves no path at all for
+ *  an existing account whose `derived/*` docs are missing or stale — most
+ *  commonly a reinstall, where the device lost its Firestore cache but the
+ *  account's server-side state (including `lastMineRunAt`) is untouched.
+ *  Without this endpoint, such an account's Mirror tab stays blank until the
+ *  next 04:00 UTC `computeUserDerived` run.
+ *
+ *  Deliberately narrow: this calls ONLY `runDerivedForUser`, the same
+ *  deterministic worker `computeUserDerived` runs — no mining, no card
+ *  generation, no Gemini call at all. That is what makes a per-user rate
+ *  limit here (rather than a one-shot claim) safe: the cost ceiling is
+ *  Firestore reads/writes, not model tokens, so a user re-opening Mirror a
+ *  few times while their account catches up costs nothing worth guarding
+ *  harder than the cooldown below.
+ *
+ *  Auth contract matches `bootstrapMirror` / `geminiProxy`: Bearer ID token,
+ *  non-anonymous account, `invoker: "public"` (the function itself is the
+ *  gate).
+ * ────────────────────────────────────────────────────────────────────────── */
+
+// How often ONE user can trigger a recompute via this endpoint. Short on
+// purpose — this exists to unstick a cold/never-computed account, not to let
+// the client poll it. `computeUserDerived`'s nightly pass is still the
+// primary writer for everyone; this only fills the gap until the next one.
+const REFRESH_DERIVED_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6h
+
+/** Atomically claims a `refreshDerived` run for `uid`, or refuses if one ran
+ *  too recently. Unlike `claimMirrorBootstrap`, this is a repeatable
+ *  cooldown, not a one-shot — see the header comment above for why that's
+ *  safe here. */
+async function claimDerivedRefresh(db, uid) {
+  const ref = db.collection("users").doc(uid);
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (!snap.exists) return false;
+    const last = snap.data().derivedRefreshedAt;
+    if (last && last.toDate &&
+        (Date.now() - last.toDate().getTime()) < REFRESH_DERIVED_COOLDOWN_MS) {
+      return false;
+    }
+    tx.set(ref, {
+      derivedRefreshedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+    return true;
+  });
+}
+
+exports.refreshDerived = onRequest(
+  {
+    region: REGION,
+    // NO GEMINI_KEY — this only ever calls runDerivedForUser, which is pure
+    // arithmetic. A worker that cannot reach the model cannot accidentally
+    // cost money, no matter how it's called.
+    timeoutSeconds: 120,
+    memory: "512MiB",
+    maxInstances: 10,
+    invoker: "public",
+  },
+  async (req, res) => {
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method not allowed" });
+      return;
+    }
+
+    const authHeader = req.headers.authorization || "";
+    const match = authHeader.match(/^Bearer (.+)$/);
+    if (!match) {
+      res.status(401).json({ error: "Missing Authorization bearer token" });
+      return;
+    }
+    let uid;
+    try {
+      const decoded = await admin.auth().verifyIdToken(match[1]);
+      uid = decoded.uid;
+      if (decoded.firebase.sign_in_provider === "anonymous") {
+        res.status(403).json({ error: "Account required" });
+        return;
+      }
+    } catch (e) {
+      res.status(401).json({ error: "Invalid or expired token" });
+      return;
+    }
+
+    const db = admin.firestore();
+    const claimed = await claimDerivedRefresh(db, uid);
+    if (!claimed) {
+      res.status(200).json({ ran: false, reason: "cooldown" });
+      return;
+    }
+
+    try {
+      const result = await runDerivedForUser(db, uid, new Date());
+      console.log("refreshDerived", { uid, entriesTotal: result.facts && result.facts.entriesTotal });
+      res.status(200).json({ ran: true });
+    } catch (e) {
+      console.error("refreshDerived error", { uid, error: String(e) });
+      res.status(500).json({ error: "Refresh failed" });
     }
   }
 );
@@ -3104,6 +4344,181 @@ exports.revenueCatWebhook = onRequest(
       // 500 tells RevenueCat to retry with backoff — an entitlement write must
       // not be silently dropped.
       res.status(500).json({ error: "Internal error" });
+    }
+  }
+);
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  runNightlyForUser — DEV ONLY. The manual trigger for the whole pipeline.
+ *
+ *  The Firebase emulator does not implement task queues, so `onSchedule` and
+ *  `dispatchUserWork` are no-ops locally and the per-user workers can only be
+ *  reached by invoking them directly (see this file's header). This is that
+ *  invocation, as an authenticated endpoint, so a night's work can be run and
+ *  inspected on demand instead of waiting for 04:00 UTC.
+ *
+ *  Three separate locks, because an endpoint that runs a user's whole
+ *  pipeline is exactly the shape of thing that should not exist by accident in
+ *  production:
+ *    - DEV_ADMIN_UIDS must be set, and the caller must be in it
+ *    - a real, non-anonymous Firebase ID token (same contract as geminiProxy)
+ *    - only ever operates on the CALLER's own uid unless they name another,
+ *      which still requires them to be an admin
+ *
+ *  POST { stages?: ["facts","observations","decay","threads","dedup","mine",
+ *                   "reading","letter","firstSeven"], uid?, dryRun? }
+ * ────────────────────────────────────────────────────────────────────────── */
+exports.runNightlyForUser = onRequest(
+  {
+    region: REGION,
+    secrets: [GEMINI_KEY],
+    cors: true,
+    timeoutSeconds: 300,
+    memory: "512MiB",
+    maxInstances: 1,
+    invoker: "public",
+  },
+  async (req, res) => {
+    const admins = String(process.env.DEV_ADMIN_UIDS || "")
+      .split(",").map((s) => s.trim()).filter(Boolean);
+    if (admins.length === 0) {
+      res.status(404).json({ error: "Not enabled" });
+      return;
+    }
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "POST only" });
+      return;
+    }
+    const match = String(req.headers.authorization || "").match(/^Bearer (.+)$/);
+    if (!match) {
+      res.status(401).json({ error: "Missing Authorization bearer token" });
+      return;
+    }
+    let callerUid;
+    try {
+      const decoded = await admin.auth().verifyIdToken(match[1]);
+      callerUid = decoded.uid;
+      if (decoded.firebase.sign_in_provider === "anonymous") {
+        res.status(403).json({ error: "Account required" });
+        return;
+      }
+    } catch (e) {
+      res.status(401).json({ error: "Invalid or expired token" });
+      return;
+    }
+    if (!admins.includes(callerUid)) {
+      res.status(403).json({ error: "Not an admin uid" });
+      return;
+    }
+
+    const body = req.body || {};
+    const uid = String(body.uid || callerUid);
+    const stages = Array.isArray(body.stages) && body.stages.length
+      ? body.stages
+      : ["dedup", "facts", "observations", "decay", "threads", "reading", "firstSeven"];
+    const now = body.now ? new Date(body.now) : new Date();
+    const db = admin.firestore();
+    const out = { uid, ran: [], now: now.toISOString() };
+
+    try {
+      let facts = null; let tz = "UTC"; let analyses = []; let observations = [];
+      let threads = [];
+
+      if (stages.includes("dedup")) {
+        out.dedup = await dedupHypothesesForUser(db, uid, now);
+        out.ran.push("dedup");
+      }
+      if (stages.includes("mine")) {
+        out.mine = await mineHypothesesForUser(db, uid, now);
+        out.ran.push("mine");
+      }
+      if (stages.includes("facts")) {
+        const r = await computeFactsForUser(db, uid, now);
+        facts = r.facts; tz = r.tz; analyses = r.analyses;
+        out.facts = {
+          entriesTotal: facts.entriesTotal,
+          coverage: facts.coverage,
+          week: {
+            entries: facts.week.entries, activeDays: facts.week.activeDays,
+            words: facts.week.words, wordsKnown: facts.week.wordsKnown,
+            byBand: facts.week.byBand, topEmotion: facts.week.topEmotion,
+            people: facts.week.people,
+          },
+          unlock: facts.unlock,
+        };
+        out.ran.push("facts");
+      } else {
+        const s = await db.collection("users").doc(uid).collection("derived").doc("facts").get();
+        facts = s.exists ? s.data() : null;
+        // Restore the in-memory `firstSeen` map shape from its persisted
+        // list form, so the streak detector sees what it expects.
+        if (facts) facts.firstSeen = firstSeenFromDoc(facts);
+        tz = (facts && facts.timezone) || "UTC";
+      }
+      if (stages.includes("observations") && facts) {
+        if (!analyses.length) {
+          const aSnap = await db.collection("users").doc(uid).collection("entryAnalyses")
+            .orderBy("createdAt", "desc").limit(200).get();
+          analyses = aSnap.docs.map((d) => {
+            const x = d.data();
+            return { ...x, entryId: x.entryId || d.id, createdAt: toDate(x.createdAt), entryCreatedAt: toDate(x.entryCreatedAt) };
+          });
+        }
+        observations = await computeObservationsForUser(db, uid, now, facts, analyses, tz);
+        out.observations = {
+          count: observations.length,
+          byType: observations.reduce((m, o) => ({ ...m, [o.type]: (m[o.type] || 0) + 1 }), {}),
+          top: observations.slice(0, 8).map((o) => ({
+            score: o.score, type: o.type, text: o.templateText,
+            n: o.n, m: o.m, k: o.k, j: o.j,
+          })),
+        };
+        out.ran.push("observations");
+      }
+      if (stages.includes("decay")) {
+        out.decayRetired = await decayHypothesesFor(db, uid, now);
+        out.ran.push("decay");
+      }
+      if (stages.includes("threads") && facts) {
+        threads = await buildThreadsFor(db, uid, now, facts, observations);
+        out.threads = threads.map((t) => ({
+          title: t.title, n: t.n, label: t.label, since: t.sinceDate,
+          exception: t.exceptionDate,
+          dots: t.dots.map((d) => (d.x ? "x" : d.f ? "●" : "○")).join(""),
+        }));
+        out.ran.push("threads");
+      }
+      if (stages.includes("reading") && facts) {
+        const [lifeCtxSnap, styleSnap] = await Promise.all([
+          db.collection("users").doc(uid).collection("lifeContext").doc("current").get(),
+          db.collection("users").doc(uid).collection("stylePreferences").doc("current").get(),
+        ]);
+        const reading = await selectTodayFor(db, uid, now, facts, observations, tz, {
+          allowModel: body.dryRun !== true,
+          lifeContext: lifeCtxSnap.exists ? lifeContextBlock(lifeCtxSnap.data()) : "",
+          stylePrefs: styleSnap.exists ? styleSnap.data() : null,
+        });
+        out.reading = {
+          date: reading.date, silence: reading.silence, reason: reading.reason,
+          line: reading.line, templateText: reading.templateText,
+          lintPassed: reading.lintPassed, lintReason: reading.lintReason,
+          receipt: reading.receipt, unlockHint: reading.unlockHint,
+        };
+        out.ran.push("reading");
+      }
+      if (stages.includes("firstSeven") && facts) {
+        out.firstSeven = await buildFirstSevenFor(db, uid, now, facts, threads, observations);
+        out.ran.push("firstSeven");
+      }
+      if (stages.includes("letter")) {
+        out.letter = await buildWeeklyLetterFor(db, uid, now);
+        out.ran.push("letter");
+      }
+
+      res.status(200).json(out);
+    } catch (e) {
+      console.error("runNightlyForUser error", { uid, error: String(e), stack: e.stack });
+      res.status(500).json({ error: String(e), ran: out.ran });
     }
   }
 );

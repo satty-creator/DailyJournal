@@ -22,25 +22,16 @@ struct TemplateReviewView: View {
     let onDiscard: () -> Void
     let onBack: () -> Void
 
-    @State private var text: String
     @State private var showDiscardConfirm = false
+    /// Guards against a double-tap on Save minting a duplicate entry — the
+    /// sheet stays visible during `TemplateRunnerView`'s 0.35s dismiss delay,
+    /// so the button needs to go inert on the first tap, not just once
+    /// `vm.save` returns (see A2).
+    @State private var isSaving = false
 
-    init(
-        template: JournalTemplate,
-        vm: TemplateRunnerViewModel,
-        onSave: @escaping () -> Void,
-        onDiscard: @escaping () -> Void,
-        onBack: @escaping () -> Void
-    ) {
-        self.template = template
-        self.vm = vm
-        self.onSave = onSave
-        self.onDiscard = onDiscard
-        self.onBack = onBack
-        _text = State(initialValue: vm.wovenPreview)
-    }
-
-    private var trimmed: String { text.trimmingCharacters(in: .whitespacesAndNewlines) }
+    /// Bound straight to `vm.wovenPreview` (no local `@State` copy) so an
+    /// edit survives going back to a question and returning — see A1.
+    private var trimmed: String { vm.wovenPreview.trimmingCharacters(in: .whitespacesAndNewlines) }
 
     var body: some View {
         NavigationStack {
@@ -124,11 +115,15 @@ struct TemplateReviewView: View {
         let caption: String = change > 0
             ? "Eased by \(change) point\(change == 1 ? "" : "s")."
             : (change < 0 ? "Rose by \(abs(change)) point\(abs(change) == 1 ? "" : "s")." : "No change.")
+        // Drawn from the before-step's own label rather than hardcoded, so a
+        // future template with a different before/after pair (e.g. "How
+        // anxious this felt") gets the right title automatically — see A5.
+        let title = template.beforeScaleStep?.label ?? "Feeling intensity"
 
         return VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("How stuck this felt")
+                    Text(title)
                         .font(.system(size: 13, weight: .bold, design: .rounded))
                         .foregroundStyle(AppTheme.ink)
                     Text("BEFORE \u{2192} AFTER")
@@ -154,7 +149,7 @@ struct TemplateReviewView: View {
     // MARK: - Editable prose
 
     private var proseEditor: some View {
-        TextEditor(text: $text)
+        TextEditor(text: $vm.wovenPreview)
             .font(AppTheme.editorialBody(size: 17))
             .foregroundStyle(AppTheme.ink)
             .scrollContentBackground(.hidden)
@@ -233,6 +228,8 @@ struct TemplateReviewView: View {
 
     private var saveButton: some View {
         Button {
+            guard !isSaving else { return }
+            isSaving = true
             vm.save(finalText: trimmed)
             UINotificationFeedbackGenerator().notificationOccurred(.success)
             onSave()
@@ -247,9 +244,9 @@ struct TemplateReviewView: View {
                                    startPoint: .leading, endPoint: .trailing)
                 )
                 .clipShape(Capsule())
-                .opacity(trimmed.isEmpty ? 0.5 : 1)
+                .opacity(trimmed.isEmpty || isSaving ? 0.5 : 1)
         }
         .buttonStyle(.plain)
-        .disabled(trimmed.isEmpty)
+        .disabled(trimmed.isEmpty || isSaving)
     }
 }

@@ -49,12 +49,16 @@ struct TemplateGalleryView: View {
                     filterRow
 
                     VStack(spacing: 11) {
-                        if let featured {
-                            featuredCard(featured)
-                        }
-                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 11), GridItem(.flexible())], spacing: 11) {
-                            ForEach(gridTemplates) { template in
-                                gridCard(template)
+                        if filtered.isEmpty {
+                            emptyFilterState
+                        } else {
+                            if let featured {
+                                featuredCard(featured)
+                            }
+                            LazyVGrid(columns: [GridItem(.flexible(), spacing: 11), GridItem(.flexible())], spacing: 11) {
+                                ForEach(gridTemplates) { template in
+                                    gridCard(template)
+                                }
                             }
                         }
                     }
@@ -148,6 +152,23 @@ struct TemplateGalleryView: View {
             }
             .padding(.horizontal, 22)
         }
+    }
+
+    // MARK: - Empty state (latent today — no current filter yields zero
+    // templates — but the filter chips and `tags` are otherwise unrelated
+    // data, so nothing guarantees that stays true.)
+
+    private var emptyFilterState: some View {
+        VStack(spacing: 6) {
+            Text("No exercises match yet")
+                .font(.system(size: 14, weight: .heavy, design: .rounded))
+                .foregroundStyle(AppTheme.ink)
+            Text("Try a different filter.")
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(AppTheme.inkSoft)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 40)
     }
 
     // MARK: - Cards

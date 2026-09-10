@@ -36,13 +36,58 @@ final class TemplateRunnerViewModel: ObservableObject {
 
     @Published private(set) var savedEntry: JournalEntry?
 
+    /// True when `stepIndex`/`answers` were restored from a saved draft on
+    /// init (lets the view show a transient "Draft restored" note, mirroring
+    /// `TimedSessionViewModel.didRestoreDraft`).
+    @Published private(set) var didRestoreDraft = false
+
     private let service = JournalService()
     private let startedAt = Date()
+
+    // MARK: - Draft
+
+    /// Multi-step, multi-typed answers don't fit `TimedSessionViewModel`'s
+    /// single-`String` draft, so this stores the step cursor alongside the
+    /// typed answers. Keyed per template (not one shared key) so an abandoned
+    /// run of one exercise never resurfaces inside a different one.
+    private struct Draft: Codable {
+        var stepIndex: Int
+        var answers: [String: TemplateAnswer]
+    }
+    private var draftKey: String { "template_draft.\(template.id)" }
+    /// Logged once per run, the first time an answer actually makes the draft
+    /// worth saving — not on every keystroke.
+    private var hasLoggedDraft = false
 
     init(userId: String, template: JournalTemplate) {
         self.userId = userId
         self.template = template
+        if let data = UserDefaults.standard.data(forKey: draftKey),
+           let draft = try? JSONDecoder().decode(Draft.self, from: data),
+           draft.answers.values.contains(where: { $0.isAnswered }) {
+            stepIndex = min(draft.stepIndex, template.steps.count - 1)
+            answers = draft.answers
+            didRestoreDraft = true
+        }
         AnalyticsManager.shared.trackEntryCompositionStarted(sessionType: "template")
+    }
+
+    private func persistDraft() {
+        guard hasAnyAnswer else {
+            clearDraft()
+            return
+        }
+        let draft = Draft(stepIndex: stepIndex, answers: answers)
+        guard let data = try? JSONEncoder().encode(draft) else { return }
+        UserDefaults.standard.set(data, forKey: draftKey)
+        if !hasLoggedDraft {
+            hasLoggedDraft = true
+            AnalyticsManager.shared.logEvent(.entryDrafted)
+        }
+    }
+
+    func clearDraft() {
+        UserDefaults.standard.removeObject(forKey: draftKey)
     }
 
     // MARK: - Step navigation
@@ -58,11 +103,13 @@ final class TemplateRunnerViewModel: ObservableObject {
 
     func setAnswer(_ answer: TemplateAnswer, for step: TemplateStep) {
         answers[step.id] = answer
+        persistDraft()
     }
 
     func back() {
         guard stepIndex > 0 else { return }
         stepIndex -= 1
+        persistDraft()
     }
 
     /// Advances past the current step, or — on the last step — starts the
@@ -74,6 +121,7 @@ final class TemplateRunnerViewModel: ObservableObject {
             buildReview()
         } else {
             stepIndex += 1
+            persistDraft()
         }
     }
 
@@ -91,8 +139,22 @@ final class TemplateRunnerViewModel: ObservableObject {
 
     // MARK: - Weave
 
+    /// The answers the current `wovenPreview` was actually built from. Lets
+    /// `buildReview()` tell "user tapped Continue past an unchanged answer set"
+    /// (e.g. went Back from the review to re-read a question, then forward again)
+    /// apart from "an answer actually changed" — only the latter should re-weave.
+    /// Without this, returning to the review after any edit to the prose itself
+    /// would also silently discard that edit and fire a second Gemini call.
+    private var lastWovenAnswers: [String: TemplateAnswer]?
+
     func buildReview() {
         guard !isWeaving else { return }
+        if let lastWovenAnswers, lastWovenAnswers == answers {
+            // Nothing about the answers changed since the last weave — show the
+            // existing (possibly user-edited) preview instead of re-weaving over it.
+            showReview = true
+            return
+        }
         isWeaving = true
         let template = self.template
         let currentAnswers = self.answers
@@ -110,6 +172,7 @@ final class TemplateRunnerViewModel: ObservableObject {
             withAnimation(.easeInOut(duration: 0.2)) {
                 self.wovenPreview = woven
                 self.usedAI = succeeded
+                self.lastWovenAnswers = currentAnswers
                 self.showReview = true
                 self.isWeaving = false
             }
@@ -122,13 +185,21 @@ final class TemplateRunnerViewModel: ObservableObject {
     /// instantly with local heuristics, then enrich in detached background
     /// tasks via `EntryEnrichment`.
     func save(finalText: String) {
+        // Re-entry guard: the review screen's Save button stays live during the
+        // dismiss delay in `TemplateRunnerView`, so a second tap must be a no-op
+        // rather than minting a duplicate entry.
+        guard savedEntry == nil else { return }
         let trimmed = finalText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
         let sentiment  = LocalAI.detectSentiment(from: trimmed)
         let reflection = SpilrVoice.localReflection(from: trimmed, sentiment: sentiment)
 
-        var mergedTags = [template.id]
+        // Seeded from the template's real topic tags ("clarity", "calm", …) —
+        // NOT `template.id`, which is a kebab-case slug that would otherwise
+        // render as a raw hashtag like "#after-a-hard-conversation" on the
+        // journal card (see `JournalCardView`).
+        var mergedTags = template.tags
         for topic in LocalAI.extractTopics(from: trimmed) where !mergedTags.contains(topic) && mergedTags.count < 5 {
             mergedTags.append(topic)
         }
@@ -149,6 +220,7 @@ final class TemplateRunnerViewModel: ObservableObject {
         )
         savedEntry = entry
         service.createEntry(entry)
+        clearDraft()
 
         EntryEnrichment.run(
             entryId: entry.id,
@@ -171,16 +243,17 @@ final class TemplateRunnerViewModel: ObservableObject {
         )
     }
 
-    /// Called when the user exits mid-flow. No entry is written — the runner
-    /// keeps no draft (unlike `TimedSessionViewModel`'s single-slot draft;
-    /// a multi-step, multi-typed draft is a deliberate follow-up, not part
-    /// of this change).
+    /// Called when the user explicitly discards mid-flow (as opposed to
+    /// exiting with "Save for later", which leaves the autosaved draft in
+    /// place). No entry is written, and the draft is cleared so a future
+    /// run of this template starts blank.
     func discard() {
         let wordCount = answers.values
             .map(\.displayValue)
             .joined(separator: " ")
             .split(separator: " ")
             .count
+        clearDraft()
         AnalyticsManager.shared.trackEntryDiscarded(sessionType: "template", wordCount: wordCount)
     }
 }

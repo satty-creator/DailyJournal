@@ -235,6 +235,10 @@ final class SelfModelService: ObservableObject {
             .filter { $0.patternType == .absence }
             .map { toSelfModelHypothesis($0) }
 
+        let bodySignals: [SelfModelHypothesis] = active
+            .filter { $0.patternType == .bodySignal }
+            .map { toSelfModelHypothesis($0) }
+
         let protectives: [ProtectiveHypothesis] = active
             .filter { $0.patternType == .protectiveLoop }
             .map { toProtectiveHypothesis($0) }
@@ -281,6 +285,7 @@ final class SelfModelService: ObservableObject {
             contradictions: selfModel.contradictions,
             whatHelps: whatHelps,
             absences: absences.isEmpty ? selfModel.absences : absences,
+            bodySignals: bodySignals.isEmpty ? selfModel.bodySignals : bodySignals,
             relationshipRoles: selfModel.relationshipRoles,
             vocabulary: vocabulary.isEmpty ? selfModel.vocabulary : vocabulary,
             writtenBy: "client"

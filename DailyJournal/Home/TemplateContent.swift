@@ -12,10 +12,12 @@
 //
 //  Integrity: `TemplateEvidenceLibrary` cites only sources that were actually
 //  checked — the NHS thought record, the 293-person gratitude RCT, Kristin
-//  Neff's self-compassion exercise, and the Day One / Stoic / Rosebud product
-//  links. There is no clinical citation for `morningPages` or `windDown` —
-//  both use `productPattern`, and its blurb says plainly that no trial backs
-//  the format. Do not add a source here that wasn't actually verified.
+//  Neff's self-compassion exercise, the Best Possible Self meta-analysis
+//  (29 studies, 2,909 participants — confirmed against the PubMed abstract),
+//  and the Day One / Stoic / Rosebud product links. There is no clinical
+//  citation for `morningPages` or `windDown` — both use `productPattern`, and
+//  its blurb says plainly that no trial backs the format. Do not add a source
+//  here that wasn't actually verified.
 //
 
 import Foundation
@@ -64,7 +66,8 @@ enum TemplateContent {
             label: "The decision",
             question: "What's the decision you keep circling?",
             helper: "State it plainly \u{2014} the actual choice, not the whole backstory.",
-            kind: .text(placeholder: "The decision is\u{2026}")
+            kind: .text(placeholder: "The decision is\u{2026}"),
+            whyThis: "This mirrors \u{201c}situation\u{201d} in a CBT thought record \u{2014} naming what's actually in front of you, before the interpretation."
         ),
         TemplateStep(
             id: "stuck-before",
@@ -78,28 +81,32 @@ enum TemplateContent {
             label: "The thought driving it",
             question: "What thought keeps stopping you?",
             helper: "Write it exactly as it sounds in your head.",
-            kind: .text(placeholder: "The thought is\u{2026}")
+            kind: .text(placeholder: "The thought is\u{2026}"),
+            whyThis: "This is the thought record's \u{201c}automatic thought\u{201d} step \u{2014} write it as it actually sounds, not the tidied-up version."
         ),
         TemplateStep(
             id: "evidence-for",
             label: "What supports it",
             question: "What actually supports that thought?",
             helper: "Facts, not guesses.",
-            kind: .text(placeholder: "What supports it is\u{2026}")
+            kind: .text(placeholder: "What supports it is\u{2026}"),
+            whyThis: "Facts first, before the interpretation \u{2014} this is \u{201c}evidence that supports the thought.\u{201d}"
         ),
         TemplateStep(
             id: "evidence-against",
             label: "What it leaves out",
             question: "What does that thought leave out?",
             helper: "Look for the facts the first read skips over.",
-            kind: .text(placeholder: "It leaves out\u{2026}")
+            kind: .text(placeholder: "It leaves out\u{2026}"),
+            whyThis: "The record's most-skipped step: evidence the first read leaves out."
         ),
         TemplateStep(
             id: "balanced",
             label: "A more balanced read",
             question: "What's a more balanced way to see this?",
             helper: "It doesn't have to be positive \u{2014} just fairer and more complete.",
-            kind: .text(placeholder: "A more balanced read is\u{2026}")
+            kind: .text(placeholder: "A more balanced read is\u{2026}"),
+            whyThis: "The \u{201c}alternative thought\u{201d} step \u{2014} not necessarily positive, just more complete."
         ),
         TemplateStep(
             id: "stuck-after",
@@ -166,6 +173,46 @@ enum TemplateContent {
             question: "What actually needs your attention today?",
             helper: "One thing is enough.",
             kind: .text(placeholder: "Today I need to\u{2026}")
+        )
+    ]
+
+    // MARK: - Best possible self (Best Possible Self intervention meta-analysis)
+
+    static let bestPossibleSelf: [TemplateStep] = [
+        TemplateStep(
+            id: "future-picture",
+            label: "Future picture",
+            question: "Pick a point one to three years out. What's gone as well as it reasonably could?",
+            helper: "Reasonably possible, not a fantasy \u{2014} something you can actually picture.",
+            kind: .text(placeholder: "In a couple of years, if things have gone well\u{2026}")
+        ),
+        TemplateStep(
+            id: "workday",
+            label: "An ordinary workday",
+            question: "What does an ordinary day look like in that picture?",
+            helper: "Concrete details beat aspirations \u{2014} what you're actually doing on a normal Tuesday.",
+            kind: .text(placeholder: "On a normal day, I\u{2026}")
+        ),
+        TemplateStep(
+            id: "health-relationships",
+            label: "Health & relationships",
+            question: "What do your health and relationships look like there?",
+            helper: "Routines and behaviors you can picture, not just how you'd feel.",
+            kind: .text(placeholder: "My health and the people around me\u{2026}")
+        ),
+        TemplateStep(
+            id: "repeated-actions",
+            label: "What got you there",
+            question: "What did you keep doing, over and over, to get there?",
+            helper: "Look for behaviors, not personality traits.",
+            kind: .text(placeholder: "The thing I kept doing was\u{2026}")
+        ),
+        TemplateStep(
+            id: "next-week",
+            label: "One step this week",
+            question: "What's one action toward this you can take in the next 7 days?",
+            helper: "Small enough to actually schedule.",
+            kind: .text(placeholder: "This week I will\u{2026}")
         )
     ]
 
@@ -256,8 +303,23 @@ enum TemplateEvidenceLibrary {
         ]
     )
 
+    /// Verified against the PubMed abstract directly (not just the prototype's
+    /// claim) before writing this as `.clinical` — see the integrity note above.
+    /// 29 studies, 2,909 participants total; small-to-medium effects on
+    /// wellbeing, optimism and positive affect versus controls.
+    static let bestPossibleSelfMetaAnalysis = TemplateEvidence(
+        id: "best-possible-self-meta-analysis",
+        kind: .clinical,
+        pill: "Meta-analysis \u{00b7} n=2,909",
+        blurb: "Based on the Best Possible Self intervention. A systematic review and meta-analysis of 29 studies (2,909 participants) found small-to-medium improvements in wellbeing, optimism and positive affect compared with control conditions.",
+        sources: [
+            .init(label: "PubMed \u{2014} Best Possible Self meta-analysis",
+                  url: URL(string: "https://pubmed.ncbi.nlm.nih.gov/31545815/")!)
+        ]
+    )
+
     /// Backs the "Why these?" sheet. Clinical rows first, then practice.
     static let all: [TemplateEvidence] = [
-        nhsThoughtRecord, gratitudeRCT, neffSelfCompassion, productPattern
+        nhsThoughtRecord, gratitudeRCT, neffSelfCompassion, bestPossibleSelfMetaAnalysis, productPattern
     ]
 }

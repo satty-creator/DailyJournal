@@ -39,29 +39,6 @@ extension PatternType {
     }
 }
 
-// MARK: - Trend badge (replaces the old dedicated "What's shifting" section)
-
-extension PatternHypothesis {
-    /// A short trend tag for a pattern-list row — new / growing / quiet, or
-    /// nil. Same three arithmetic conditions the old `ShiftingSignal` used,
-    /// now a tag on the item instead of its own navigation branch and its
-    /// own counted disclosure row (rosebud-teardown-mirror-redesign-2026-09-09.md §3.6).
-    var trendBadge: String? {
-        let now = Date()
-        let daysSinceFirst = Calendar.current.dateComponents([.day], from: firstSeenAt, to: now).day ?? 0
-        let daysSinceShown = shownAt.map { Calendar.current.dateComponents([.day], from: $0, to: now).day ?? 0 }
-
-        if daysSinceFirst < 7 && timesSeen >= 2 {
-            return "new"
-        } else if (daysSinceShown ?? 0) > 14 && timesSeen >= 3 {
-            return "quiet"
-        } else if timesSeen >= 4 && daysSinceFirst > 7 && daysSinceFirst < 30 {
-            return "growing"
-        }
-        return nil
-    }
-}
-
 // MARK: - ViewModel
 
 /// Where the daily Mirror card stands relative to `isLoading`.
@@ -98,6 +75,22 @@ final class MirrorViewModel: ObservableObject {
     @Published var showSelfModel = false
     @Published var weeklyLetter: MirrorLetter? = nil
 
+    // MARK: - Mirror v3 derived layer
+    /// Tier 0 — the counts behind "This week, in your words". Never empty once
+    /// the nightly job has run once, and never wrong: it is arithmetic.
+    @Published var facts: MirrorFacts = .empty(userId: "")
+    /// Tier 3 — at most three threads.
+    @Published var threads: MirrorThreads = .empty
+    /// Today's one thing. `nil` means the nightly job has not written one yet
+    /// (a brand-new account), which is distinct from `reading.silence == true`
+    /// — a deliberate quiet day.
+    @Published var reading: Reading? = nil
+    /// True when the derived layer's last read couldn't reach the server or a
+    /// warm cache at all — distinct from `!facts.isFresh`, which means the
+    /// docs genuinely don't exist yet. Mirrors `DerivedService.loadFailed`;
+    /// drives which empty-state copy the screen shows.
+    @Published var derivedLoadFailed = false
+
     var userId: String  // mutable so MainTabView can set the real uid after pre-warming
     /// Prevents the full-screen spinner from re-appearing when navigating back
     /// from SelfModelView. Only the very first fetch shows the spinner; subsequent
@@ -121,6 +114,23 @@ final class MirrorViewModel: ObservableObject {
         selfModel = SelfModel.empty(userId: userId)
     }
 
+    /// Reassigns the uid this VM operates on and resets its load-freshness
+    /// state. MainTabView constructs this VM with `userId: ""` before
+    /// authentication resolves and used to patch `mirrorVM.userId = uid`
+    /// directly — which left `hasLoaded`/`lastLoadCompletedAt` from the
+    /// placeholder VM in place, so a subsequent `loadIfStale()` could treat a
+    /// load that ran against the EMPTY uid as still "fresh" and skip
+    /// reloading against the real one. `MirrorView` used to keep its own
+    /// shadow `userId` to route writes around this; this method removes the
+    /// need for that by making the switch itself safe to observe through
+    /// `vm.userId` alone (mirror-v3-prd-2026-09-10.md, Week 1).
+    func setUserId(_ newUserId: String) {
+        guard newUserId != userId else { return }
+        userId = newUserId
+        hasLoaded = false
+        lastLoadCompletedAt = nil
+    }
+
     // MARK: - Maturity (based on real entry count, as per PRD)
 
     var maturity: MirrorMaturity {
@@ -129,18 +139,34 @@ final class MirrorViewModel: ObservableObject {
 
     /// Used by HomeView's "Spilr noticed" bridge card, which previews a
     /// pattern on Home before the user opens the Mirror tab.
+    ///
+    /// Deliberately answers in the SAME order and from the SAME two sources
+    /// Mirror's own Today section renders from (`reading`, then the first
+    /// thread) — never from `hypotheses` alone. This used to fall back to
+    /// `hypotheses.first(where: { $0.isSurfaceable })`, with no maturity gate
+    /// and no `timesSeen >= 3` floor, reading a collection
+    /// (`patternHypotheses`) that Mirror v3 no longer has any screen for —
+    /// `PatternListView` was deleted. The result was structural: Home could
+    /// promise an insight that opening Mirror could never show, on a
+    /// perfectly healthy network, for any account whose derived layer just
+    /// hadn't produced a thread yet. If this returns non-nil, tapping through
+    /// to Mirror is now guaranteed to show that same line.
     var bridgeInsightTitle: String? {
-        hypotheses.first(where: { $0.isSurfaceable })?.userFacingTitle
+        if let reading, !reading.silence { return reading.line }
+        return threads.threads.first?.title
     }
 
-    /// Every surfaceable hypothesis, sorted by MirrorScore — the flat "Your
-    /// patterns" list. The old goDeepSection filtered this same array four
-    /// separate ways into four counted rows; the taxonomy is now a tag on
-    /// each row (`PatternType.displayLabel`, `trendBadge`), not a navigation
-    /// branch.
+    /// Hypotheses seen on at least 3 distinct entries, sorted by MirrorScore —
+    /// the flat "Your patterns" list. Mirror v3 (mirror-v3-prd-2026-09-10.md
+    /// §11.1) draws the line between "an observation" and "a pattern" at n≥3;
+    /// below that, `PatternListView` would otherwise be a wall of one-off
+    /// hypotheses shown with the same chrome as a real recurrence. This will
+    /// read as empty for most accounts until the identity/dedup work (§4) and
+    /// the dedicated Threads surface (§5.4) land — that emptiness is correct,
+    /// not a bug, until then.
     var surfaceablePatterns: [PatternHypothesis] {
         hypotheses
-            .filter(\.isSurfaceable)
+            .filter { $0.isSurfaceable && $0.timesSeen >= 3 }
             .sorted { MirrorScore.score(for: $0) > MirrorScore.score(for: $1) }
     }
 
@@ -149,10 +175,6 @@ final class MirrorViewModel: ObservableObject {
     func onMirrorFeedback(_ feedback: MirrorFeedback, card: MirrorCard) {
         guard let patternId = card.sourcePatternIds.first else { return }
 
-        // "This is me" (.thisIsMe) is a soft signal — maps to .shown so it
-        // records mild agreement without pinning confidence or triggering
-        // user_confirmed lifecycle. Only corrective feedback (.notMe) is
-        // load-bearing for hypothesis suppression.
         let status: PatternCallbackStatus
         switch feedback {
         case .thisIsMe:    status = .shown
@@ -174,6 +196,19 @@ final class MirrorViewModel: ObservableObject {
         )
         for i in hypotheses.indices where hypotheses[i].id == patternId {
             hypotheses[i].status = status
+        }
+
+        // "This is me" was previously ALSO only .shown — mild agreement, no
+        // confidence bump. That made confirmation from the Today card a dead
+        // end: SelfModelHypothesis.userStatus (and therefore .confidenceBand
+        // == .yours, the decay exemption, and the confidence floor of 0.85 in
+        // functions/index.js's toSMHyp) could only ever be set from
+        // SelfModelView's "This is me" button — the Today card, the surface
+        // most people actually use, never reached it
+        // (mirror-v3-prd-2026-09-10.md, ordering risk #3). Route it through
+        // the same path SelfModelView uses so both surfaces agree.
+        if feedback == .thisIsMe {
+            SelfModelService.shared.markHypothesis(id: patternId, userStatus: .thisIsMe, userId: userId)
         }
 
         // Route into style learning (§3.9 StylePreferences) — "Too intense"
@@ -277,15 +312,27 @@ final class MirrorViewModel: ObservableObject {
         async let lifeCtx = SelfModelService.shared.lifeContext(for: userId)
         async let stylePrefsLoad: Void = StylePreferencesService.shared.load(for: userId)
         async let letterLoad: Void = MirrorLetterService.shared.loadLatest(for: userId)
+        // Mirror v3's derived layer: facts + threads + firstSeven, then
+        // today's reading (in that order internally — the reading's date key
+        // depends on `facts.timezone`, so DerivedService.load fetches facts
+        // first rather than computing the key up front). Server-written
+        // nightly — see DerivedService.load's doc comment for the read
+        // strategy.
+        async let derivedLoad: Void = DerivedService.shared.load(for: userId)
 
         totalEntries = await rollupStats.entryCount
         _ = await selfModelLoad
         _ = await hypothesesLoad
         _ = await stylePrefsLoad
         _ = await letterLoad
+        _ = await derivedLoad
         selfModel   = SelfModelService.shared.selfModel
         hypotheses  = MirrorGraphService.shared.hypotheses
         weeklyLetter = MirrorLetterService.shared.latest
+        facts       = DerivedService.shared.facts
+        threads     = DerivedService.shared.threads
+        reading     = DerivedService.shared.reading
+        derivedLoadFailed = DerivedService.shared.loadFailed
 
         AIService.cacheLifeContext(await lifeCtx)
 
@@ -310,8 +357,103 @@ final class MirrorViewModel: ObservableObject {
         // One-time bootstrap for a brand-new user the server hasn't mined yet.
         await runMiningIfNeeded()
 
+        // The derived layer (facts/threads/readings) is written nightly at
+        // 04:00 UTC. `bootstrapMirror` above only ever fires once per
+        // account — it refuses outright once `lastMineRunAt` is set, which is
+        // every RETURNING user, including one who reinstalled and lost
+        // nothing server-side. Without this, such an account has no path to
+        // ever seeing the derived layer except waiting for the next nightly
+        // run. `refreshDerived` is pure arithmetic (no model call, no cost
+        // ceiling to worry about) and safe to call as often as its own
+        // server-side cooldown allows, so it's the right thing to call for
+        // "this account has never been computed" specifically, not just
+        // "never mined".
+        if !facts.isFresh {
+            await refreshDerivedIfNeeded()
+        }
+
         // Read today's card off the server-generated deck.
         await loadOrGenerateMirrorCard()
+    }
+
+    /// Fallback for an account whose derived layer (facts/threads/readings)
+    /// has never been computed — most commonly a returning user on a fresh
+    /// install, where `derived/facts` may simply not exist yet server-side
+    /// and the client has no cache to fall back to either. Local cooldown
+    /// only; the server enforces its own ~6h cooldown independently
+    /// (`refreshDerived`'s per-user rate limit) so this is just here to avoid
+    /// a pointless round trip on every Mirror open for an account that is
+    /// genuinely still un-computed for some other reason (e.g. below the
+    /// mining maturity gate).
+    private func refreshDerivedIfNeeded() async {
+        // No `isAIAvailable` gate here on purpose: unlike `bootstrapMirror`,
+        // `refreshDerived` never touches Gemini (it's the same pure-arithmetic
+        // worker the nightly cron runs), so it isn't something AI consent
+        // should gate — only sign-in matters, and `AIService.refreshDerived`
+        // already no-ops if there's no token to send.
+        let cooldownKey = "mirrorDerivedRefreshAttempt_\(userId)"
+        let lastAttempt = UserDefaults.standard.object(forKey: cooldownKey) as? Date
+        guard lastAttempt == nil || Date().timeIntervalSince(lastAttempt!) > 6 * 3600 else { return }
+        UserDefaults.standard.set(Date(), forKey: cooldownKey)
+
+        await AIService.shared.refreshDerived(userId: userId)
+
+        await DerivedService.shared.load(for: userId)
+        facts       = DerivedService.shared.facts
+        threads     = DerivedService.shared.threads
+        reading     = DerivedService.shared.reading
+        derivedLoadFailed = DerivedService.shared.loadFailed
+    }
+
+    // MARK: - Mirror v3 derived helpers
+
+    /// The authoritative unlock hint. Prefers the SERVER's, which can see band
+    /// coverage and can therefore say "one entry at a different time of day"
+    /// rather than a bare count; falls back to the local ladder for an account
+    /// the nightly job has not reached yet.
+    var unlockHint: String? {
+        facts.unlock.hint ?? UnlockLadder.hint(totalEntries: totalEntries)
+    }
+
+    /// True once the server has written the 7-entry unlock card.
+    var firstSevenAvailable: Bool { DerivedService.shared.firstSeven != nil }
+
+    func onReadingFeedback(_ feedback: ReadingFeedback,
+                           reason: ReadingMissReason?,
+                           reading: Reading) {
+        DerivedService.shared.recordReadingFeedback(
+            feedback, reason: reason, reading: reading, userId: userId)
+        self.reading = DerivedService.shared.reading
+        if feedback == .almost {
+            AnalyticsManager.shared.trackPatternDismissed()
+        }
+    }
+
+    /// Records that today's line was actually displayed, for the 14-day
+    /// novelty gate the server's ObservationScore reads.
+    func markReadingShown(_ reading: Reading) {
+        DerivedService.shared.markReadingShown(reading, userId: userId)
+    }
+
+    /// "Teach Spilr" — routed by the same classifier the evidence drawer uses,
+    /// so a note about TONE ("too blunt") becomes a style preference while a
+    /// note about CONTENT ("that's not why") becomes a hard exclusion the
+    /// miner reads before it writes.
+    func submitCorrection(_ text: String, hypothesisId: String?, observationId: String?) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if MirrorCorrectionClassifier.isStyleCorrection(trimmed) {
+            StylePreferencesService.shared.addNote(trimmed, userId: userId)
+            return
+        }
+        let correction = ProfileCorrection(
+            userId: userId,
+            feedbackType: .notMe,
+            patternId: observationId,
+            hypothesisId: hypothesisId,
+            userCorrection: trimmed
+        )
+        SelfModelService.shared.submitCorrection(correction, userId: userId)
     }
 
     func onFeedback(hypothesisId: String, status: PatternCallbackStatus) {
@@ -468,15 +610,14 @@ struct MirrorView: View {
     @State private var showMoreSheet = false
     @State private var silenceSeedPrompt: String? = nil
     @State private var showWeeklyLetter = false
-
-    /// The real uid, held separately from `vm.userId`. MainTabView constructs the
-    /// shared VM with `userId: ""` and only assigns the real one inside its `.task`,
-    /// so anything that WRITES must use this value — `vm.userId` can still be empty,
-    /// which would send the entry to `users//entries`.
-    private let userId: String
+    /// The §5.2 proof sheet — opened from "more…" on Today, and from a thread
+    /// row. Same sheet either way: the numbers, the quotes, the exception.
+    @State private var showProofSheet = false
+    @State private var selectedThread: MirrorThread? = nil
+    @State private var showTeachSheet = false
+    @State private var teachText = ""
 
     init(userId: String, viewModel: MirrorViewModel? = nil) {
-        self.userId = userId
         vm = viewModel ?? MirrorViewModel(userId: userId)
     }
 
@@ -498,6 +639,61 @@ struct MirrorView: View {
         let dayOfYear = Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 0
         let seed = MirrorSeed.all[dayOfYear % MirrorSeed.all.count]
         return seed.prompt
+    }
+
+    /// True when at least one of the sections above (Today, This week,
+    /// Threads) has something to show, on its own terms — including its own
+    /// "not yet, here's what would unlock it" empty state. When every one of
+    /// them is genuinely silent, `mirrorEmptyStateCard` takes over instead of
+    /// falling straight through to `goDeepSection` unexplained.
+    private var hasAnyDailyContent: Bool {
+        vm.reading != nil
+            || vm.cardLoadState == .working
+            || vm.facts.isFresh
+            || !vm.threads.threads.isEmpty
+            || vm.maturity.canShowThreads
+    }
+
+    /// Distinguishes the two reasons the screen can be this empty: a real
+    /// server/network failure (`vm.derivedLoadFailed`) versus an account that
+    /// is honestly this new — the case §7 of the v3 PRD calls "the first
+    /// honest state".
+    private var mirrorEmptyStateCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if vm.derivedLoadFailed {
+                Text("Couldn't reach the server")
+                    .font(AppTheme.editorialDisplay(size: 20, weight: .semibold))
+                    .foregroundStyle(AppTheme.ink)
+                Text("Pull down to try again.")
+                    .font(AppTheme.editorialBody(size: 14))
+                    .foregroundStyle(AppTheme.inkSoft)
+            } else {
+                Text("Nothing new to show today.")
+                    .font(AppTheme.editorialDisplay(size: 20, weight: .semibold))
+                    .foregroundStyle(AppTheme.ink)
+                if let hint = vm.unlockHint {
+                    Text(hint)
+                        .font(AppTheme.editorialBody(size: 14))
+                        .foregroundStyle(AppTheme.inkSoft)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Button { silenceSeedPrompt = silenceQuestion } label: {
+                    HStack(spacing: 8) {
+                        Text(silenceQuestion)
+                            .font(AppTheme.editorialBody(size: 15).italic())
+                            .foregroundStyle(AppTheme.terracotta)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .multilineTextAlignment(.leading)
+                        Image(systemName: "arrow.up.right")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(AppTheme.terracotta)
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .softCard(cornerRadius: 30, padding: 22)
     }
 
     var body: some View {
@@ -523,37 +719,79 @@ struct MirrorView: View {
                                 }
                             }
 
-                            // Today's mirror — the single daily reflection.
-                            // `isLoading` no longer covers this: the card resolves
-                            // (a Firestore read) AFTER the rest of the screen has
-                            // already painted, so `cardLoadState` decides what
-                            // shows here.
-                            if let card = vm.mirrorCard, vm.maturity.canShowDailyMirror {
-                                TodayMirrorCardView(
-                                    card: card,
-                                    hypothesis: cardHypothesis,
-                                    onFeedback: { feedback in
-                                        vm.onMirrorFeedback(feedback, card: card)
-                                    },
-                                    onMore: {
-                                        showMoreSheet = true
-                                    }
-                                )
+                            // ── TODAY (§5.2) ──────────────────────────────
+                            // One line, one receipt, two taps. `reading` is
+                            // server-written and always sits on top of a
+                            // deterministic observation; `reading.silence`
+                            // means the day is deliberately quiet, which is
+                            // different from `reading == nil` (nothing has
+                            // been computed for this account yet).
+                            if let reading = vm.reading {
+                                if reading.silence {
+                                    ReadingSilenceCardView(
+                                        reading: reading,
+                                        seedQuestion: silenceQuestion,
+                                        onTapQuestion: { silenceSeedPrompt = $0 }
+                                    )
+                                } else {
+                                    TodayReadingCardView(
+                                        reading: reading,
+                                        onFeedback: { feedback, reason in
+                                            vm.onReadingFeedback(feedback, reason: reason, reading: reading)
+                                        },
+                                        onMore: { showProofSheet = true },
+                                        onTapQuestion: { question in
+                                            exploreSeed = question
+                                            showExploreChat = true
+                                        }
+                                    )
+                                    .onAppear { vm.markReadingShown(reading) }
+                                }
                             } else if vm.cardLoadState == .working {
                                 MirrorCardSkeletonView()
-                            } else if case .empty(let reason) = vm.cardLoadState, vm.maturity.canShowDailyMirror {
-                                MirrorSilenceCardView(
-                                    reason: reason,
-                                    question: silenceQuestion,
-                                    onTapQuestion: { silenceSeedPrompt = silenceQuestion }
+                            }
+
+                            // ── THIS WEEK, IN YOUR WORDS (§5.3) ───────────
+                            // Tier 0. No model, no thresholds, available from
+                            // the first entry — the part of this screen that
+                            // is never empty and never wrong.
+                            if vm.facts.isFresh {
+                                ThisWeekStripView(facts: vm.facts)
+                            }
+
+                            // ── THREADS (§5.4) ────────────────────────────
+                            // Max 3, and only at n>=3 with a contrast set.
+                            // Shown from the `unlock` rung so the empty state
+                            // ("threads need the same thing on three
+                            // different days") does the teaching.
+                            if vm.maturity.canShowThreads || !vm.threads.threads.isEmpty {
+                                ThreadsSectionView(
+                                    threads: vm.threads,
+                                    canShow: vm.maturity.canShowThreads,
+                                    unlockHint: vm.unlockHint,
+                                    onSelect: { thread in
+                                        selectedThread = thread
+                                        showProofSheet = true
+                                    }
                                 )
                             }
 
-                            if vm.maturity.canShowFirstSketch && vm.selfModel.isSurfaceable && !firstSketchSeen {
+                            if vm.maturity.canShowFirstSketch && vm.firstSevenAvailable && !firstSketchSeen {
                                 firstSketchBanner
                             }
 
-                            // Progressive disclosure: two uncounted rows.
+                            // Every section above independently decided it has
+                            // nothing to show. Previously that meant the
+                            // screen fell straight through to `goDeepSection`
+                            // — one dashed "Your living profile" row — with no
+                            // explanation of WHY, indistinguishable from a
+                            // genuine loading failure. Say which case this is.
+                            if !hasAnyDailyContent {
+                                mirrorEmptyStateCard
+                            }
+
+                            // Progressive disclosure: the weekly letter and
+                            // the full profile.
                             goDeepSection
 
                             Spacer(minLength: 90)
@@ -565,7 +803,7 @@ struct MirrorView: View {
                     .refreshable { await vm.load() }
                 }
             }
-            .composeFAB(userId: userId) { Task { await vm.load() } }
+            .composeFAB(userId: vm.userId) { Task { await vm.load() } }
             .navigationTitle("Mirror")
             .navigationBarTitleDisplayMode(.large)
             .task {
@@ -573,16 +811,73 @@ struct MirrorView: View {
                 AnalyticsManager.shared.logEvent(.mirrorGraphViewed)
             }
             .sheet(isPresented: $vm.showFirstSketch) {
-                FirstSketchView(selfModel: vm.selfModel) {
+                FirstSketchView(
+                    selfModel: vm.selfModel,
+                    serverCard: DerivedService.shared.firstSeven
+                ) {
                     vm.showFirstSketch = false
                     markFirstSketchSeen()
                 }
             }
             .sheet(isPresented: $showAsk) {
-                AskView(userId: userId)
+                AskView(userId: vm.userId)
+            }
+            // §5.2's proof sheet, shared by Today's "more…" and every thread
+            // row. `selectedThread` decides which proof is shown; it is
+            // cleared on dismiss so the next "more…" goes back to Today.
+            .sheet(isPresented: $showProofSheet, onDismiss: { selectedThread = nil }) {
+                if let reading = vm.reading, let proof = reading.proof, selectedThread == nil {
+                    ProofSheetView(
+                        line: reading.line,
+                        proof: proof,
+                        userStatus: reading.userStatus,
+                        onFeedback: { feedback, reason in
+                            vm.onReadingFeedback(feedback, reason: reason, reading: reading)
+                        },
+                        onAsk: {
+                            showProofSheet = false
+                            exploreSeed = reading.line
+                            showExploreChat = true
+                        },
+                        onTeach: {
+                            showProofSheet = false
+                            showTeachSheet = true
+                        },
+                        onDismiss: { showProofSheet = false }
+                    )
+                } else if let thread = selectedThread {
+                    ThreadProofSheetView(
+                        thread: thread,
+                        onAsk: {
+                            showProofSheet = false
+                            exploreSeed = thread.title
+                            showExploreChat = true
+                        },
+                        onTeach: {
+                            showProofSheet = false
+                            showTeachSheet = true
+                        },
+                        onDismiss: { showProofSheet = false }
+                    )
+                }
+            }
+            // "Teach Spilr" — free text straight into `profileCorrections`,
+            // the collection the nightly miner already reads as hard
+            // exclusions. The correction outranks the inference (PI-010).
+            .sheet(isPresented: $showTeachSheet) {
+                TeachSpilrSheet(
+                    subject: selectedThread?.title ?? vm.reading?.line ?? "",
+                    onSubmit: { text in
+                        vm.submitCorrection(text,
+                                            hypothesisId: selectedThread?.hypothesisId,
+                                            observationId: vm.reading?.sourceId)
+                        showTeachSheet = false
+                    },
+                    onCancel: { showTeachSheet = false }
+                )
             }
             .sheet(isPresented: $showWeeklyLetter, onDismiss: {
-                MirrorLetterService.shared.markOpened(userId: userId)
+                MirrorLetterService.shared.markOpened(userId: vm.userId)
                 vm.weeklyLetter = MirrorLetterService.shared.latest
             }) {
                 if let letter = vm.weeklyLetter {
@@ -590,12 +885,12 @@ struct MirrorView: View {
                 }
             }
             .fullScreenCover(isPresented: $showExploreChat) {
-                DailyChatView(userId: userId, seedContext: exploreSeed) {
+                DailyChatView(userId: vm.userId, seedContext: exploreSeed) {
                     Task { await vm.load(showSpinner: false) }
                 }
             }
             .fullScreenCover(item: $silenceSeedPrompt.asIdentifiablePrompt) { prompt in
-                SpillWriteView(userId: userId, prompt: prompt.value) {
+                SpillWriteView(userId: vm.userId, prompt: prompt.value) {
                     Task { await vm.load(showSpinner: false) }
                 }
             }
@@ -644,7 +939,7 @@ struct MirrorView: View {
                 }
             }
             .navigationDestination(isPresented: $vm.showSelfModel) {
-                SelfModelView(userId: userId, selfModel: vm.selfModel)
+                SelfModelView(userId: vm.userId, selfModel: vm.selfModel)
             }
         }
         .trackScreen(.mirror)
@@ -665,7 +960,7 @@ struct MirrorView: View {
     // Keyed by uid so switching accounts on one device doesn't inherit
     // another user's "already seen" state.
 
-    private var firstSketchSeenKey: String { "mirrorFirstSketchSeen_\(userId)" }
+    private var firstSketchSeenKey: String { "mirrorFirstSketchSeen_\(vm.userId)" }
 
     private var firstSketchSeen: Bool {
         UserDefaults.standard.bool(forKey: firstSketchSeenKey)
@@ -768,27 +1063,20 @@ struct MirrorView: View {
 
     // MARK: - Go deeper (progressive disclosure)
     //
-    // Two uncounted rows, replacing the old four counted disclosure rows
-    // ("Patterns being watched" / "What you might not be noticing" /
-    // "What's shifting" / "When the loop softened"). Counts create an
-    // obligation; the taxonomy (PatternType.displayLabel, trendBadge) is now
-    // a tag on each row inside a single list, not a navigation branch.
+    // Two rows: the weekly letter and the profile. The "Your patterns" row and
+    // `PatternListView` behind it are GONE (Mirror v3 M7) — that list was the
+    // pattern engine's raw output rendered as a product surface, nineteen
+    // items deep with a taxonomy label and a lifecycle chip on each. Threads
+    // (§5.4) replaces it with at most three, each of which had to happen on
+    // three different days and survive an audit to appear at all.
 
     private var goDeepSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             sectionLabel("Go deeper when you want")
 
-            if !vm.surfaceablePatterns.isEmpty {
-                NavigationLink {
-                    PatternListView(
-                        hypotheses: vm.surfaceablePatterns,
-                        onSelectHypothesis: { h in
-                            selectedHypothesis = h
-                            showEvidenceDrawer = true
-                        }
-                    )
-                } label: {
-                    mirrorDisclosureRow(icon: "eye", title: "Your patterns")
+            if vm.weeklyLetter != nil {
+                Button { showWeeklyLetter = true } label: {
+                    mirrorDisclosureRow(icon: "envelope", title: "Your weekly letter")
                 }
                 .buttonStyle(.plain)
             }
@@ -848,71 +1136,15 @@ struct MirrorView: View {
     }
 }
 
-// MARK: - Pattern List (pushed from "Your patterns")
+// MARK: - PatternListView — DELETED (Mirror v3 M7)
+//
+// The flat "Your patterns" list is gone. It rendered every surfaceable
+// hypothesis with a taxonomy label, a trend badge and a "Seen N×" count —
+// nineteen rows on the account in the 9 Sept screenshots, eighteen of them
+// seen once and six of them the same pattern reworded. Threads
+// (ThreadsSectionView, §5.4) replaces it: at most three, each requiring three
+// distinct days, a contrast set and a passed audit before it can appear.
 
-struct PatternListView: View {
-    let hypotheses: [PatternHypothesis]
-    var onSelectHypothesis: ((PatternHypothesis) -> Void)? = nil
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Spacer()
-                    Text("\(hypotheses.count) pattern\(hypotheses.count == 1 ? "" : "s")")
-                        .font(.system(size: 12, weight: .semibold, design: .rounded))
-                        .foregroundStyle(AppTheme.inkSoft)
-                }
-
-                ForEach(hypotheses) { h in
-                    patternRow(h)
-                }
-            }
-            .padding(.horizontal, 20)
-            .padding(.top, 16)
-        }
-        .background(AppTheme.paper.ignoresSafeArea())
-        .navigationTitle("Patterns")
-        .navigationBarTitleDisplayMode(.inline)
-    }
-
-    private func patternRow(_ h: PatternHypothesis) -> some View {
-        Button {
-            onSelectHypothesis?(h)
-        } label: {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 6) {
-                    Text(h.patternType.displayLabel)
-                        .font(.system(size: 10, weight: .bold, design: .rounded))
-                        .foregroundStyle(AppTheme.inkSoft)
-                        .textCase(.uppercase)
-                    if let badge = h.trendBadge {
-                        Text(badge)
-                            .font(.system(size: 10, weight: .bold, design: .rounded))
-                            .foregroundStyle(AppTheme.terracotta)
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 2)
-                            .background(AppTheme.terracotta.opacity(0.10))
-                            .clipShape(Capsule())
-                    }
-                    Spacer()
-                    Text("Seen \(h.timesSeen)\u{00D7}")
-                        .font(.system(size: 11, weight: .semibold, design: .rounded))
-                        .foregroundStyle(AppTheme.inkSoft)
-                }
-
-                Text(h.userFacingTitle)
-                    .font(AppTheme.editorialDisplay(size: 17, weight: .semibold))
-                    .foregroundStyle(AppTheme.ink)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .multilineTextAlignment(.leading)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .softCard(cornerRadius: 20, padding: 16)
-        }
-        .buttonStyle(.plain)
-    }
-}
 
 // MARK: - Ask, AskView, MirrorMoreSheet, MirrorSilenceCardView live in their
 // own files (AskView.swift, MirrorMoreSheet.swift, TodayMirrorCardView.swift).

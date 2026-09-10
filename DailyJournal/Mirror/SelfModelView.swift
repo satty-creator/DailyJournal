@@ -26,45 +26,26 @@ final class SelfModelViewModel: ObservableObject {
         self.selfModel = selfModel
     }
 
+    /// Loads a PREVIOUSLY generated narrative, if one exists. Read-only.
+    ///
+    /// The generation half is gone (Mirror v3 §5.5, Week 6). This was the last
+    /// client-side LLM call on the whole Mirror surface — a third prose writer
+    /// over the same hypotheses the server already writes cards and the weekly
+    /// letter from, with no lint on its output beyond a banned-term check, and
+    /// it ran on tab open. The weekly letter replaces it with a DATED artefact
+    /// built on counted facts plus exactly one observation, which is both
+    /// better grounded and archived.
+    ///
+    /// Existing narratives keep rendering until they age out, so nobody loses
+    /// a paragraph they had yesterday.
     func loadNarrative() async {
-        let key = "mirrorNarrativeDate_\(userId)"
-        let lastGenerated = UserDefaults.standard.object(forKey: key) as? Date
-        let weekAgo = Date().addingTimeInterval(-7 * 86_400)
-
-        // Try cached narrative from Firestore first
-        if let cached = await fetchCachedNarrative() {
-            narrative = cached
-            if let lastGenerated, lastGenerated > weekAgo { return }
-        }
-
-        // Generate fresh if stale or absent
-        let hypotheses = MirrorGraphService.shared.hypotheses
-        guard hypotheses.count >= 3 else { return }
-
-        guard let fresh = await AIService.shared.generateMirrorNarrative(
-            userId: userId,
-            hypotheses: hypotheses
-        ) else { return }
-
-        narrative = fresh
-        UserDefaults.standard.set(Date(), forKey: key)
-
-        // Persist
-        Firestore.firestore()
-            .collection("users").document(userId)
-            .collection("selfModel").document("narrative")
-            .setData(fresh.toFirestoreData()) { _ in }
-    }
-
-    private func fetchCachedNarrative() async -> MirrorNarrative? {
         guard let snap = try? await Firestore.firestore()
             .collection("users").document(userId)
             .collection("selfModel").document("narrative")
             .getDocument(),
-              snap.exists,
-              let data = snap.data()
-        else { return nil }
-        return MirrorNarrative(from: data)
+              snap.exists, let data = snap.data()
+        else { return }
+        narrative = MirrorNarrative(from: data)
     }
 
     /// The ONLY producer of `UserHypothesisStatus` in the app, and therefore the
@@ -156,7 +137,12 @@ struct SelfModelView: View {
     }
 
     var body: some View {
-        NavigationStack {
+        // Not its own NavigationStack — this view is always pushed via a
+        // `.navigationDestination` from MirrorView, which already owns the
+        // stack. A nested NavigationStack here doubled the nav bar and broke
+        // the interactive swipe-back gesture (mirror-v3-prd-2026-09-10.md,
+        // Week 1).
+        Group {
             ZStack {
                 AppTheme.paper.ignoresSafeArea()
 
@@ -169,16 +155,16 @@ struct SelfModelView: View {
                             if let narrative = vm.narrative {
                                 narrativeHeader(narrative)
                             }
-                            if !vm.selfModel.coreRules.filter(\.isActive).isEmpty {
+                            if !vm.selfModel.coreRules.filter { $0.isActive && $0.isProfileSurfaceable }.isEmpty {
                                 rulesSection
                             }
-                            if !vm.selfModel.protectiveStrategies.filter(\.isActive).isEmpty {
+                            if !vm.selfModel.protectiveStrategies.filter { $0.isActive && $0.asHypothesis.isProfileSurfaceable }.isEmpty {
                                 protectiveSection
                             }
                             if !vm.selfModel.innerParts.filter({ $0.confidence > 0.3 }).isEmpty {
                                 innerPartsSection
                             }
-                            if !vm.selfModel.whatHelps.filter(\.isActive).isEmpty {
+                            if !vm.selfModel.whatHelps.filter { $0.isActive && $0.isProfileSurfaceable }.isEmpty {
                                 whatHelpsSection
                             }
                             // Placed high: an absence is the most specific,
@@ -188,6 +174,14 @@ struct SelfModelView: View {
                             if !vm.selfModel.absences.filter(\.isActive).isEmpty {
                                 absencesSection
                             }
+                            // §5.6 "People and the part you play". This has
+                            // been populated by updateSelfModel all along and
+                            // rendered NOWHERE — one of three fields the
+                            // server wrote every night into a screen that
+                            // never read them.
+                            if !vm.selfModel.relationshipRoles.isEmpty {
+                                relationshipRolesSection
+                            }
                             if !vm.selfModel.vocabulary.isEmpty {
                                 vocabularySection
                             }
@@ -196,6 +190,14 @@ struct SelfModelView: View {
                             }
                             if !openQuestions.isEmpty {
                                 openQuestionsSection(questions: openQuestions)
+                            }
+                            // Says what would fill each empty section, rather
+                            // than leaving a blank screen that reads as
+                            // "nothing here about you". At 7 entries most of
+                            // this is empty and being straight about that is
+                            // what earns belief at 30 (§7).
+                            if isProfileEmpty {
+                                profileEmptyState
                             }
                             Spacer(minLength: 60)
                         }
@@ -330,8 +332,8 @@ struct SelfModelView: View {
 
     private var rulesSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            sectionLabel("Rules I may be living by")
-            ForEach(vm.selfModel.coreRules.filter(\.isActive)) { h in
+            sectionLabel("Rules you seem to run on")
+            ForEach(vm.selfModel.coreRules.filter { $0.isActive && $0.isProfileSurfaceable }) { h in
                 hypothesisCard(for: h)
             }
         }
@@ -341,8 +343,8 @@ struct SelfModelView: View {
 
     private var protectiveSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            sectionLabel("Protective moves")
-            ForEach(vm.selfModel.protectiveStrategies.filter(\.isActive)) { h in
+            sectionLabel("What you do when it gets hard")
+            ForEach(vm.selfModel.protectiveStrategies.filter { $0.isActive && $0.asHypothesis.isProfileSurfaceable }) { h in
                 protectiveCard(for: h)
             }
         }
@@ -363,9 +365,9 @@ struct SelfModelView: View {
 
     private var whatHelpsSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            sectionLabel("What softens it")
-            ForEach(vm.selfModel.whatHelps.filter(\.isActive)) { h in
-                hypothesisCard(for: h)
+            sectionLabel("What helps")
+            ForEach(vm.selfModel.whatHelps.filter { $0.isActive && $0.isProfileSurfaceable }) { h in
+                hypothesisCard(for: h, eyebrow: "what helps")
             }
         }
     }
@@ -374,7 +376,7 @@ struct SelfModelView: View {
 
     private var vocabularySection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            sectionLabel("Words that mean something here")
+            sectionLabel("Your words")
             FlowLayout(spacing: 8) {
                 ForEach(vm.selfModel.vocabulary, id: \.word) { entry in
                     VStack(alignment: .leading, spacing: 2) {
@@ -393,6 +395,55 @@ struct SelfModelView: View {
             }
             .softCard(cornerRadius: 22, padding: 16)
         }
+    }
+
+    // MARK: - People and the part you play (§5.6)
+
+    private var relationshipRolesSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            sectionLabel("People and the part you play")
+            ForEach(vm.selfModel.relationshipRoles) { role in
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(role.context)
+                        .font(AppTheme.editorialDisplay(size: 17, weight: .semibold))
+                        .foregroundStyle(AppTheme.ink)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(role.role)
+                        .font(AppTheme.editorialBody(size: 14))
+                        .foregroundStyle(AppTheme.inkSoft)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .softCard(cornerRadius: 20, padding: 16)
+            }
+        }
+    }
+
+    // MARK: - Empty state (§5.6)
+
+    /// True when every gated section came up empty — which at 7 entries is the
+    /// normal, correct state.
+    private var isProfileEmpty: Bool {
+        vm.selfModel.coreRules.filter { $0.isActive && $0.isProfileSurfaceable }.isEmpty &&
+        vm.selfModel.protectiveStrategies.filter { $0.isActive && $0.asHypothesis.isProfileSurfaceable }.isEmpty &&
+        vm.selfModel.whatHelps.filter { $0.isActive && $0.isProfileSurfaceable }.isEmpty &&
+        vm.selfModel.absences.filter(\.isActive).isEmpty &&
+        vm.selfModel.relationshipRoles.isEmpty &&
+        vm.selfModel.vocabulary.isEmpty
+    }
+
+    private var profileEmptyState: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Nothing here yet")
+                .font(AppTheme.editorialDisplay(size: 18, weight: .semibold))
+                .foregroundStyle(AppTheme.ink)
+            Text("This fills in when something shows up on three different days and holds up when Spilr checks it against your other entries.")
+                .font(AppTheme.editorialBody(size: 14))
+                .foregroundStyle(AppTheme.inkSoft)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .softCard(cornerRadius: 22, padding: 18)
     }
 
     // MARK: - Open questions section
@@ -423,10 +474,16 @@ struct SelfModelView: View {
 
     // MARK: - hypothesisCard
 
-    private func hypothesisCard(for h: SelfModelHypothesis) -> some View {
+    /// Shared card body for both `rulesSection` ("Rules I may be living by")
+    /// and `whatHelpsSection` ("What softens it") — they used to be
+    /// indistinguishable, both hardcoding the eyebrow "rule you may carry",
+    /// so an exception mislabelled itself as a rule
+    /// (mirror-v3-prd-2026-09-10.md §1). `eyebrow` lets each section speak
+    /// for itself again.
+    private func hypothesisCard(for h: SelfModelHypothesis, eyebrow: String = "rule you may carry") -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("rule you may carry")
+                Text(eyebrow)
                     .font(AppTheme.mono(size: 9))
                     .foregroundStyle(AppTheme.inkSoft)
                     .tracking(1)
@@ -446,8 +503,6 @@ struct SelfModelView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             metaChips(timesSeen: h.timesSeen, lastSeenAt: h.lastSeenAt, scope: h.scope.rawValue)
-
-            confidenceRow(for: h)
 
             cardActions(hypothesisId: h.id, isConfirmed: h.userStatus == .thisIsMe)
         }
@@ -545,8 +600,6 @@ struct SelfModelView: View {
 
             metaChips(timesSeen: h.timesSeen, lastSeenAt: h.lastSeenAt, scope: h.scope.rawValue)
 
-            confidenceRow(for: h.asHypothesis)
-
             cardActions(hypothesisId: h.id, isConfirmed: h.userStatus == .thisIsMe)
         }
         .softCard(cornerRadius: 24, padding: 18)
@@ -643,34 +696,16 @@ struct SelfModelView: View {
     /// against the two failure modes that actually lose trust: "that's obvious"
     /// costs nothing when the app called it a hunch, and "that's wrong" costs
     /// nothing when the app already said it hadn't checked.
-    private func confidenceRow(for h: SelfModelHypothesis) -> some View {
-        let caveat = h.evidenceCaveat
-        return VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(confidenceTint(h.confidenceBand))
-                    .frame(width: 6, height: 6)
-                Text(h.confidenceBand.rawValue)
-                    .font(AppTheme.mono(size: 10))
-                    .foregroundStyle(AppTheme.inkSoft)
-                    .tracking(0.5)
-            }
-            if !caveat.isEmpty {
-                Text(caveat)
-                    .font(AppTheme.mono(size: 9))
-                    .foregroundStyle(AppTheme.inkSoft.opacity(0.75))
-            }
-        }
-    }
-
-    private func confidenceTint(_ band: SelfModelHypothesis.ConfidenceBand) -> Color {
-        switch band {
-        case .hunch:  return AppTheme.inkSoft.opacity(0.4)
-        case .maybe:  return AppTheme.terracotta.opacity(0.6)
-        case .likely: return AppTheme.terracotta
-        case .yours:  return AppTheme.mint
-        }
-    }
+    // MARK: - confidenceRow — DELETED (Mirror v3 M7)
+    //
+    // Printed the ConfidenceBand ("A hunch" / "Might be a thing" / …) and the
+    // evidence caveat under every card. Two problems, and the second is the
+    // real one: it put the internal ontology on screen, and on 17 of 19 cards
+    // the caveat it printed was "Not checked against other entries yet" —
+    // the app volunteering that it had not done its own homework, as a
+    // caption, on a claim about the reader. §5.6 shows only items that are
+    // audited or user-confirmed, which makes a confidence caption redundant
+    // by construction: everything on screen has already cleared the bar.
 
     private func metaChip(_ text: String) -> some View {
         Text(text)
@@ -682,19 +717,24 @@ struct SelfModelView: View {
             .clipShape(Capsule())
     }
 
+    /// TWO taps, not four (Mirror v3 §5.6).
+    ///
+    /// The old row was "This is me" / "Correct" / "This is done" / "Hide" on
+    /// EVERY card — 76 buttons on the account in the 9 Sept screenshots. The
+    /// two decisions a person actually makes about a claim are "yes that's me"
+    /// and "no it isn't"; the other two are housekeeping and belong behind the
+    /// overflow.
+    ///
+    /// "This is me" still lives here as well as on the Today card. Both write
+    /// `userStatus: this_is_me`, which is what unlocks the `user_confirmed`
+    /// lifecycle, the 0.85 confidence floor and the decay exemption.
     private func cardActions(hypothesisId: String, isConfirmed: Bool = false) -> some View {
         HStack(spacing: 10) {
-            // "This is me" lives HERE and nowhere else. Removing it from the daily
-            // card left the app with zero producers of `this_is_me`, which quietly
-            // made three things unreachable: the `user_confirmed` lifecycle, the
-            // "you confirmed this" confidence band, and the decay exemption — so
-            // no hypothesis could ever survive 45 days. This is the deliberate
-            // review context the signal was always meant to come from.
             Button {
                 vm.markHypothesis(id: hypothesisId,
                                   status: isConfirmed ? .unrated : .thisIsMe)
             } label: {
-                Text(isConfirmed ? "Confirmed" : "This is me")
+                Text(isConfirmed ? "Confirmed" : "That's me")
                     .font(.system(size: 13, weight: .semibold, design: .rounded))
                     .foregroundStyle(isConfirmed ? AppTheme.mint : AppTheme.ink)
                     .padding(.horizontal, 14)
@@ -711,7 +751,7 @@ struct SelfModelView: View {
                 vm.selectedHypothesisId = hypothesisId
                 vm.showCorrectionSheet = true
             } label: {
-                Text("Correct")
+                Text("Not quite")
                     .font(.system(size: 13, weight: .semibold, design: .rounded))
                     .foregroundStyle(AppTheme.ink)
                     .padding(.horizontal, 14)
@@ -720,34 +760,27 @@ struct SelfModelView: View {
             }
             .buttonStyle(.plain)
 
-            // THE FORGET AFFORDANCE. "Remembers everything" and "keeps bringing
-            // up what I've moved past" are the same feature, and users of every
-            // memory-heavy app describe the second one as the reason they quit.
-            // Without this, the only way to stop hearing about something you
+            Spacer()
+
+            // THE FORGET AFFORDANCE, kept but demoted. "Remembers everything"
+            // and "keeps bringing up what I've moved past" are the same
+            // feature, and the second is why people quit memory-heavy apps.
+            // Without it, the only way to stop hearing about something you
             // have genuinely resolved is to tell the app it was wrong — which
             // poisons the corrections that are meant to be ground truth.
-            Button {
-                vm.closeHypothesis(id: hypothesisId)
+            Menu {
+                Button("This is done") { vm.closeHypothesis(id: hypothesisId) }
+                Button("Hide from profile", role: .destructive) {
+                    vm.hideHypothesis(id: hypothesisId)
+                }
             } label: {
-                Text("This is done")
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
-                    .foregroundStyle(AppTheme.mint)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 9)
-                    .overlay(Capsule().stroke(AppTheme.mint.opacity(0.5), lineWidth: 1))
-            }
-            .buttonStyle(.plain)
-
-            Button {
-                vm.hideHypothesis(id: hypothesisId)
-            } label: {
-                Text("Hide")
-                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(AppTheme.inkSoft)
-                    .padding(.horizontal, 14)
+                    .padding(.horizontal, 10)
                     .padding(.vertical, 9)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
         }
     }
 

@@ -102,11 +102,32 @@ struct SelfModelHypothesis: Identifiable {
 
     /// One honest line about how well-tested this is. Empty when there is
     /// nothing truthful to say, because silence beats false reassurance.
+    /// May this item appear in the profile at all? (Mirror v3 §5.6.)
+    ///
+    /// Either the user confirmed it, or it recurred on 3+ distinct entries AND
+    /// an audit actually ran and did not drop it. Everything else stays in the
+    /// corpus, invisible — which is what makes the "A hunch · Not checked
+    /// against other entries yet" caption unnecessary rather than merely
+    /// hidden. The app should not show you something and simultaneously tell
+    /// you it hasn't checked it.
+    var isProfileSurfaceable: Bool {
+        if userStatus == .thisIsMe { return true }
+        guard timesSeen >= 3 else { return false }
+        guard testedAgainstEntries > 0 else { return false }
+        return disconfirmationVerdict != "drop"
+    }
+
     var evidenceCaveat: String {
         if disconfirmationVerdict == "weaken" {
             return "Softened after checking other entries"
         }
-        if testedAgainstEntries == 0 { return "Not checked against other entries yet" }
+        // The "Not checked against other entries yet" string is GONE (Mirror
+        // v3 M7). It appeared on 17 of 19 cards — the UI printing the ABSENCE
+        // of QA as though it were a finding about the user. Unaudited items
+        // are no longer shown at all (see `isProfileSurfaceable`), so this
+        // branch is unreachable rather than merely hidden; returning empty
+        // keeps it that way if the gate above is ever relaxed.
+        if testedAgainstEntries == 0 { return "" }
         if counterEvidenceEntryIds.isEmpty {
             return "Held up against \(testedAgainstEntries) other entries"
         }
@@ -544,6 +565,11 @@ struct SelfModel {
     /// the fastest way to prove the app isn't actually reading.
     var absences: [SelfModelHypothesis]
 
+    /// `patternType == .bodySignal` hypotheses. Previously mined, scored, and
+    /// then silently dropped — `updateSelfModel` had no bucket for them at all
+    /// (Mirror v3 bucketing fix, mirror-v3-prd-2026-09-10.md §11.1).
+    var bodySignals: [SelfModelHypothesis]
+
     var relationshipRoles: [RelationshipRole]
     var vocabulary: [VocabularyEntry]
 
@@ -577,6 +603,7 @@ struct SelfModel {
             contradictions: [],
             whatHelps: [],
             absences: [],
+            bodySignals: [],
             relationshipRoles: [],
             vocabulary: [],
             doNotInfer: defaultDoNotInfer
@@ -597,6 +624,7 @@ struct SelfModel {
         contradictions: [SelfModelHypothesis] = [],
         whatHelps: [SelfModelHypothesis] = [],
         absences: [SelfModelHypothesis] = [],
+        bodySignals: [SelfModelHypothesis] = [],
         relationshipRoles: [RelationshipRole] = [],
         vocabulary: [VocabularyEntry] = [],
         doNotInfer: [String] = defaultDoNotInfer,
@@ -613,6 +641,7 @@ struct SelfModel {
         self.contradictions       = contradictions
         self.whatHelps            = whatHelps
         self.absences             = absences
+        self.bodySignals          = bodySignals
         self.relationshipRoles    = relationshipRoles
         self.vocabulary           = vocabulary
         self.writtenBy            = writtenBy
@@ -650,6 +679,8 @@ struct SelfModel {
             .compactMap { SelfModelHypothesis(from: $0) }
         self.absences = (data["absences"] as? [[String: Any]] ?? [])
             .compactMap { SelfModelHypothesis(from: $0) }
+        self.bodySignals = (data["bodySignals"] as? [[String: Any]] ?? [])
+            .compactMap { SelfModelHypothesis(from: $0) }
         self.writtenBy = data["writtenBy"] as? String ?? "client"
         self.relationshipRoles = (data["relationshipRoles"] as? [[String: Any]] ?? [])
             .compactMap { RelationshipRole(from: $0) }
@@ -677,6 +708,7 @@ struct SelfModel {
             "contradictions":       contradictions.map { $0.toFirestoreData() },
             "whatHelps":            whatHelps.map { $0.toFirestoreData() },
             "absences":             absences.map { $0.toFirestoreData() },
+            "bodySignals":          bodySignals.map { $0.toFirestoreData() },
             "relationshipRoles":    relationshipRoles.map { $0.toFirestoreData() },
             "vocabulary":           vocabulary.map { $0.toFirestoreData() },
             "doNotInfer":           doNotInfer,

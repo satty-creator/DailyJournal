@@ -3,8 +3,10 @@
 //
 // Mirror Engine AI layer: per-entry deep analysis, plus the client's read side
 // of the server-generated Mirror card deck.
-// Prompt A (mirror-extract-v1)   — analyzeEntry          → EntryAnalysis
-// Prompt F (mirror-narrative-v1) — generateMirrorNarrative → MirrorNarrative?
+// Prompt A (mirror-extract-v2)   — analyzeEntry → EntryAnalysis. The ONLY
+// LLM call this file still makes: Prompt F (mirror-narrative-v1) was deleted
+// in Mirror v3, so the Mirror surface now makes no client-side model call at
+// all, on open or otherwise.
 //
 // Prompts B/D/E (mining, card write, card guard) moved server-side —
 // functions/index.js `mineHypothesesForUser` / `generateMirrorDeck` /
@@ -46,6 +48,12 @@ extension AIService {
         entryId: String,
         userId: String,
         text: String,
+        // The ENTRY's own createdAt — typed passthrough, not model output.
+        // Mirror v3's FactsJob needs it to bucket the entry into the right
+        // local day/band without depending on `entryAnalyses.createdAt`
+        // (which is when this ANALYSIS ran, and moves on re-analysis —
+        // mirror-v3-prd-2026-09-10.md §1.3).
+        entryCreatedAt: Date? = nil,
         // Typed passthrough for a guided-template entry (Phase 5) — never
         // model output, so there's nothing here for the model to invent.
         templateId: String? = nil,
@@ -56,6 +64,11 @@ extension AIService {
             guard let templateId, let before = templateScaleBefore, let after = templateScaleAfter else { return nil }
             return TemplateDelta(templateId: templateId, before: before, after: after)
         }()
+        // Same formula as `JournalEntry.wordCount` — computed here, not
+        // passed by the caller, so the two numbers can never disagree.
+        // Available regardless of AI outcome; `content` is encrypted at rest,
+        // so this is the server's only way to ever see it.
+        let wordCount = text.split(separator: " ").count
 
         guard isAIAvailable else {
             return EntryAnalysis.local(entryId: entryId, userId: userId, text: text)
@@ -107,6 +120,7 @@ extension AIService {
         if templateDelta != nil {
             analysis = analysis.withTemplateDelta(templateDelta)
         }
+        analysis = analysis.withEntryMeta(entryCreatedAt: entryCreatedAt, wordCount: wordCount)
 
         // Fire-and-forget persist (completion-handler form, no try/await — matches app-wide pattern)
         var doc = analysis.toFirestoreData()
@@ -156,6 +170,41 @@ extension AIService {
         _ = try? await URLSession.shared.data(for: request)
     }
 
+    /// Triggers the server's on-demand derived-layer recompute
+    /// (`functions:refreshDerived`) for an account whose `derived/facts` /
+    /// `derived/threads` / `readings/{date}` have never been written — most
+    /// commonly a RETURNING user on a fresh install, where `bootstrapMirror`
+    /// above refuses outright (it only ever fires once per account, gated on
+    /// `lastMineRunAt`). This is the fallback for that case: same
+    /// `runDerivedForUser` the nightly cron calls, invoked synchronously
+    /// instead of waiting for the next 04:00 UTC run.
+    ///
+    /// Pure arithmetic server-side — no Gemini call, no cost ceiling to
+    /// respect — so this can be called far more liberally than
+    /// `bootstrapMirror`. The server still enforces its own short cooldown
+    /// per uid; `MirrorViewModel.refreshDerivedIfNeeded` adds a longer local
+    /// one on top just to avoid a pointless round trip on every Mirror open.
+    ///
+    /// Never throws; a failure just means the user waits for the next
+    /// nightly run, same as any other AI-adjacent degrade in this app.
+    func refreshDerived(userId: String) async {
+        guard let token = await idToken() else { return }
+
+        var request = URLRequest(url: URL(string: Self.refreshDerivedURLString)!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let appCheckToken = try? await AppCheck.appCheck().token(forcingRefresh: false) {
+            request.setValue(appCheckToken.token, forHTTPHeaderField: "X-Firebase-AppCheck")
+        }
+        // Pure arithmetic over a bounded lookback window — much faster than
+        // bootstrapMirror's mine + deck chain, but still give it real
+        // headroom rather than the 25s single-round-trip default.
+        request.timeoutInterval = 60
+
+        _ = try? await URLSession.shared.data(for: request)
+    }
+
     // MARK: - Fetch a card from the server-generated deck
 
     /// Reads one card from `users/{uid}/mirrorCards/{hypothesisId}` — the deck
@@ -184,145 +233,19 @@ extension AIService {
 
     /// Generates a 3-4 sentence psychological sketch from the top hypotheses.
     /// Returns nil on failure — never throws. Cached weekly by the caller.
-    func generateMirrorNarrative(
-        userId: String,
-        hypotheses: [PatternHypothesis]
-    ) async -> MirrorNarrative? {
-        guard isAIAvailable, hypotheses.count >= 3 else { return nil }
-
-        let prompt = buildMirrorNarrativePrompt(hypotheses: hypotheses)
-        guard let data = try? await generate(
-            prompt: prompt,
-            maxTokens: 500,
-            temperature: 0.5,
-            surface: "mirror_narrative"
-        ) else { return nil }
-
-        return parseMirrorNarrativeResponse(data)
-    }
-
-    private func buildMirrorNarrativePrompt(hypotheses: [PatternHypothesis]) -> String {
-        let rendered = hypotheses.prefix(5).enumerated().map { idx, h in
-            let quotes = h.evidence.prefix(2).map { "\"\($0.quote)\"" }.joined(separator: "; ")
-            let daysSince = Calendar.current.dateComponents([.day], from: h.firstSeenAt, to: Date()).day ?? 0
-            return """
-            \(idx + 1). "\(h.userFacingTitle)"
-               Hypothesis: \(h.coreHypothesis)
-               Protection: \(h.protection ?? "—")
-               Cost: \(h.cost ?? "—")
-               Evidence: \(quotes.isEmpty ? "—" : quotes)
-               Seen \(h.timesSeen)× over \(daysSince) days
-            """
-        }.joined(separator: "\n\n")
-
-        let exceptions = hypotheses
-            .filter { $0.patternType == .exception }
-            .prefix(3)
-            .map { "- \($0.userFacingTitle): \($0.coreHypothesis)" }
-            .joined(separator: "\n")
-
-        let phrases = hypotheses
-            .flatMap(\.evidence)
-            .prefix(6)
-            .map { "\"\($0.quote)\"" }
-            .joined(separator: ", ")
-
-        return """
-        \(SpilrVoice.safetyRules)
-
-        TASK: Write a 3-4 sentence sketch of this person based on their patterns.
-        Talk to them directly ("you"). Plain English, no poetry.
-
-        RULES:
-        - Every sentence must be immediately clear on first read. 8th-grade reading level.
-          If you reach for a metaphor, delete it and say what you actually mean.
-        - Use their exact phrases in quotes — the sketch must sound like THEM, not like a therapist
-        - Name specific situations, people, and days — not abstractions
-        - Name what's WORKING (exceptions, what softens) alongside what loops
-        - Everything is a hypothesis — "seems", "may", "might"
-        - No diagnosis, no clinical terms, no trauma inference, no self-help language
-        - Must pass the horoscope test: must contain details only this person would recognize
-        - Write like a smart friend summarizing what they've noticed, not a wellness app
-        - NEVER name a psychological label, even a popular one — not
-          "perfectionism", "people-pleasing", "catastrophising", "imposter
-          syndrome", "fear of failure", "inner critic", "core belief", and not
-          "your worth is tied to your productivity". A label is interchangeable
-          across millions of people, which makes it the exact opposite of a
-          sketch of THIS person. Say what they DO, in the words they used.
-        - Every sentence must be checkable against a specific entry. If you
-          cannot point at the entry it came from, cut the sentence.
-
-        PATTERNS (ranked by evidence strength):
-        \(rendered)
-
-        EXCEPTIONS (what helped):
-        \(exceptions.isEmpty ? "(none yet)" : exceptions)
-
-        VOCABULARY (their distinctive phrases):
-        \(phrases.isEmpty ? "(none)" : phrases)
-
-        \(MemoryProfileService.shared.cachedPromptContext())
-
-        Return ONLY valid JSON:
-        {
-          "narrative": "3-4 sentences, direct address, their language",
-          "shifting": [
-            {"direction": "growing|fading", "signal": "what specifically", "evidence": "brief"}
-          ],
-          "openQuestion": "one question this sketch raises but can't yet answer"
-        }
-        """
-    }
-
-    private func parseMirrorNarrativeResponse(_ data: Data) -> MirrorNarrative? {
-        guard
-            let root    = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let cands   = root["candidates"] as? [[String: Any]],
-            let first   = cands.first,
-            let content = first["content"] as? [String: Any],
-            let parts   = content["parts"] as? [[String: Any]],
-            let rawText = parts.first?["text"] as? String,
-            let jsonData = rawText.data(using: .utf8),
-            let json    = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
-            let narrative = json["narrative"] as? String,
-            !narrative.isEmpty
-        else { return nil }
-
-        // OUTPUT-SIDE LINT. The narrative is the first thing the user reads on
-        // the Mirror screen and it previously shipped straight to Firestore with
-        // no deterministic check — the only profile surface with none. Prompt
-        // rules are a request; this is the enforcement. Silence beats a bad
-        // sketch, so a trip returns nil and the section simply doesn't render.
-        guard !SpilrVoice.tripsLint(narrative) else {
-            #if DEBUG
-            print("Mirror narrative suppressed by lint")
-            #endif
-            return nil
-        }
-
-        let shifting: [MirrorNarrative.ShiftSignal] = (json["shifting"] as? [[String: Any]] ?? [])
-            .compactMap { item in
-                guard
-                    let direction = item["direction"] as? String,
-                    let signal    = item["signal"]    as? String
-                else { return nil }
-                guard !SpilrVoice.tripsLint(signal) else { return nil }
-                return MirrorNarrative.ShiftSignal(
-                    direction: direction == "growing" ? .growing : .fading,
-                    signal: SpilrVoice.sentenceCased(signal),
-                    evidence: item["evidence"] as? String ?? ""
-                )
-            }
-
-        let openQuestion = json["openQuestion"] as? String
-        return MirrorNarrative(
-            narrative: SpilrVoice.sentenceCased(narrative),
-            shifting: shifting,
-            openQuestion: openQuestion.flatMap {
-                SpilrVoice.tripsLint($0) ? nil : SpilrVoice.sentenceCased($0)
-            }
-        )
-    }
+    // MARK: - generateMirrorNarrative — DELETED (Mirror v3, Week 6)
+    //
+    // Prompt F (mirror-narrative-v1) and its prompt/parser helpers are gone.
+    // This was the LAST client-side LLM call on the Mirror surface: a third
+    // prose writer over the same `patternHypotheses` the server already writes
+    // Mirror cards and the weekly letter from, generating on tab open, with no
+    // output lint beyond a banned-term check.
+    //
+    // §5.5's weekly letter replaces it — same job, but built on counted facts
+    // plus exactly one deterministic observation, linted against the full §6
+    // copy contract, dated, and archived so last month's is still readable.
+    // `SelfModelViewModel.loadNarrative` now only READS a narrative that was
+    // generated before this shipped.
 
     // MARK: - Life context injection
 
@@ -371,6 +294,11 @@ extension AIService {
         - Protective strategies are adaptive, not pathological. Frame them that way.
         - Do NOT infer diagnosis, trauma origin, attachment style, or mental disorder.
         - "may/might/seems" language throughout — these are observations, not verdicts.
+        - For "people": list at most 5 people actually named in the entry, by
+          first name or nickname exactly as the writer used it — never a
+          surname, and never someone the writer didn't name. "role" is the
+          part they play in this entry (e.g. "fixer", "the one I lean on"),
+          optional if nothing specific fits. Omit entirely if no one is named.
 
         Return ONLY valid JSON matching this exact schema:
         {
@@ -386,6 +314,7 @@ extension AIService {
           "valuesConflict": ["e.g. 'wants rest but feels productivity is the only valid use of time'"],
           "bodySignals": ["physical sensations mentioned or implied"],
           "relationshipRoles": ["e.g. fixer, peacekeeper, invisible one"],
+          "people": [{"name":"first name or nickname as written, max 5","role":"optional, e.g. fixer"}],
           "openLoops": ["unresolved situations or decisions mentioned"],
           "phrasesToTrack": ["distinctive words/phrases worth watching across future entries"],
           "possibleTinyAct": "one small, concrete experiment (optional — omit if nothing fits)",
@@ -452,6 +381,19 @@ extension AIService {
         let avoidanceMarkers: [AvoidanceMarker] = (json["avoidanceMarkers"] as? [[String: Any]] ?? [])
             .compactMap { AvoidanceMarker(from: $0) }
 
+        // Cap at 5 and de-dupe by lowercased name (last mention wins, keeping
+        // whatever role text came with it) — the prompt already asks for
+        // this, but a model can still ignore instructions.
+        var peopleByName: [String: PersonMention] = [:]
+        var peopleOrder: [String] = []
+        for dict in (json["people"] as? [[String: Any]] ?? []) {
+            guard let name = dict["name"] as? String, !name.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
+            let key = name.lowercased()
+            if peopleByName[key] == nil { peopleOrder.append(key) }
+            peopleByName[key] = PersonMention(name: name, role: dict["role"] as? String, mentions: 1)
+        }
+        let people: [PersonMention] = peopleOrder.prefix(5).compactMap { peopleByName[$0] }
+
         let episodes: [EpisodeFrame] = (json["episodes"] as? [[String: Any]] ?? [])
             .compactMap { dict -> EpisodeFrame? in
                 guard let situation = dict["situation"] as? String else { return nil }
@@ -483,11 +425,12 @@ extension AIService {
             valuesConflict:       valuesConflict,
             bodySignals:          bodySignals,
             relationshipRoles:    relationshipRoles,
+            people:               people,
             openLoops:            openLoops,
             phrasesToTrack:       phrasesToTrack,
             possibleTinyAct:      possibleTinyAct,
             episodes:             episodes,
-            promptVersion:        "mirror-extract-v1"
+            promptVersion:        "mirror-extract-v2"
         )
     }
 }

@@ -123,6 +123,27 @@ final class JournalService {
         return snapshot.documents.compactMap { JournalEntry(from: $0.data()) }
     }
 
+    // MARK: - Fetch, one page at a time (Journal list first paint)
+    //
+    // Same query as `fetchEntries`, but capped and cursored, so
+    // `JournalListViewModel` can paint the first ~10 rows immediately instead
+    // of waiting on the full 300-doc / cold-install fetch — then keep calling
+    // this in the background to fill in the rest for search, tag chips and
+    // the header count, which all compute over the full in-memory array.
+    func fetchEntriesPage(
+        for userId: String, limit: Int, after cursor: DocumentSnapshot?
+    ) async throws -> (entries: [JournalEntry], lastDoc: DocumentSnapshot?) {
+        var query = entriesCollection(for: userId)
+            .order(by: "createdAt", descending: true)
+            .limit(to: limit)
+        if let cursor { query = query.start(afterDocument: cursor) }
+        let snapshot = try await getDocuments(query)
+        return (
+            snapshot.documents.compactMap { JournalEntry(from: $0.data()) },
+            snapshot.documents.last
+        )
+    }
+
     // MARK: - Fetch recent (home screen)
     func fetchRecentEntries(for userId: String, limit: Int = 5) async throws -> [JournalEntry] {
         let snapshot = try await getDocuments(

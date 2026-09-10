@@ -117,6 +117,43 @@ enum FirestoreSchema {
     /// server can read a conversation.
     static let chatSessions = "chatSessions"
 
+    /// One doc per local date (`yyyy-MM-dd`) recording which hypothesis/line
+    /// was shown on the Mirror tab that day, for the 14-day novelty gate.
+    /// Client-written (`MirrorGraphService.markShown`). Was missing from this
+    /// file — per the RULE above, that means it silently survived account
+    /// deletion despite holding a `line` and `contentWords` lifted from the
+    /// user's own writing (mirror-v3-prd-2026-09-10.md, Week 1).
+    static let mirrorShown = "mirrorShown"
+
+    /// Single doc (`current`) — "how Spilr writes" for this user: sharpness,
+    /// muted pattern types, free-text style notes. Client-written
+    /// (`StylePreferencesService`). Was missing from this file; same fix as
+    /// `mirrorShown` above.
+    static let stylePreferences = "stylePreferences"
+
+    /// One doc per ISO week key — the Sunday weekly letter. Server-written
+    /// (`functions:buildUserWeeklyLetter`); the client patches `openedAt`.
+    /// Was missing from this file; same fix as `mirrorShown` above.
+    static let mirrorLetters = "mirrorLetters"
+
+    /// Mirror v3 Tier 0/3 — `facts`, `threads`, `firstSeven`. Server-written
+    /// by `functions:computeUserDerived`, client read-only. Purely derived: a
+    /// deleted `derived` doc costs nothing but a night's wait, which is why
+    /// the whole collection is safe to overwrite wholesale every run.
+    static let derived = "derived"
+
+    /// Mirror v3 Tier 1 — deterministic observations, ids being
+    /// `sha1(type + sorted terms)` so counts can change nightly while the
+    /// user's own `shownAt`/`userStatus`/`notQuiteCount` survive. Server-owned;
+    /// the client may update only those three fields (see firestore.rules).
+    static let observations = "observations"
+
+    /// Mirror v3 Tier 2 — one doc per local date, "today's one thing".
+    /// Server-written; the client may update only `userStatus`, `shownAt` and
+    /// `followUp`. Carries verbatim quotes from entries, so it must be erased
+    /// with the account.
+    static let readings = "readings"
+
     /// Every user subcollection this app has ever written to.
     ///
     /// Account deletion walks this list. Order is irrelevant. Retired collections
@@ -140,6 +177,12 @@ enum FirestoreSchema {
         pushTokens,
         rollups,
         chatSessions,
+        mirrorShown,
+        stylePreferences,
+        mirrorLetters,
+        derived,
+        observations,
+        readings,
     ]
 
     // MARK: - Storage

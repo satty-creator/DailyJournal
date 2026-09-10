@@ -23,7 +23,51 @@
         { "fieldPath": "mode", "order": "ASCENDING" },
         { "fieldPath": "updatedAt", "order": "DESCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "observations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "type", "order": "ASCENDING" },
+        { "fieldPath": "score", "order": "DESCENDING" }
+      ]
     }
   ],
-  "fieldOverrides": []
+  "fieldOverrides": [
+    {
+      "collectionGroup": "patternHypotheses",
+      "fieldPath": "embedding",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "observations",
+      "fieldPath": "entryIds",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "observations",
+      "fieldPath": "contrastEntryIds",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "observations",
+      "fieldPath": "terms",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "derived",
+      "fieldPath": "entryDates",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "derived",
+      "fieldPath": "entryMeta",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "derived",
+      "fieldPath": "firstSeen",
+      "indexes": []
+    }
+  ]
 }

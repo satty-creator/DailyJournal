@@ -11,43 +11,91 @@ import SwiftUI
 struct FirstSketchView: View {
 
     let selfModel: SelfModel
+    /// `users/{uid}/derived/firstSeven`, when the nightly job has written it
+    /// (Mirror v3 M8). Preferred over the SelfModel-derived cards below,
+    /// because it is built from COUNTED facts — "1,140 words in 7 days",
+    /// "'lucky' — 3 times, every time after 8pm" — rather than from truncated
+    /// hypothesis prose. Nil for an account the job hasn't reached, in which
+    /// case this falls back to the original behaviour.
+    var serverCard: FirstSevenCard? = nil
     let onDismiss: () -> Void
 
     @State private var ringAnimate = false
 
     private var sketchItems: [(eyebrow: String, title: String, sentence: String)] {
+        // Server-computed facts win. They carry real numbers the user can
+        // check, which is the entire point of the replacement (§5.7).
+        if let serverCard, !serverCard.cards.isEmpty {
+            var items = serverCard.cards.map {
+                (eyebrow: $0.eyebrow, title: $0.text, sentence: "")
+            }
+            if let title = serverCard.threadTitle {
+                items.append((eyebrow: "one thread so far",
+                              title: title,
+                              sentence: serverCard.threadN.map { "Seen on \($0) different days." } ?? ""))
+            } else if let observation = serverCard.observationText {
+                // Labelled honestly as an observation, NOT a pattern — at 7
+                // entries almost nobody has a thread, and saying so is what
+                // earns belief later (§5.7).
+                items.append((eyebrow: "an observation, not a pattern yet",
+                              title: observation, sentence: ""))
+            }
+            return Array(items.prefix(4))
+        }
+        // No character truncation here any more — the card's Text already has
+        // `.fixedSize(horizontal: false, vertical: true)` and wraps fully. A
+        // hard `prefix(120)` chop instead cut mid-word with no ellipsis and
+        // no visual signal that it happened (mirror-v3-prd-2026-09-10.md §1,
+        // "maybe to fend o").
         var items: [(String, String, String)] = []
 
         if let rule = selfModel.coreRules.first(where: { $0.stability != .retired }) {
             items.append(("rule you may carry", rule.title,
-                          rule.hypothesis.isEmpty ? rule.title : String(rule.hypothesis.prefix(120))))
+                          rule.hypothesis.isEmpty ? rule.title : rule.hypothesis))
         }
         if let protective = selfModel.protectiveStrategies.first(where: { $0.stability != .retired }) {
             items.append(("protective move", protective.title,
-                          protective.hypothesis.isEmpty ? protective.title : String(protective.hypothesis.prefix(120))))
+                          protective.hypothesis.isEmpty ? protective.title : protective.hypothesis))
         }
         if let part = selfModel.innerParts.first(where: { $0.confidence > 0.3 }) {
             items.append(("part that shows up", part.name,
-                          part.description.isEmpty ? part.name : String(part.description.prefix(120))))
+                          part.description.isEmpty ? part.name : part.description))
         }
         if let help = selfModel.whatHelps.first(where: { $0.stability != .retired }) {
             items.append(("what softens it", help.title,
-                          help.hypothesis.isEmpty ? help.title : String(help.hypothesis.prefix(120))))
+                          help.hypothesis.isEmpty ? help.title : help.hypothesis))
         }
 
         return Array(items.prefix(4))
     }
 
+    /// A real question, verbatim — never a declarative hypothesis title with
+    /// "?" appended. `coreRules`/`protectiveStrategies` titles are statements
+    /// ("You go quiet when things get close"), and appending "?" to one
+    /// produced a bare tag question at best and a doubled "…?" at worst when
+    /// the title already ended in punctuation
+    /// (mirror-v3-prd-2026-09-10.md §1). Until the miner writes an actual
+    /// question field onto these hypotheses, there is no source that
+    /// qualifies — this returns nil and `questionCard` is simply omitted (M8).
     private var openQuestion: String? {
+        if let serverQuestion = serverCard?.question,
+           serverQuestion.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?") {
+            return serverQuestion
+        }
+        func asQuestion(_ title: String) -> String? {
+            let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasSuffix("?") else { return nil }
+            return trimmed
+        }
         if let unratedRule = selfModel.coreRules.first(where: {
             $0.userStatus == .unrated && $0.stability == .emerging
-        }) {
-            return unratedRule.title
+        }), let q = asQuestion(unratedRule.title) {
+            return q
         }
         if let unratedProtective = selfModel.protectiveStrategies.first(where: {
             $0.userStatus == .unrated && $0.stability == .emerging
-        }) {
-            return unratedProtective.title
+        }), let q = asQuestion(unratedProtective.title) {
+            return q
         }
         return nil
     }
@@ -89,7 +137,7 @@ struct FirstSketchView: View {
                 .foregroundStyle(AppTheme.ink)
                 .multilineTextAlignment(.center)
 
-            Text("From 7 spills, here is what Spilr is learning to watch.")
+            Text("From \(serverCard?.entriesAtUnlock ?? 7) spills, here is what Spilr is learning to watch.")
                 .font(AppTheme.editorialBody(size: 16))
                 .foregroundStyle(AppTheme.inkSoft)
                 .multilineTextAlignment(.center)
@@ -114,7 +162,7 @@ struct FirstSketchView: View {
                 )
                 .rotationEffect(.degrees(-90))
 
-            Text("7")
+            Text("\(serverCard?.entriesAtUnlock ?? 7)")
                 .font(AppTheme.editorialDisplay(size: 32, weight: .bold))
                 .foregroundStyle(AppTheme.ink)
         }
@@ -156,7 +204,7 @@ struct FirstSketchView: View {
                 .foregroundStyle(AppTheme.inkSoft)
                 .tracking(1)
 
-            Text("\(question)?")
+            Text(question)
                 .font(AppTheme.editorialDisplay(size: 18, weight: .semibold).italic())
                 .foregroundStyle(AppTheme.terracotta)
                 .fixedSize(horizontal: false, vertical: true)

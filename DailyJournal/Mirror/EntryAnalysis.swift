@@ -109,6 +109,39 @@ struct TemplateDelta {
     }
 }
 
+/// A person named in the entry, with the part they play — the structured
+/// counterpart to the flat `relationshipRoles: [String]` role words (which
+/// carry no name at all, e.g. "fixer", "peacekeeper"). Added in
+/// `mirror-extract-v2` for the Mirror v3 "This week, in your words" people
+/// row (mirror-v3-prd-2026-09-10.md §4 Tier 0). Forward-only: historical
+/// entries analysed under `mirror-extract-v1` will never have this — see the
+/// content-hash short-circuit in `AIService.analyzeEntry`, which is
+/// deliberately NOT re-triggered by a promptVersion bump.
+struct PersonMention {
+    let name: String
+    let role: String?
+    let mentions: Int
+
+    init(name: String, role: String?, mentions: Int) {
+        self.name     = name
+        self.role     = role
+        self.mentions = mentions
+    }
+
+    init?(from data: [String: Any]) {
+        guard let name = data["name"] as? String, !name.isEmpty else { return nil }
+        self.name     = name
+        self.role     = data["role"] as? String
+        self.mentions = data["mentions"] as? Int ?? 1
+    }
+
+    func toFirestoreData() -> [String: Any] {
+        var d: [String: Any] = ["name": name, "mentions": mentions]
+        if let role { d["role"] = role }
+        return d
+    }
+}
+
 struct AvoidanceMarker {
     let type: String
     let phrase: String
@@ -158,12 +191,29 @@ struct EntryAnalysis {
     let valuesConflict: [String]
     let bodySignals: [String]
     let relationshipRoles: [String]
+    /// Structured people (name + role), from `mirror-extract-v2` onward. See
+    /// `PersonMention`'s doc comment — `nil`/empty for anything analysed
+    /// before that prompt version.
+    let people: [PersonMention]
     let openLoops: [String]
     let phrasesToTrack: [String]
     let possibleTinyAct: String?
     let episodes: [EpisodeFrame]
     let promptVersion: String
     let createdAt: Date
+    /// The ENTRY's own createdAt (as opposed to `createdAt` above, which is
+    /// when this analysis was written) — a typed passthrough, not model
+    /// output. Needed because `entryAnalyses.createdAt` moves every time an
+    /// entry is re-analysed, which silently re-buckets the entry's date for
+    /// any nightly job that keys off it (e.g. the absence detector's
+    /// baseline-vs-recent window in functions/index.js `computeAbsences`).
+    /// `nil` for analyses written before this field existed.
+    let entryCreatedAt: Date?
+    /// Word count of the entry text at analysis time — typed, not model
+    /// output, since `entries.content` is encrypted at rest and the server
+    /// can't otherwise see it. `nil` until the entry has been (re-)analysed
+    /// under a build that sets this.
+    let wordCount: Int?
     /// Typed passthrough from the entry, not model output — see TemplateDelta.
     let templateDelta: TemplateDelta?
 
@@ -184,12 +234,15 @@ struct EntryAnalysis {
         valuesConflict: [String],
         bodySignals: [String],
         relationshipRoles: [String],
+        people: [PersonMention] = [],
         openLoops: [String],
         phrasesToTrack: [String],
         possibleTinyAct: String? = nil,
         episodes: [EpisodeFrame],
         promptVersion: String,
         createdAt: Date = Date(),
+        entryCreatedAt: Date? = nil,
+        wordCount: Int? = nil,
         templateDelta: TemplateDelta? = nil
     ) {
         self.entryId              = entryId
@@ -206,12 +259,15 @@ struct EntryAnalysis {
         self.valuesConflict       = valuesConflict
         self.bodySignals          = bodySignals
         self.relationshipRoles    = relationshipRoles
+        self.people               = people
         self.openLoops            = openLoops
         self.phrasesToTrack       = phrasesToTrack
         self.possibleTinyAct      = possibleTinyAct
         self.episodes             = episodes
         self.promptVersion        = promptVersion
         self.createdAt            = createdAt
+        self.entryCreatedAt       = entryCreatedAt
+        self.wordCount            = wordCount
         self.templateDelta        = templateDelta
     }
 
@@ -241,6 +297,8 @@ struct EntryAnalysis {
         self.valuesConflict     = data["valuesConflict"]     as? [String] ?? []
         self.bodySignals        = data["bodySignals"]        as? [String] ?? []
         self.relationshipRoles  = data["relationshipRoles"]  as? [String] ?? []
+        self.people             = (data["people"] as? [[String: Any]] ?? [])
+            .compactMap { PersonMention(from: $0) }
         self.openLoops          = data["openLoops"]          as? [String] ?? []
         self.phrasesToTrack     = data["phrasesToTrack"]     as? [String] ?? []
         self.possibleTinyAct    = data["possibleTinyAct"]    as? String
@@ -248,6 +306,8 @@ struct EntryAnalysis {
             .compactMap { EpisodeFrame(from: $0) }
         self.promptVersion      = data["promptVersion"] as? String ?? "unknown"
         self.createdAt          = createdAt
+        self.entryCreatedAt     = (data["entryCreatedAt"] as? Timestamp)?.dateValue()
+        self.wordCount          = data["wordCount"] as? Int
         self.templateDelta      = (data["templateDelta"] as? [String: Any]).flatMap { TemplateDelta(from: $0) }
     }
 
@@ -269,6 +329,7 @@ struct EntryAnalysis {
             "valuesConflict":       valuesConflict,
             "bodySignals":          bodySignals,
             "relationshipRoles":    relationshipRoles,
+            "people":               people.map { $0.toFirestoreData() },
             "openLoops":            openLoops,
             "phrasesToTrack":       phrasesToTrack,
             "episodes":             episodes.map { $0.toFirestoreData() },
@@ -276,6 +337,8 @@ struct EntryAnalysis {
             "createdAt":            Timestamp(date: createdAt)
         ]
         if let possibleTinyAct { d["possibleTinyAct"] = possibleTinyAct }
+        if let entryCreatedAt { d["entryCreatedAt"] = Timestamp(date: entryCreatedAt) }
+        if let wordCount { d["wordCount"] = wordCount }
         if let templateDelta { d["templateDelta"] = templateDelta.toFirestoreData() }
         return d
     }
@@ -291,10 +354,32 @@ struct EntryAnalysis {
             protectiveStrategies: protectiveStrategies, avoidanceMarkers: avoidanceMarkers,
             cognitivePatterns: cognitivePatterns, valuesPresent: valuesPresent,
             valuesConflict: valuesConflict, bodySignals: bodySignals,
-            relationshipRoles: relationshipRoles, openLoops: openLoops,
+            relationshipRoles: relationshipRoles, people: people, openLoops: openLoops,
             phrasesToTrack: phrasesToTrack, possibleTinyAct: possibleTinyAct,
             episodes: episodes, promptVersion: promptVersion, createdAt: createdAt,
+            entryCreatedAt: entryCreatedAt, wordCount: wordCount,
             templateDelta: delta
+        )
+    }
+
+    /// Copy with the entry's own `createdAt` and word count attached — typed
+    /// passthroughs, not model output. Applied once, right before persisting
+    /// a freshly-parsed analysis (see `AIService.analyzeEntry`); never
+    /// applied to a cache-hit, so re-opening an unchanged entry doesn't pay a
+    /// write just to backfill these two fields.
+    func withEntryMeta(entryCreatedAt: Date?, wordCount: Int?) -> EntryAnalysis {
+        EntryAnalysis(
+            entryId: entryId, userId: userId, surfaceSummary: surfaceSummary,
+            lifeDomains: lifeDomains, explicitEmotions: explicitEmotions,
+            inferredEmotions: inferredEmotions, needs: needs,
+            protectiveStrategies: protectiveStrategies, avoidanceMarkers: avoidanceMarkers,
+            cognitivePatterns: cognitivePatterns, valuesPresent: valuesPresent,
+            valuesConflict: valuesConflict, bodySignals: bodySignals,
+            relationshipRoles: relationshipRoles, people: people, openLoops: openLoops,
+            phrasesToTrack: phrasesToTrack, possibleTinyAct: possibleTinyAct,
+            episodes: episodes, promptVersion: promptVersion, createdAt: createdAt,
+            entryCreatedAt: entryCreatedAt, wordCount: wordCount,
+            templateDelta: templateDelta
         )
     }
 

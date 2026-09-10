@@ -403,8 +403,8 @@ final class DailyChatViewModel: ObservableObject {
     // MARK: - Save the woven entry
     //
     // Mirrors TimedSessionViewModel.saveEntry: save instantly with local heuristics,
-    // then enrich (insights / echo / river) in detached background tasks. The only
-    // difference is sessionType == .dailyChat.
+    // then enrich via the shared EntryEnrichment tail. The only difference is
+    // sessionType == .dailyChat (or .cbtReframe).
 
     func save(entryText: String) {
         let trimmed = entryText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -446,34 +446,15 @@ final class DailyChatViewModel: ObservableObject {
             wovenEntryId: entry.id
         ))
 
-        // Background enrichment — silent on failure, never blocks.
-        let svc            = service
-        let entryId        = entry.id
-        let uid            = userId
-        let entryCreatedAt = entry.createdAt
-
-        Task.detached(priority: .utility) {
-            guard let insights = try? await AIService.shared.generateInsights(from: trimmed) else { return }
-            svc.updateEntryInsights(entryId: entryId, userId: uid, insights: insights)
-        }
-        Task.detached(priority: .background) {
-            await EchoExtractionService.shared.extractAndStore(
-                entryText:      trimmed,
-                entryId:        entryId,
-                userId:         uid,
-                entryCreatedAt: entryCreatedAt
-            )
-        }
-        // Mirror analysis (Prompt A) — the woven chat entry feeds the same
-        // structured EntryAnalysis pipeline as free-write and 90-second entries.
-        // Self-persisting, never throws.
-        Task.detached(priority: .background) {
-            _ = await AIService.shared.analyzeEntry(
-                entryId: entryId,
-                userId:  uid,
-                text:    trimmed
-            )
-        }
+        // Background enrichment — silent on failure, never blocks. Shared with
+        // every other composer via `EntryEnrichment`.
+        EntryEnrichment.run(
+            entryId: entry.id,
+            userId: userId,
+            entryCreatedAt: entry.createdAt,
+            text: trimmed,
+            service: service
+        )
     }
 }
 

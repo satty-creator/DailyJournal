@@ -145,14 +145,31 @@ final class HomeViewModel: ObservableObject {
             }
         }
 
+        // These three all fetch the full entry corpus (or close to it), and
+        // their own throttles (crisis-scan's ~20h window, the memory-profile
+        // build's cache, the event backfill's cursor) are all UserDefaults —
+        // gone on a fresh install, so all three fire at once, unthrottled,
+        // on exactly the launch where the connection is also busiest (App
+        // Attest is being minted for the first time). That queues out
+        // whatever the user taps to next — most visibly the Journal tab's
+        // own entry fetch. A few seconds' delay costs these jobs nothing
+        // (they're already fire-and-forget background work with no UI
+        // waiting on them) and lets the user's own first tap win the
+        // connection instead.
+        let corpusJobDelayNanos: UInt64 = 2_500_000_000
+
         // Kick off the crisis-corpus scan in the background (throttled to
         // ~once/20h inside the service).
-        Task { [weak self] in await self?.runDetection() }
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: corpusJobDelayNanos)
+            await self?.runDetection()
+        }
 
         // Prime the durable memory profile (and the AI prompt context it caches)
         // so hints/echoes/insights are personalised even before the user opens
         // the Echoes tab. Fire-and-forget; never blocks the home screen.
         Task.detached(priority: .utility) { [userId] in
+            try? await Task.sleep(nanoseconds: corpusJobDelayNanos)
             await MemoryProfileService.shared.build(for: userId)
         }
 
@@ -161,6 +178,7 @@ final class HomeViewModel: ObservableObject {
         // history has been walked (or if they have no pre-events analyses at
         // all). Fire-and-forget, same tolerance as the memory-profile prime.
         Task.detached(priority: .utility) { [userId] in
+            try? await Task.sleep(nanoseconds: corpusJobDelayNanos)
             await EventService.shared.backfillIfNeeded(for: userId)
         }
     }
@@ -255,6 +273,16 @@ struct HomeView: View {
     /// `JournalTemplate`'s `Identifiable` id lets this drive
     /// `.fullScreenCover(item:)` directly.
     @State private var runningTemplate: JournalTemplate?
+    /// Set by `TemplateRunnerView.onExitWithoutSaving` right before it calls
+    /// `dismiss()`. The Templates gallery the runner was opened from lives on
+    /// the start sheet's own `NavigationStack` and is already torn down by
+    /// the time the runner is on screen (see `handlePendingStart`) — so
+    /// without this, every exit lands on Home instead of back on the gallery
+    /// to browse another exercise. Read (and reset) in the cover's
+    /// `onDismiss`, once the runner is actually gone, for the same
+    /// can't-present-while-dismissing reason `pendingStart` is stashed rather
+    /// than acted on directly.
+    @State private var returnToTemplatesGalleryOnDismiss = false
 
     @ObservedObject private var mirrorVM: MirrorViewModel
 
@@ -419,7 +447,12 @@ struct HomeView: View {
                         })
                     }
                 }
-                .presentationDetents(startPath.isEmpty ? [.height(420)] : [.large])
+                // 420 used to leave the invitation card's cream "Begin →"
+                // button peeking out above the sheet's rounded top corner —
+                // it read as a stray shape stuck to the modal. 500 clears the
+                // card entirely, `dayOne` copy included (its body text runs
+                // longer than the returning-user copy).
+                .presentationDetents(startPath.isEmpty ? [.height(500)] : [.large])
                 // `StartOptionsView` draws its own drag-handle capsule, so the
                 // system indicator stays hidden here too — otherwise the two
                 // overlap on the options screen.
@@ -440,15 +473,28 @@ struct HomeView: View {
                     await (fast, reload)
                     checkFirstEntry()
                 }
-            }) { template in
-                TemplateRunnerView(userId: vm.userId, template: template) {
-                    Task {
-                        async let fast: () = checkFirstEntryFast()
-                        async let reload: () = vm.load()
-                        await (fast, reload)
-                        checkFirstEntry()
-                    }
+                if returnToTemplatesGalleryOnDismiss {
+                    returnToTemplatesGalleryOnDismiss = false
+                    // Reopens the start sheet straight onto the gallery,
+                    // rather than the options screen it normally starts on —
+                    // mirrors `onOpenTemplates` pushing `.templates`.
+                    startPath = [.templates]
+                    showingStartSheet = true
                 }
+            }) { template in
+                TemplateRunnerView(
+                    userId: vm.userId,
+                    template: template,
+                    onSave: {
+                        Task {
+                            async let fast: () = checkFirstEntryFast()
+                            async let reload: () = vm.load()
+                            await (fast, reload)
+                            checkFirstEntry()
+                        }
+                    },
+                    onExitWithoutSaving: { returnToTemplatesGalleryOnDismiss = true }
+                )
             }
             .sheet(item: $celebrationEntry, onDismiss: {
                 firstEntryCelebrationShown = true

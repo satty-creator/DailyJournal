@@ -248,9 +248,13 @@ struct MainTabView: View {
         }
         .environmentObject(router)
         .tint(AppTheme.terracotta)
-        .task {
+        // `.task(id: uid)` — not a bare `.task` — so this re-fires if `uid`
+        // changes after the tab first appears (e.g. auth resolves a beat
+        // after MainTabView does), instead of only ever running once against
+        // whatever `uid` happened to be at that moment.
+        .task(id: uid) {
             guard !uid.isEmpty else { return }
-            mirrorVM.userId = uid
+            mirrorVM.setUserId(uid)
             await mirrorVM.load(showSpinner: false)
         }
     }
@@ -265,6 +269,9 @@ struct ProfileView: View {
     @State private var showDeleteConfirmation = false
     @State private var showGuestUpgrade = false
     @State private var showPaywall = false
+    #if DEBUG
+    @State private var debugTokenStatus: String? = nil
+    #endif
 
     var body: some View {
         NavigationStack {
@@ -458,6 +465,33 @@ struct ProfileView: View {
                             .foregroundStyle(AppTheme.inkSoft)
                     }
 
+                    #if DEBUG
+                    // MARK: Dev tools — Mirror v3 manual testing
+                    //
+                    // `runNightlyForUser` (functions/index.js) needs a real Firebase
+                    // ID token in its Authorization header, same contract as
+                    // geminiProxy. There's no UI anywhere else to get one, and it's
+                    // the only way to trigger the nightly pipeline without waiting
+                    // for 04:00 UTC — see MIRROR_V3_TEST_CASES.md §3.
+                    Section {
+                        Button {
+                            Task { await copyDebugIDToken() }
+                        } label: {
+                            Label(debugTokenStatus ?? "Copy ID token for testing",
+                                  systemImage: "key")
+                                .font(.system(size: 15))
+                        }
+                        .listRowBackground(AppTheme.cream)
+                    } header: {
+                        Text("Debug")
+                            .foregroundStyle(AppTheme.inkSoft)
+                    } footer: {
+                        Text("Paste this as the Bearer token when calling runNightlyForUser. Expires in about an hour — copy a fresh one if a call starts returning 401.")
+                            .font(.caption)
+                            .foregroundStyle(AppTheme.inkSoft)
+                    }
+                    #endif
+
                     // MARK: Sign out / Delete account
                     Section {
                         Button(role: .destructive) {
@@ -565,6 +599,26 @@ struct ProfileView: View {
             .signInWithAppleDeleteSheet(authViewModel: authViewModel)
         }
     }
+
+    #if DEBUG
+    /// Copies a fresh Firebase ID token to the clipboard for manually calling
+    /// `runNightlyForUser` (see MIRROR_V3_TEST_CASES.md §3) — the only way to
+    /// exercise the nightly pipeline without waiting for the 04:00 UTC cron,
+    /// since the Firebase emulator doesn't implement task queues.
+    ///
+    /// Reuses `AIService.idToken()` — same fetch, same 10s timeout, same
+    /// contract geminiProxy already expects — rather than duplicating it here.
+    /// Works no matter how you signed in (email, Google, Apple): Firebase
+    /// issues the same kind of ID token regardless of provider.
+    private func copyDebugIDToken() async {
+        guard let token = await AIService.shared.idToken() else {
+            debugTokenStatus = "No signed-in user — sign in first"
+            return
+        }
+        UIPasteboard.general.string = token
+        debugTokenStatus = "Copied ✓ (paste within ~1 hour)"
+    }
+    #endif
 }
 
 // MARK: - SignInWithApple sheet for account deletion (Apple users)

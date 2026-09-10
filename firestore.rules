@@ -26,25 +26,123 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // Everything under a user's own document is private to that user: the profile
-    // doc itself AND every subcollection beneath it.
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    // True when a write changes ONLY the named fields. Used to let the client
+    // record its own feedback on a server-owned document without being able to
+    // rewrite the document's substance.
+    function onlyChanges(fields) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(fields);
+    }
+
+    // ── Per-user data ────────────────────────────────────────────────────
     //
-    // Why the recursive wildcard: the app stores a growing set of per-user
-    // subcollections (entries, echoes, moodLogs, patternCallbacks, riverMarks,
-    // dailyReads, pushTokens, selfModel, profileCorrections, patternHypotheses,
-    // entryAnalyses, mirror cards/graph, …). Whitelisting them one by one meant any
-    // NEW subcollection was silently denied — which is exactly what starved the AI
-    // of context (selfModel / patternHypotheses / entryAnalyses all failed with
-    // "Missing or insufficient permissions"). A single owner-scoped recursive rule
-    // covers the whole subtree and prevents that class of bug from recurring.
+    // READ stays recursive; WRITE does not.
     //
-    // Cloud Functions use the Admin SDK, which bypasses these rules entirely, so the
-    // overnight generators are unaffected.
+    // WHY READ IS STILL A WILDCARD: the app stores a growing set of per-user
+    // subcollections, and whitelisting them one by one meant any NEW
+    // subcollection was silently DENIED — which is exactly what starved the AI
+    // of context once already (selfModel / patternHypotheses / entryAnalyses
+    // all failing with "Missing or insufficient permissions"). A single
+    // owner-scoped recursive read prevents that class of bug from recurring,
+    // and reading your own data is never the risk here.
+    //
+    // WHY WRITE IS NOT: `patternHypotheses`, `selfModel`, `mirrorCards`,
+    // `derived`, `observations` and `readings` are written by the Admin SDK
+    // and are meant to be server truth. Under a recursive write rule any
+    // client could forge a hypothesis, rewrite an observation's counts, or
+    // delete the Self Model — and "evidence-backed, correctable" is the
+    // product's actual promise, so a model the client can silently rewrite is
+    // not evidence-backed (engineering-decisions-ai-architecture §5.3).
+    //
+    // CRITICAL, AND EASY TO GET WRONG: Firestore rules are OR'd, not
+    // first-match. A narrow `allow write` further down CANNOT restrict a
+    // broader one above it — the broad rule still grants. That is why the
+    // recursive block below grants READ ONLY, and every write is enumerated.
+    // Cloud Functions use the Admin SDK and bypass all of this.
     match /users/{userId} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+      allow read: if isOwner(userId);
+      allow write: if isOwner(userId);
 
       match /{document=**} {
-        allow read, write: if request.auth != null && request.auth.uid == userId;
+        allow read: if isOwner(userId);
+      }
+
+      // ── Client-owned: the user's own material ──────────────────────────
+      match /entries/{docId}             { allow write: if isOwner(userId); }
+      match /entryAnalyses/{docId}       { allow write: if isOwner(userId); }
+      match /events/{docId}              { allow write: if isOwner(userId); }
+      match /profileCorrections/{docId}  { allow write: if isOwner(userId); }
+      match /lifeContext/{docId}         { allow write: if isOwner(userId); }
+      match /stylePreferences/{docId}    { allow write: if isOwner(userId); }
+      match /mirrorShown/{docId}         { allow write: if isOwner(userId); }
+      match /moodLogs/{docId}            { allow write: if isOwner(userId); }
+      match /echoes/{docId}              { allow write: if isOwner(userId); }
+      match /pushTokens/{docId}          { allow write: if isOwner(userId); }
+      match /rollups/{docId}             { allow write: if isOwner(userId); }
+      match /chatSessions/{docId}        { allow write: if isOwner(userId); }
+      match /patternCallbacks/{docId}    { allow write: if isOwner(userId); }
+      // Retired collections. Still writable so an older client build cannot
+      // start failing mid-session, and still readable/deletable so account
+      // deletion keeps erasing them.
+      match /riverMarks/{docId}          { allow write: if isOwner(userId); }
+      match /mirrors/{docId}             { allow write: if isOwner(userId); }
+      match /dailyReads/{docId}          { allow write: if isOwner(userId); }
+
+      // ── Server-owned: feedback-only writes ─────────────────────────────
+      //
+      // Purely derived. Nothing the client could say about these is
+      // information the server does not already have, and a forged count here
+      // would corrupt every downstream comparison.
+      match /derived/{docId} {
+        allow write: if false;
+      }
+
+      // The client records that it SHOWED an observation and what the user
+      // said about it — never the arithmetic.
+      match /observations/{docId} {
+        allow update: if isOwner(userId)
+                      && onlyChanges(['userStatus', 'shownAt', 'notQuiteCount']);
+        allow create, delete: if false;
+      }
+
+      match /readings/{docId} {
+        allow update: if isOwner(userId)
+                      && onlyChanges(['userStatus', 'shownAt', 'followUp']);
+        allow create, delete: if false;
+      }
+
+      // `userStatus` is the confirmation ("This is me"); `status` is the
+      // forget affordance (closed / muted / dismissed). Both are the user's to
+      // set; evidence, counts, lifecycle and the audit verdict are not.
+      match /patternHypotheses/{docId} {
+        allow update: if isOwner(userId)
+                      && onlyChanges(['userStatus', 'status', 'shownAt',
+                                      'respondedAt', 'closedAt', 'salienceScore',
+                                      'stability', 'lifecycle', 'lastEvidenceAt']);
+        allow create, delete: if false;
+      }
+
+      match /mirrorCards/{docId} {
+        allow update: if isOwner(userId) && onlyChanges(['userFeedback']);
+        allow create, delete: if false;
+      }
+
+      match /mirrorLetters/{docId} {
+        allow update: if isOwner(userId) && onlyChanges(['openedAt']);
+        allow create, delete: if false;
+      }
+
+      // The Self Model is assembled server-side, but the client still has a
+      // deterministic local fallback for a user the nightly job has not
+      // reached (SelfModelService.assembleFromHypotheses), which refuses to
+      // overwrite a server-written model. Keep it writable, and keep it
+      // deletable — "delete everything Spilr thinks it knows" is a promise in
+      // the privacy PRD.
+      match /selfModel/{docId} {
+        allow write: if isOwner(userId);
       }
     }
   }

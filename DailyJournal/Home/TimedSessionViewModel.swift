@@ -107,44 +107,16 @@ final class TimedSessionViewModel: ObservableObject {
         service.createEntry(entry)
         clearDraft()
 
-        // Step 2 – Gemini enrichment + Echo extraction in background, silent on failure.
-        let svc             = service
-        let entryId         = entry.id
-        let uid             = userId
-        let entryCreatedAt  = entry.createdAt
-
-        Task.detached(priority: .utility) {
-            guard let insights = try? await AIService.shared.generateInsights(from: trimmed) else { return }
-            svc.updateEntryInsights(entryId: entryId, userId: uid, insights: insights)
-        }
-
-        // Optional photo — upload to Storage, then patch the entry's photoURL.
-        // Best-effort and fully detached: a failed/slow upload never blocks the save.
-        if let photo {
-            Task.detached(priority: .utility) {
-                if let url = await PhotoUploadService.shared.uploadEntryPhoto(photo, userId: uid, entryId: entryId) {
-                    svc.updateEntryPhotoURL(entryId: entryId, userId: uid, url: url)
-                }
-            }
-        }
-
-        Task.detached(priority: .background) {
-            await EchoExtractionService.shared.extractAndStore(
-                entryText:      trimmed,
-                entryId:        entryId,
-                userId:         uid,
-                entryCreatedAt: entryCreatedAt
-            )
-        }
-
-        // Mirror analysis (Prompt A) — structured EntryAnalysis for the Mirror /
-        // Self-Model / pattern-mining chain. Self-persisting, never throws.
-        Task.detached(priority: .background) {
-            _ = await AIService.shared.analyzeEntry(
-                entryId: entryId,
-                userId:  uid,
-                text:    trimmed
-            )
-        }
+        // Step 2 – Gemini insights, Echo extraction, Mirror analysis and an
+        // optional photo upload — all detached, silent on failure. Shared
+        // with every other composer via `EntryEnrichment`.
+        EntryEnrichment.run(
+            entryId: entry.id,
+            userId: userId,
+            entryCreatedAt: entry.createdAt,
+            text: trimmed,
+            photo: photo,
+            service: service
+        )
     }
 }

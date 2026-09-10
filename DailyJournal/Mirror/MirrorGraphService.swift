@@ -130,22 +130,14 @@ final class MirrorGraphService: ObservableObject {
     }
 
     // MARK: - Persist hypothesis
-
-    /// Fire-and-forget write of a hypothesis to Firestore.
-    ///
-    /// `merge: true` is load-bearing. `PatternHypothesis.toFirestoreData()` does
-    /// not carry the fields the nightly server pipeline owns —
-    /// `counterEvidenceEntryIds`, `disconfirmation`, `lifecycle`,
-    /// `evidenceEntryIdsAllTime`, `lastEvidenceAt`, `obviousRisk`,
-    /// `actionOutcome`, `absenceFact`. A full overwrite therefore erased the
-    /// entire audit trail and evidence history for any hypothesis the client
-    /// touched, which is exactly the data that makes the profile trustworthy.
-    func saveHypothesis(_ h: PatternHypothesis, userId: String) {
-        Firestore.firestore()
-            .collection("users").document(userId)
-            .collection("patternHypotheses").document(h.id)
-            .setData(h.toFirestoreData(), merge: true) { _ in }
-    }
+    //
+    // `saveHypothesis` was DELETED (Mirror v3). It had no call sites — the
+    // server has been the sole writer of `patternHypotheses` since mining
+    // moved server-side — and firestore.rules now enforces that: the client
+    // may only patch `userStatus` / `status` / the shown+responded timestamps.
+    // A general-purpose full-document writer sitting here unused was a
+    // landmine: the next caller would have got a silent permission failure,
+    // and fire-and-forget writes have no error path to notice it in.
 
     // MARK: - Mark shown
 
