@@ -1,7 +1,11 @@
 # Today's Read — Feature PRD
 
-**Last updated:** 2026-06-09
-**Status:** Core slice + share surface + push notifications shipped (models, local engine, card, Home wiring, overnight generator, share card, FCM push). Card simplified 2026-06-09: shown directly (no sealed/tap-to-reveal), no in-card feedback loop, "receipts" relabelled.
+**Last updated:** 2026-08-11
+**Status:** Core slice + share surface + push notifications shipped (models, local engine, card, Home wiring, overnight generator, share card, FCM push). Card simplified 2026-06-09: shown directly (no sealed/tap-to-reveal), no in-card feedback loop, "receipts" relabelled. LocalReadEngine pool expanded 2026-06-15: each scenario×tone now has 5 distinct lines rotated daily by `daySeed % 5`.
+
+**2026-08-11 — content quality overhaul (read felt formulaic / presumptuous):**
+- **Server generator prompt → `read-gen-v2`** (`functions/index.js`): dropped the mandatory **six sentence templates** ("You keep calling it X but it sounds like Y", etc.) and the "tenderly brutal" edge that made reads feel like gotchas. The read is now a grounded, warm, specific reflection in **natural language** (1–2 sentences, ≤200 chars), may include an **optional soft, non-clinical reframe** (CBT-flavoured, e.g. "it keeps sounding a bit all-or-nothing"), and still bans advice / clichés / diagnosis / horoscope generality. Persona renamed "ninety" → **Spilr**.
+- **LocalReadEngine made conservative** (`Hints/LocalReadEngine.swift`): the offline fallback used to commit to a specific scenario on a **single** keyword hit (`>= 1`), fabricating confident narratives that often didn't match the entry — the main reason offline reads felt wrong. Threshold raised to **`>= 2`**, and weak-signal (`.generic`) now returns a **no-show** so Home shows the neutral prompt card instead of a presumptuous read. NOTE: until the `(default)` Firestore DB is provisioned and functions are deployed, users see the **local** read, not the server LLM read.
 
 ---
 
@@ -119,6 +123,15 @@ Always-available, offline, never-throws. Reads coarse signals off the last 14 en
 - Returns `shouldShow == false` (with `doNotShowReason`) when there is too little signal (< 60 chars of corpus), so Home falls back to the prompt card.
 - Local reads carry `confidence = 0.55`, `modelProvider = "local"`, `promptVersion = "local-read-v1"`.
 
+### Line pool rotation (added 2026-06-15)
+
+Each scenario × tone combination now has a **pool of 5 distinct `ReadLine`s** rather than a single line. The line is selected by `daySeed(localDate) % 5`, where `daySeed` is a stable integer derived from the calendar date (e.g. `days since epoch % 1000`). This means:
+
+- The same scenario detected on consecutive days will still surface a different line each day.
+- The pool rotates on a ~5-day cycle independently of the scenario or sharpness.
+- `funny` tone shares a pool with `direct` in the local engine (they fall into the same `case` branch); the server generator still uses `funny` as a distinct tone.
+- The `generic + preferConcrete` branch also has a 3-line pool rotated by `seed % 3`.
+
 ---
 
 ## Feedback engine
@@ -157,17 +170,28 @@ The local store recalibrates the local engine immediately; the overnight server 
 
 **File:** `DailyJournal/Home/TodayReadCardView.swift`
 
-Calm, light card (2026-06-09 restyle — the old loud dark-`ink` / 25 pt bold-cream
-treatment was toned down). `AppTheme.cream` surface with a hairline
-`inkSoft` border and soft shadow. Shown directly — no sealed gate. Layout:
+**Spilr-prototype `today-card` restyle (2026-06-11).** The card now matches the
+HTML prototype's hero card and is fully theme-driven (adopts all 5 palettes via
+`AppTheme`). 30 pt rounded corners, a soft gradient surface
+(`cream` + a `terracotta` 18% top-left wash) with a blurred `sun` accent orb in
+the top-right, hairline `inkSoft` border, soft shadow. Layout:
 
-- "today's read" label (muted inkSoft) + share button (header).
-- Read line: 22 pt **serif, regular weight**, `AppTheme.ink`, generous line
-  spacing — readable and quiet rather than shouty.
-- Evidence row labelled "drawn from your entries" (terracotta mono chips joined
-  by " · ") — formerly "receipts".
-- "reply in 90s" soft `rose2` capsule with ink text. After tapping, it swaps to
-  a quiet inkSoft confirmation ("you took it to the page.").
+- Header: a **pulsing** `terracotta` dot + "today's read" mono label + share button.
+- Read line: 24 pt **rounded display, bold**, `AppTheme.ink` (the card headline).
+- Evidence: "drawn from your entries" with the receipt chips rendered as
+  individual `rose`-tinted capsules in a `FlowLayout` (formerly a " · "-joined string).
+- **Tiny act box** (the prototype's dashed "tiny-act"): a `sun`-tinted box with a
+  dashed `terracotta` border — "today's tiny act" label, a **concrete behavioural
+  suggestion** from `LocalAI.tinyAct(from: read.readText)` (topic→action map, e.g.
+  work → "Write tomorrow's first task… then close the laptop"; *not* a question),
+  a "Tap tomorrow to log…" subtitle, and a **"Log tiny act done"** button that
+  toggles to "Tiny act logged ✓" (local state; not yet persisted).
+- The primary "reply in 90s" action **stays available even after replying** (a
+  small "you took it to the page" note appears, but the button no longer
+  disappears) so the user can always start writing again from Home.
+- Primary action: a `terracotta → terracottaDeep` gradient "reply in 90s" capsule
+  with `cream` text. After tapping it swaps to a quiet terracotta confirmation
+  ("you took it to the page.").
 
 The card's only outbound closure is `onReply`. The felt-true / too-sharp / not-me affordances and the sealed/revealed/replied state machine were removed (2026-06-09). `ReadRejectionCode` / `ReadFeedback` and the recalibration methods remain in the model/service layer for the server feedback loop.
 
@@ -175,11 +199,82 @@ The card's only outbound closure is `onReply`. The felt-true / too-sharp / not-m
 
 **File:** `DailyJournal/Home/HomeView.swift`
 
-- `HomeViewModel.todayRead` is fetched once per session in `load()` (guarded by `if todayRead == nil`) so the sealed/revealed state and feedback survive pull-to-refresh.
-- `promptCard` now renders `TodayReadCardView` when a read exists, else `fallbackPromptCard` (the original today's-prompt card).
-- `onReply` opens the 90-second session directly via `NinetySecondSessionView` (`showingNinetySecond = true`). The separate `PebblePickerView` gating step was removed — pebbles are now chosen inline on the writing screen.
-- Home also shows an always-visible "Write something" CTA (`writeCTASection`) independent of the read/prompt card, plus a "start with a hint" secondary that opens the 90-second session.
-- The `vm.readFeltTrue()/readTooSharp()/readNotMe(_:)` methods remain on `HomeViewModel` for the server feedback loop but are no longer wired to the card UI.
+**Home rebuilt to the Spilr prototype's "Today" screen (2026-06-11).** The Home
+screen is now a clean four-block layout matching the prototype 1:1, and nothing
+else:
+
+1. **Header (screen-head):** "Today" + "Your private 90-second drop is ready." +
+   an avatar stack (the user's initial, tappable → Profile; plus a decorative
+   "AI" chip).
+2. **Today card (hero):** `TodayReadCardView` when a read exists; otherwise
+   `fallbackTodayCard` — a matching today-card whose headline is the selected
+   prompt, with "Start today's spill" (90-sec) and "Write freely" mini-actions.
+3. **Streak row:** the 7-day "resilience week" pills (see `journalprd.md`).
+4. **Prompt preview card:** "Prompt preview" + the selected prompt + category
+   chips (Mind loop / Avoided / Future you) that swap `selectedPrompt`.
+
+- The only thing allowed to interrupt this layout is the crisis-safety
+  `PatternResourceCardView` (`vm.showResourceCard`) — a non-negotiable safety flow.
+- **Removed from Home:** the mood check-in (`MoodBlobView`), recent-entries list,
+  "letters from past you", the surfaced Echo card, and the pattern-callback card.
+  Their data still lives in the Journal / River / Patterns tabs. The old section
+  builders (`writeCTASection`, `moodCheckInSection`, `recentSection`,
+  `lettersSection`, `echoSection`, `patternSection`, `promptCard`,
+  `fallbackPromptCard`) remain defined but unused, to be pruned in a later pass.
+- `HomeViewModel.todayRead` is still fetched once per session in `load()`.
+- All three write entry points on Home — the Today's Read **reply**, **Start
+  today's spill**, and **Write freely** — now open the new `SpillWriteView`
+  (`showingNinetySecond` cover), each passing the appropriate `spillPrompt`
+  (the read's `replyPrompt`, the selected prompt-chip, or empty respectively).
+- The `vm.readFeltTrue()/readTooSharp()/readNotMe(_:)` and echo/callback methods
+  remain on `HomeViewModel` for the server/feedback loops but are no longer wired
+  to the Home UI.
+
+### Navigation
+
+The **Echoes tab was removed** from `MainTabView` (`App/RootView.swift`) — it has
+no counterpart in the prototype. The tab bar is now Today / Journal / River /
+Patterns. `EchoesView` remains defined (in `River/NoticedView.swift`) but unused.
+
+### SpillWriteView (the prototype's Write tab)
+
+**File:** `DailyJournal/Home/SpillWriteView.swift`
+
+A new write screen modelled 1:1 on the prototype's Write tab. Layout:
+screen-head ("Spill" + "Saved exactly as written." + Close / Reset) → **90-second
+ring** → prompt card (when a prompt was passed) → textarea → photo **upload zone**
+(PhotosPicker; the picked image is **persisted to Firebase Storage** on save —
+see `journalprd.md` → Photos) → **bottom bar (small mic + word-count /
+save-state)** → "Save exactly as written" → a live on-device **mirror shelf**
+(`LocalAI.extractTopics` + `detectSentiment`, no network).
+
+**Timer:** the 90-second ring is a **soft cap** — a self-contained countdown
+(`remaining`/`ticker`, independent of `NinetySecondViewModel`'s timer) that starts
+when the person begins writing (first non-empty content, typed or dictated),
+counts down, and at zero simply rests with a gentle "Time's up — but no rush"
+message. It never force-saves or discards.
+
+**Voice:** the mic is a small button in the bottom bar (not the centerpiece).
+Tapping dictates, with the live transcript streaming into the editor via
+`SpeechManager` (`toggle(existingText:)` → `liveText` mirrored onto `vm.content`);
+mic-permission errors surface the "Open Settings" alert.
+
+**Starter "question":** the prompt card always shows a starter. When a specific
+prompt was passed (read reply / Home chip) it's shown as-is. Otherwise (free
+spill / pencil) it opens with a `HintLadder` starter and shows gentler / more
+direct / weirder **re-roll** pills, auto-adopting the AI-sharpened starter when it
+arrives — the same engine the pencil's blank-page starter uses. `SpillWriteView`
+is now the destination for **all** write entry points: Home actions, the Today's
+Read reply, and the pencil FAB on Journal / River / Patterns.
+
+It reuses `NinetySecondViewModel` purely as the **save engine**
+(`saveEntry()` persists the entry and kicks off Gemini enrichment, Echo
+extraction, and River-mark generation); the VM's timer methods are intentionally
+not started. The older `NinetySecondSessionView` is unchanged and still used by
+the pattern-stitch, question-picker, and pebble-picker flows.
+
+**Follow-ups:** persist the uploaded photo (Storage wiring); consider a dedicated
+`sessionType` for free spills instead of reusing `.ninetySecond`.
 
 ---
 

@@ -9,76 +9,144 @@ import SwiftUI
 final class HomeViewModel: ObservableObject {
     @Published var recentEntries: [JournalEntry] = []
     @Published var arrivedLetters: [JournalEntry] = []
-    @Published var isLoading = false
-    @Published var showingNinetySecond = false
-    @Published var showingFreeWrite = false
+    /// Starts TRUE, not false. `[]` and `false` are indistinguishable from "this
+    /// user genuinely has nothing", so a view that renders before `load()` has run
+    /// confidently states the new-user case and then corrects itself — which is the
+    /// flicker. Defaulting to `true` makes "we don't know yet" the initial state.
+    @Published var isLoading = true
+
+    /// Whether the entries query has come back yet.
+    ///
+    /// Separate from `isLoading` on purpose. The header subtitle branches on
+    /// `recentEntries.isEmpty`, and `[]` is indistinguishable from "this user
+    /// has written nothing". Sharing one flag meant clearing it early made a
+    /// returning user read "First drop ready" and then watch it flip once the
+    /// entries landed — the exact flicker the opacity gate exists to prevent.
+    /// Two independent questions need two flags.
+    @Published var entriesLoaded = false
+
     @Published var selectedLetter: JournalEntry?
 
-    // ── Today's Read ───────────────────────────────────────────────────
-    /// The daily hook. Replaces the prompt card when present. Fetched once per
-    /// session (server doc if the overnight job wrote one, else a local read).
-    @Published var todayRead: DailyRead?
+    // ── Header stats (Spilr Redesign 3a) ────────────────────────────────
+    /// The tiny `rollups/stats` doc — entry count + last-entry date for the
+    /// returning-user greeting subtitle. Non-throwing and self-healing (see
+    /// `RollupService.fetchStats`), so no error state is needed here.
+    @Published var stats: RollupStats?
+    /// True once the stats fetch above has resolved (hit or miss) this session.
+    @Published var statsLoaded = false
+
+    /// Distinct calendar days with at least one entry, within the current
+    /// week (Sunday/Monday per the user's calendar). Drives the week-row dots
+    /// on the invitation card. Derived from `recentEntries`, not a separate
+    /// query — see `load()`.
+    @Published var daysWrittenThisWeek: Int = 0
+
+    // ── "Have I written today?" ────────────────────────────────────────
+    /// The most recent entry written today, if there is one.
+    ///
+    /// Home previously had NO state for this. The only place today-ness was
+    /// computed was an inline `Calendar.isDateInToday` inside a view-level
+    /// computed string, which meant the single thing that changed after posting
+    /// was the header subtitle flipping to "Written today ✓" — the hero card and
+    /// its CTA were byte-identical before and after. Real state, derived once in
+    /// `load()`, so the view can actually render a different card.
+    @Published var todayEntry: JournalEntry?
+
+    /// Whether the user has written at least once today.
+    var hasPostedToday: Bool { todayEntry != nil }
 
     // ── Echoes ─────────────────────────────────────────────────────────
     /// The single pending echo to surface this session. Nil when none is
     /// available or after the user dismisses / answers it.
     @Published var pendingEcho: Echo?
 
-    // ── Daily mood log ─────────────────────────────────────────────────
-    /// Today's logged mood, if the user has checked in. Drives the mood widget's
-    /// "already logged" state.
-    @Published var todayMood: Mood?
-
-    // ── Pattern callbacks ──────────────────────────────────────────────
-    /// The single pattern callback to surface this session (nil = none / cleared).
-    /// Separate system from Echoes — rarer, weightier, stitched from many entries.
-    @Published var pendingCallback: PatternCallback?
-    /// When true, a crisis signal was detected in the window: we show the soft
-    /// opt-in resource card INSTEAD of any callback (non-negotiable safety flow).
+    // ── Crisis safety ─────────────────────────────────────────────────
+    /// When true, a crisis signal was detected in the recent corpus: show the
+    /// soft opt-in resource card (non-negotiable safety flow).
     @Published var showResourceCard = false
 
     private let service          = JournalService()
-    private let readService      = ReadService()
     private let echoService      = EchoService()
-    private let moodService      = MoodLogService()
-    private let callbackService  = PatternCallbackService()
     private let detection        = PatternDetectionService.shared
     let userId: String
 
     private var settings: PatternSettings { PatternSettings(userId: userId) }
 
-    init(userId: String) { self.userId = userId }
+    /// True once `load()` has completed at least once for this VM instance.
+    private var hasLoadedOnce = false
+
+    init(userId: String) {
+        self.userId = userId
+    }
 
     func load() async {
-        isLoading = true
+        // Only claim "loading" when there is genuinely nothing on screen yet.
+        if !hasLoadedOnce { isLoading = true }
 
-        // Fan out all reads concurrently
-        async let recent  = (try? await service.fetchRecentEntries(for: userId, limit: 5)) ?? []
+        // Fan out all reads concurrently.
+        //
+        // Limit bumped from 5 → 20 so `daysWrittenThisWeek` below can see a
+        // full week's worth of entries without a second query. `askJournalPill`
+        // (>= 5) and the first-entry fallback (== 1) both stay correct: a
+        // higher limit only ever grows what they see.
+        async let recent  = (try? await service.fetchRecentEntries(for: userId, limit: 20)) ?? []
         async let letters = (try? await service.fetchArrivedLetters(for: userId)) ?? []
         async let echo    = try? await echoService.fetchTopPendingEcho(for: userId)
-        async let mood    = try? await moodService.fetchToday(for: userId)
+        async let statsFetch = RollupService.shared.fetchStats(for: userId)
 
-        recentEntries  = await recent
+        // Entries first, and release the header as soon as they land. Letters,
+        // mood and echo are awaited AFTER, so a slow one of those no longer holds
+        // the part of the screen that depends only on entries.
+        recentEntries = await recent
+        entriesLoaded = true
+
+        // Derive today-ness ONCE, here, rather than re-running the calendar check
+        // inside every view body that needs it. `recentEntries` is already sorted
+        // newest-first, so `first(where:)` is the latest entry from today.
+        todayEntry = recentEntries.first {
+            Calendar.current.isDateInToday($0.createdAt)
+        }
+
+        // Distinct calendar days written this week, for the invitation card's
+        // week-row dots. `dateInterval(of: .weekOfYear, for:)` respects the
+        // user's calendar (locale-correct week start).
+        let cal = Calendar.current
+        if let weekStart = cal.dateInterval(of: .weekOfYear, for: Date())?.start {
+            let days = Set(
+                recentEntries
+                    .filter { $0.createdAt >= weekStart }
+                    .map { cal.startOfDay(for: $0.createdAt) }
+            )
+            daysWrittenThisWeek = days.count
+        }
+
+        stats = await statsFetch
+        statsLoaded = true
+
+        // Release the loading gate here: after entries, and WITHOUT waiting on
+        // letters / mood / echo — nothing on this screen renders their results
+        // until they land (see below).
+        isLoading = false
+        hasLoadedOnce = true
+
+        // The rest is off the critical path — awaited after the entries gate
+        // releases so a slow letters/echo fetch never holds the screen.
         arrivedLetters = await letters
-        todayMood      = (await mood)?.mood
 
         // Only set pendingEcho on the first load of a session — prevents the
         // card re-appearing on pull-to-refresh after the user has dismissed it.
         if pendingEcho == nil {
             pendingEcho = await echo
+            if let surfaced = pendingEcho {
+                AnalyticsManager.shared.trackEchoSurfaced(
+                    type: surfaced.type.rawValue,
+                    confidence: surfaced.confidence
+                )
+            }
         }
 
-        // Today's Read — fetched once per session so the sealed/revealed state
-        // and any feedback the user gave survive a pull-to-refresh.
-        if todayRead == nil {
-            todayRead = await readService.todayRead(for: userId)
-        }
-
-        isLoading = false
-
-        // Surface any callback already waiting, then kick off detection in the
-        // background (throttled to ~once/20h inside the service).
-        await refreshCallback()
+        // Kick off the crisis-corpus scan in the background (throttled to
+        // ~once/20h inside the service).
         Task { [weak self] in await self?.runDetection() }
 
         // Prime the durable memory profile (and the AI prompt context it caches)
@@ -87,66 +155,31 @@ final class HomeViewModel: ObservableObject {
         Task.detached(priority: .utility) { [userId] in
             await MemoryProfileService.shared.build(for: userId)
         }
+
+        // One page of the events backfill per session — see
+        // EventService.backfillIfNeeded. No-ops instantly once a user's whole
+        // history has been walked (or if they have no pre-events analyses at
+        // all). Fire-and-forget, same tolerance as the memory-profile prime.
+        Task.detached(priority: .utility) { [userId] in
+            await EventService.shared.backfillIfNeeded(for: userId)
+        }
     }
 
-    // MARK: - Pattern callbacks
+    // MARK: - Crisis safety
 
-    /// Surfaces the top eligible callback (if the frequency / quiet-hours / mute
-    /// gates allow) and marks it shown. No-op once a card is already on screen.
-    private func refreshCallback() async {
-        guard pendingCallback == nil, !showResourceCard else { return }
-        let all = (try? await callbackService.fetchAll(for: userId)) ?? []
-        guard let callback = callbackService.surfaceableCallback(from: all, settings: settings)
-        else { return }
-        callbackService.markShown(callback)
-        withAnimation(.easeOut(duration: 0.4)) { pendingCallback = callback }
-    }
-
-    /// Runs detection and reacts to the outcome. Crisis signals route to the soft
-    /// resource card and never produce a callback.
+    /// Runs the crisis-corpus scan and reacts to the outcome. This is the only
+    /// thing PatternDetectionService still does — the pattern-callback system it
+    /// used to gate was cut (see PATTERNS_MERGE_PLAN.md); Mirror's Pattern
+    /// Hypothesis engine is the one actually shipping.
     private func runDetection() async {
         switch await detection.detectIfNeeded(for: userId) {
         case .safetyRouted:
             let s = settings
-            guard s.shouldShowResourceCard, pendingCallback == nil else { return }
+            guard s.shouldShowResourceCard else { return }
             s.lastResourceCardShown = Date()
             withAnimation(.easeOut(duration: 0.4)) { showResourceCard = true }
-        case .created:
-            await refreshCallback()
-        case .noPattern, .skipped:
+        case .clear, .skipped:
             break
-        }
-    }
-
-    /// "not now" — soft dismiss; the 4-day suppression window does the rest.
-    func dismissCallback() {
-        guard let callback = pendingCallback else { return }
-        callbackService.markDismissed(callback)
-        withAnimation(.easeOut(duration: 0.25)) { pendingCallback = nil }
-    }
-
-    /// "stop watching [entity]" — mutes the entity locally and in Firestore.
-    func muteCallback() {
-        guard let callback = pendingCallback else { return }
-        if let entity = callback.entity { settings.mute(entity) }
-        callbackService.markMuted(callback)
-        withAnimation(.easeOut(duration: 0.25)) { pendingCallback = nil }
-    }
-
-    /// "I needed that" — strong positive signal; nudges this archetype's salience.
-    func affirmCallback() {
-        guard let callback = pendingCallback else { return }
-        settings.recordAffirmation(callback.archetype)
-        callbackService.markAnswered(callback)
-        withAnimation(.easeOut(duration: 0.25)) { pendingCallback = nil }
-    }
-
-    /// Writing about a callback (from the stitched view) counts as engaging.
-    func engageCallback(_ callback: PatternCallback) {
-        settings.recordAffirmation(callback.archetype)
-        callbackService.markAnswered(callback)
-        withAnimation(.easeOut(duration: 0.25)) {
-            if pendingCallback?.id == callback.id { pendingCallback = nil }
         }
     }
 
@@ -155,41 +188,10 @@ final class HomeViewModel: ObservableObject {
         withAnimation(.easeOut(duration: 0.25)) { showResourceCard = false }
     }
 
-    /// Logs (or updates) today's mood from the Home widget. Fire-and-forget
-    /// write; we update local state immediately so the UI reflects it at once.
-    func logMood(_ mood: Mood) {
-        moodService.logMood(userId: userId, mood: mood)
-        withAnimation(.easeInOut(duration: 0.2)) { todayMood = mood }
-    }
-
     func openLetter(_ entry: JournalEntry) {
         selectedLetter = entry
         service.markLetterOpened(entryId: entry.id, userId: userId)
         arrivedLetters.removeAll { $0.id == entry.id }
-    }
-
-    // MARK: - Today's Read actions
-    //
-    // The card owns its own sealed→revealed→replied animation; the ViewModel just
-    // persists the feedback (fire-and-forget) and lets ReadService recalibrate the
-    // local engine via ReadSettings.
-
-    /// "felt true" — positive signal; rewards the read's source patterns.
-    func readFeltTrue() {
-        guard let read = todayRead else { return }
-        readService.recordFeedback(.feltTrue, on: read)
-    }
-
-    /// "too sharp" — softens future reads one gradient.
-    func readTooSharp() {
-        guard let read = todayRead else { return }
-        readService.recordFeedback(.tooSharp, on: read)
-    }
-
-    /// "not me" → classification code from the micro-menu.
-    func readNotMe(_ code: ReadRejectionCode) {
-        guard let read = todayRead else { return }
-        readService.recordRejection(code, on: read)
     }
 
     // MARK: - Echo actions
@@ -199,6 +201,7 @@ final class HomeViewModel: ObservableObject {
     func skipEcho() {
         guard let echo = pendingEcho else { return }
         echoService.skipEcho(id: echo.id, userId: userId, currentSkipCount: echo.skipCount)
+        AnalyticsManager.shared.trackEchoDismissed()
         withAnimation(.easeOut(duration: 0.25)) { pendingEcho = nil }
     }
 
@@ -206,6 +209,7 @@ final class HomeViewModel: ObservableObject {
     /// Called after the EchoAnsweredView sheet is closed.
     func answerEcho() {
         guard let echo = pendingEcho else { return }
+        AnalyticsManager.shared.trackEchoAnswered()
         echoService.markAnswered(id: echo.id, userId: userId)
         withAnimation(.easeOut(duration: 0.25)) { pendingEcho = nil }
     }
@@ -215,23 +219,90 @@ final class HomeViewModel: ObservableObject {
 struct HomeView: View {
     @StateObject private var vm: HomeViewModel
     @EnvironmentObject private var authViewModel: AuthViewModel
-    @State private var showingNinetySecond  = false
-    @State private var showingFreeWrite     = false
+    /// Cross-tab navigation, so the done card can send the user to their entry.
+    @EnvironmentObject private var router: AppRouter
+    @State private var showingTimedSession  = false
+    @State private var showingDailyChat     = false
     @State private var showProfile          = false
-    /// When the user taps a mood on Home we log it AND redirect into the editor
-    /// with that mood pre-selected. nil for a plain "write" tap.
-    @State private var moodForEditor: Mood?
-    @State private var openedLetter: JournalEntry?
-    // Echo sheets — capture the echo at tap time so the sheet content stays
-    // stable even after vm.pendingEcho is cleared during the dismissal animation.
-    @State private var activeEchoForAnswer: Echo?
-    @State private var activeEchoForTheme:  Echo?
-    // Pattern callback: the stitched tap-through sheet. Captured at tap time so
-    // the sheet content stays stable even after vm.pendingCallback is cleared.
-    @State private var activeCallbackForStitch: PatternCallback?
+    @State private var showAsk              = false
+    /// First-entry celebration: shown once when the user saves their very first entry.
+    @AppStorage("spilr.firstEntryCelebrationShown") private var firstEntryCelebrationShown = false
+    @State private var celebrationEntry: JournalEntry?
+    /// The echo currently being answered — captured on tap so it survives
+    /// `vm.pendingEcho` clearing to nil before the sheet's `onDismiss` runs.
+    @State private var answeringEcho: Echo?
 
-    init(userId: String) {
+    /// The starter prompt passed into the Spill write screen. Empty when
+    /// reached via the start sheet's "Blank page" — SpillWriteView already
+    /// handles an empty prompt by picking its own starter.
+    @State private var spillPrompt = ""
+
+    // ── Start sheet ("How do you want to start?", Spilr Redesign 3b) ────
+    @State private var showingStartSheet = false
+    /// Empty = the options screen; `[.templates]` = the pushed gallery. Also
+    /// what the sheet's own detent (short ↔ `.large`) is keyed off, so the
+    /// sheet grows in the same transaction as the push.
+    @State private var startPath: [StartRoute] = []
+    /// Set by an option row, read by the sheet's `onDismiss` once the sheet
+    /// has actually finished dismissing — see the note at the `.sheet` call
+    /// site for why a cover can't be presented directly from the row's action.
+    @State private var pendingStart: StartChoice?
+    /// Set alongside `showingDailyChat` when the start sheet's "Talk it out"
+    /// row is chosen, so the chat cover knows to open the mic immediately.
+    @State private var startChatWithDictation = false
+    /// The template whose guided runner is currently presented. `nil` = no
+    /// runner on screen. Set from `handlePendingStart`'s `.template` case;
+    /// `JournalTemplate`'s `Identifiable` id lets this drive
+    /// `.fullScreenCover(item:)` directly.
+    @State private var runningTemplate: JournalTemplate?
+
+    @ObservedObject private var mirrorVM: MirrorViewModel
+
+    init(userId: String, mirrorVM: MirrorViewModel) {
         _vm = StateObject(wrappedValue: HomeViewModel(userId: userId))
+        self.mirrorVM = mirrorVM
+    }
+
+    /// After any write session, instantly check if this was the user's very first entry.
+    /// Runs a tiny Firestore query (limit: 2) in parallel with vm.load() — because the
+    /// entry was just written to Firestore's local cache, this returns in milliseconds
+    /// rather than waiting for a full fetchAllEntries round-trip.
+    private func checkFirstEntryFast() async {
+        guard !firstEntryCelebrationShown, celebrationEntry == nil else { return }
+        let entries = (try? await JournalService().fetchRecentEntries(for: vm.userId, limit: 2)) ?? []
+        guard entries.count == 1, let first = entries.first else { return }
+        celebrationEntry = first
+    }
+
+    /// Slow fallback — used after vm.load() completes in case the fast check raced
+    /// and the entry arrived in recentEntries before checkFirstEntryFast resolved.
+    private func checkFirstEntry() {
+        guard !firstEntryCelebrationShown,
+              vm.recentEntries.count == 1,
+              let first = vm.recentEntries.first,
+              celebrationEntry == nil
+        else { return }
+        celebrationEntry = first
+    }
+
+    /// Fires the cover the start sheet's chosen row actually wants, once the
+    /// sheet has finished dismissing (see `.sheet(isPresented: $showingStartSheet)`).
+    private func handlePendingStart() {
+        guard let choice = pendingStart else { return }
+        pendingStart = nil
+        switch choice {
+        case .spill:
+            spillPrompt = ""
+            showingTimedSession = true
+        case .chat:
+            startChatWithDictation = false
+            showingDailyChat = true
+        case .talk:
+            startChatWithDictation = true
+            showingDailyChat = true
+        case .template(let template):
+            runningTemplate = template
+        }
     }
 
     var body: some View {
@@ -240,15 +311,31 @@ struct HomeView: View {
                 AppTheme.paper.ignoresSafeArea()
 
                 ScrollView {
+                    // The Today screen, per Spilr Redesign 3a: header → the
+                    // quiet Today's Read (or, on day one, the invitation leads
+                    // and a "starts tomorrow" teaser takes its place) → the
+                    // dark invitation card, always the primary CTA → a week
+                    // row for returning users → a message from your past (a
+                    // Future Self letter if one arrived, else a pending Echo —
+                    // never both, never a list) → bridge to Mirror → ask pill.
+                    // Only the crisis-safety card may interrupt.
                     VStack(alignment: .leading, spacing: 0) {
                         headerSection
-                        writeCTASection      // ← always-visible primary "write" entry point
-                        patternSection       // ← rare, weighty cross-entry callback (or safety card)
-                        if !vm.arrivedLetters.isEmpty { lettersSection }
-                        echoSection   // ← echo card sits above the prompt card
-                        promptCard           // ← primary action: today's prompt + write CTAs
-                        moodCheckInSection   // ← secondary: quick daily mood log (collapses once logged)
-                        recentSection
+                        if vm.showResourceCard {
+                            PatternResourceCardView(onDismiss: { vm.dismissResourceCard() })
+                                .padding(.horizontal, 20)
+                                .padding(.bottom, 24)
+                                .transition(.move(edge: .top).combined(with: .opacity))
+                        }
+                        heroSection
+                        weekRow
+                        if let entry = vm.todayEntry {
+                            writtenTodayRow(entry: entry)
+                                .animation(.easeOut(duration: 0.35), value: vm.hasPostedToday)
+                        }
+                        pastSlot             // ← an arrived letter, else a pending Echo
+                        spilrNoticedCard     // ← bridge to Mirror
+                        askJournalPill       // ← "Ask your journal anything"
                     }
                 }
                 .refreshable { await vm.load() }
@@ -256,170 +343,466 @@ struct HomeView: View {
             .navigationBarHidden(true)
             .task {
                 await vm.load()
-                // Ask for push permission once the user is on the (authed) Home
-                // screen — the FCM token is saved against their uid via the
-                // Messaging delegate. iOS shows the system prompt only once.
-                PushNotificationManager.shared.requestAuthorization()
+                // Push permission is NEVER requested cold. We only ask once the
+                // user already has at least one entry — asking a brand-new user
+                // before they've written anything tanks the opt-in rate. The
+                // very-first-entry case is handled at the celebration-sheet
+                // dismiss below (the ideal high-consent moment). iOS shows the
+                // system prompt only once regardless of how often this is called.
+                if !vm.recentEntries.isEmpty {
+                    PushNotificationManager.shared.requestAuthorization()
+                }
             }
-            .fullScreenCover(isPresented: $showingNinetySecond, onDismiss: { Task { await vm.load() } }) {
-                // Straight into the writing screen — pebbles are now chosen inline,
-                // not on a separate gating picker step.
-                NinetySecondSessionView(userId: vm.userId) { Task { await vm.load() } }
-            }
-            .sheet(isPresented: $showingFreeWrite, onDismiss: {
-                moodForEditor = nil
-                Task { await vm.load() }
+            .fullScreenCover(isPresented: $showingTimedSession, onDismiss: {
+                Task {
+                    async let fast: () = checkFirstEntryFast()
+                    async let reload: () = vm.load()
+                    await (fast, reload)
+                    checkFirstEntry()  // fallback if fast check raced
+                }
             }) {
-                JournalEditorView(userId: vm.userId, initialMood: moodForEditor)
+                // The Spilr-style write screen ("forget 90" — no countdown).
+                SpillWriteView(userId: vm.userId, prompt: spillPrompt) {
+                    Task {
+                        async let fast: () = checkFirstEntryFast()
+                        async let reload: () = vm.load()
+                        await (fast, reload)
+                        checkFirstEntry()
+                    }
+                }
             }
-            .sheet(item: $openedLetter) { letter in
-                LetterReadView(entry: letter)
+            .fullScreenCover(isPresented: $showingDailyChat, onDismiss: {
+                Task {
+                    async let fast: () = checkFirstEntryFast()
+                    async let reload: () = vm.load()
+                    await (fast, reload)
+                    checkFirstEntry()
+                }
+            }) {
+                // Day One-style interactive journaling — chat, then weave an entry.
+                DailyChatView(userId: vm.userId, startWithDictation: startChatWithDictation) {
+                    Task {
+                        async let fast: () = checkFirstEntryFast()
+                        async let reload: () = vm.load()
+                        await (fast, reload)
+                        checkFirstEntry()
+                    }
+                }
+            }
+            .sheet(isPresented: $showingStartSheet, onDismiss: {
+                // Reset in onDismiss, not onAppear — otherwise reopening the
+                // sheet lands straight back on the gallery instead of the
+                // options screen.
+                startPath = []
+                handlePendingStart()
+            }) {
+                NavigationStack(path: $startPath) {
+                    StartOptionsView(
+                        onPick: { choice in
+                            // A fullScreenCover can't be presented while this
+                            // sheet is still dismissing — stash the choice and
+                            // let onDismiss above fire it once the sheet is
+                            // actually gone, rather than acting here directly.
+                            pendingStart = choice
+                            showingStartSheet = false
+                        },
+                        onOpenTemplates: { startPath = [.templates] }
+                    )
+                    .navigationDestination(for: StartRoute.self) { _ in
+                        TemplateGalleryView(onStart: { template in
+                            // Same stash-and-dismiss dance as the other three
+                            // choices — the runner is a fullScreenCover, and
+                            // one can't present while this sheet is still
+                            // dismissing.
+                            pendingStart = .template(template)
+                            showingStartSheet = false
+                        })
+                    }
+                }
+                .presentationDetents(startPath.isEmpty ? [.height(420)] : [.large])
+                // `StartOptionsView` draws its own drag-handle capsule, so the
+                // system indicator stays hidden here too — otherwise the two
+                // overlap on the options screen.
+                .presentationDragIndicator(.hidden)
+                .presentationCornerRadius(28)
+                // `.clear`, not `AppTheme.paper` — `StartOptionsView` now
+                // paints its own rounded-top background (see
+                // `sheetCornerRadius` there). A system-drawn background here
+                // left a seam along the top edge against dark content behind
+                // the sheet (e.g. the "Today with Spilr" card) on the custom
+                // `.height(420)` detent.
+                .presentationBackground(.clear)
+            }
+            .fullScreenCover(item: $runningTemplate, onDismiss: {
+                Task {
+                    async let fast: () = checkFirstEntryFast()
+                    async let reload: () = vm.load()
+                    await (fast, reload)
+                    checkFirstEntry()
+                }
+            }) { template in
+                TemplateRunnerView(userId: vm.userId, template: template) {
+                    Task {
+                        async let fast: () = checkFirstEntryFast()
+                        async let reload: () = vm.load()
+                        await (fast, reload)
+                        checkFirstEntry()
+                    }
+                }
+            }
+            .sheet(item: $celebrationEntry, onDismiss: {
+                firstEntryCelebrationShown = true
+                // The user just wrote and celebrated their first entry — the
+                // highest-consent moment there is. Ask for push permission now,
+                // not cold on first launch.
+                PushNotificationManager.shared.requestAuthorization()
+            }) { entry in
+                FirstEntryCelebrationSheet(entry: entry) {
+                    firstEntryCelebrationShown = true
+                    celebrationEntry = nil
+                }
             }
             .sheet(isPresented: $showProfile) {
                 ProfileView()
                     .environmentObject(authViewModel)
             }
-            // Echo: answered / closing sheet.
-            // onDismiss fires after the animation completes — at that point
-            // activeEchoForAnswer is already nil, so answerEcho() is safe.
-            .sheet(item: $activeEchoForAnswer, onDismiss: { vm.answerEcho() }) { echo in
+            .sheet(isPresented: $showAsk) {
+                AskView(userId: vm.userId)
+            }
+            .sheet(item: $vm.selectedLetter) { letter in
+                JournalEditorView(userId: vm.userId, existingEntry: letter)
+            }
+            .sheet(item: $answeringEcho, onDismiss: { vm.answerEcho() }) { echo in
                 EchoAnsweredView(echo: echo)
             }
-            // Echo: theme compilation sheet.
-            // Viewing the compilation counts as engaging with the echo, so we
-            // mark it answered (not just skipped) on dismiss.
-            .sheet(item: $activeEchoForTheme, onDismiss: { vm.answerEcho() }) { echo in
-                ThemeCompilationView(echo: echo, userId: vm.userId)
-            }
-            // Pattern callback: stitched tap-through. Writing about it marks the
-            // callback answered (handled inside via onEngaged).
-            .sheet(item: $activeCallbackForStitch) { callback in
-                PatternStitchedView(
-                    callback: callback,
-                    userId:   vm.userId,
-                    onEngaged: { vm.engageCallback(callback) }
-                )
-            }
+        }
+        .trackScreen(.home)
+    }
+
+    /// First name for the header greeting. Falls back to "there" rather than
+    /// ever rendering a bare email address as a name.
+    private var greetingName: String {
+        guard
+            let displayName = authViewModel.currentUser?.displayName?
+                .trimmingCharacters(in: .whitespaces),
+            !displayName.isEmpty,
+            let first = displayName.split(separator: " ").first
+        else { return "there" }
+        return String(first)
+    }
+
+    private var timeOfDayGreeting: String {
+        switch Calendar.current.component(.hour, from: Date()) {
+        case 5..<12:  return "Good morning"
+        case 12..<17: return "Good afternoon"
+        default:      return "Good evening"
         }
     }
 
-    // MARK: - Write CTA (always visible)
-    //
-    // A clear, always-present way to start writing — independent of whether
-    // Today's Read or the prompt card is showing. Primary action opens a free
-    // write; the secondary opens the 90-second hinted session.
-    private var writeCTASection: some View {
-        VStack(spacing: 10) {
-            Button {
-                moodForEditor = nil
-                showingFreeWrite = true
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "square.and.pencil")
-                        .font(.system(size: 15, weight: .semibold))
-                    Text("Write something")
-                        .font(.system(size: 16, weight: .semibold))
-                }
-                .foregroundStyle(AppTheme.cream)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 15)
-                .background(AppTheme.terracotta)
-                .clipShape(Capsule())
-            }
-            .buttonStyle(.plain)
-
-            Button {
-                showingNinetySecond = true
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "sparkles")
-                        .font(.system(size: 12, weight: .medium))
-                    Text("No words yet? Start with a hint")
-                        .font(.system(size: 13, weight: .medium))
-                }
-                .foregroundStyle(AppTheme.inkSoft)
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.horizontal, 24)
-        .padding(.bottom, 28)
+    /// Day-one gets a plain welcome; a returning user gets a time-of-day
+    /// greeting. Branches on `recentEntries.isEmpty`, same signal the rest of
+    /// Home already uses to detect a brand-new account.
+    private var headerTitle: String {
+        vm.recentEntries.isEmpty
+            ? "Hi \(greetingName)."
+            : "\(timeOfDayGreeting),\n\(greetingName)"
     }
 
-    // MARK: - Pattern callback section
-    //
-    // Shows at most one thing: the soft safety resource card (if a crisis signal
-    // was detected) OR a single pattern callback. Never both, never a list.
-    @ViewBuilder
-    private var patternSection: some View {
-        if vm.showResourceCard {
-            VStack(alignment: .leading, spacing: 0) {
-                PatternResourceCardView(onDismiss: { vm.dismissResourceCard() })
-                    .padding(.horizontal, 20)
-                    .padding(.bottom, 28)
-            }
-            .transition(.move(edge: .top).combined(with: .opacity))
-        } else if let callback = vm.pendingCallback {
-            VStack(alignment: .leading, spacing: 0) {
-                sectionLabel("ninety noticed", count: nil)
-                    .padding(.horizontal, 24)
+    /// State-aware subtitle for the Today header.
+    ///
+    /// Deliberately has NO loading branch — see `headerReady` below, which
+    /// holds this (and `headerTitle`) invisible until every value it reads is
+    /// actually resolved, so the header commits to its wording once rather
+    /// than visibly rewriting itself.
+    private var headerSubtitle: String {
+        let weekday = Date().formatted(.dateTime.weekday(.wide))
 
-                PatternCallbackCardView(
-                    callback: callback,
-                    onTap:    { activeCallbackForStitch = callback },
-                    onNotNow: { vm.dismissCallback() },
-                    onMute:   { vm.muteCallback() },
-                    onAffirm: { vm.affirmCallback() }
-                )
-                .padding(.horizontal, 20)
-                .padding(.bottom, 28)
-            }
-            .transition(.move(edge: .top).combined(with: .opacity))
+        guard !vm.recentEntries.isEmpty else {
+            return "\(weekday) · welcome to your first day"
         }
+        guard let stats = vm.stats, stats.entryCount > 0, let last = stats.lastEntryAt else {
+            return weekday
+        }
+        if Calendar.current.isDateInToday(last) {
+            return "\(weekday) · you wrote today"
+        }
+        let lastWeekday = last.formatted(.dateTime.weekday(.wide))
+        return "\(weekday) · you last wrote on \(lastWeekday)"
     }
 
-    // MARK: - Header
+    /// Both header lines depend on data from two independent fetches
+    /// (entries, and — for a returning user only — stats). Gating on entries
+    /// alone would let the subtitle render without its entry count for a
+    /// frame whenever stats resolves slightly later, then silently gain it —
+    /// the exact flicker `entriesLoaded` was introduced to prevent. Day-one
+    /// never reads `stats`, so it doesn't wait on it.
+    private var headerReady: Bool {
+        vm.entriesLoaded && (vm.recentEntries.isEmpty || vm.statsLoaded)
+    }
+
+    // MARK: - Header (prototype "screen-head")
     private var headerSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(greetingText)
-                        .font(AppTheme.mono(size: 11))
-                        .foregroundStyle(AppTheme.inkSoft)
-                        .textCase(.uppercase)
-                        .tracking(2)
-
-                    Text(firstName)
-                        .font(AppTheme.editorialDisplay(size: 38))
-                        .foregroundStyle(AppTheme.ink)
-                }
-                Spacer()
-                Text(todayFormatted)
-                    .font(AppTheme.mono(size: 11))
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(headerTitle)
+                    .font(AppTheme.editorialDisplay(size: 30))
+                    .foregroundStyle(AppTheme.ink)
+                    .lineSpacing(2)
+                Text(headerSubtitle)
+                    .font(AppTheme.editorialBody(size: 15))
                     .foregroundStyle(AppTheme.inkSoft)
-                    .multilineTextAlignment(.trailing)
-
-                Button { showProfile = true } label: {
-                    Text(profileInitial)
-                        .font(.system(size: 16, weight: .heavy, design: .rounded))
-                        .foregroundStyle(AppTheme.ink)
-                        .frame(width: 40, height: 40)
-                        .background(
-                            LinearGradient(colors: [AppTheme.rose, AppTheme.lav],
-                                           startPoint: .topLeading, endPoint: .bottomTrailing)
-                        )
-                        .clipShape(Circle())
-                        .overlay(Circle().stroke(AppTheme.cream, lineWidth: 2))
-                        .shadow(color: AppTheme.rose.opacity(0.3), radius: 6, x: 0, y: 3)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Profile")
-                .padding(.leading, 4)
             }
+            // Fade on the READY state, not on the strings. Both lines hold
+            // their space (sized off whatever content is current) and arrive
+            // together once, already in their final wording.
+            .opacity(headerReady ? 1 : 0)
+            .animation(.easeInOut(duration: 0.25), value: headerReady)
+            Spacer()
+            // Single profile chip showing the user's initial.
+            Button { showProfile = true } label: {
+                avatarChip(profileInitial, colors: [AppTheme.rose, AppTheme.lav])
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Profile")
         }
-        .padding(.horizontal, 24)
+        .padding(.horizontal, 20)
         .padding(.top, 60)
-        .padding(.bottom, 32)
+        .padding(.bottom, 22)
     }
+
+    /// A circular gradient avatar chip (used in the header stack).
+    private func avatarChip(_ text: String, colors: [Color]) -> some View {
+        Text(text)
+            .font(.system(size: 14, weight: .heavy, design: .rounded))
+            .foregroundStyle(AppTheme.cream)
+            .frame(width: 38, height: 38)
+            .background(
+                LinearGradient(colors: colors,
+                               startPoint: .topLeading, endPoint: .bottomTrailing)
+            )
+            .clipShape(Circle())
+            .overlay(Circle().stroke(AppTheme.cream, lineWidth: 2))
+            .shadow(color: AppTheme.cardShadow, radius: 6, x: 0, y: 3)
+    }
+
+    // MARK: - Hero section
+    //
+    // "Today's Read" (a quiet, AI-generated line above the invitation card)
+    // was removed — see git history. `InvitationCardView` now carries the
+    // hero alone.
+
+    private var heroSection: some View {
+        invitationCard
+    }
+
+    /// The dark hero CTA — always present, always the primary way in.
+    private var invitationCard: some View {
+        InvitationCardView(
+            dayOne: vm.entriesLoaded ? vm.recentEntries.isEmpty : nil,
+            onPrimary: { showingDailyChat = true },
+            onMoreWays: { showingStartSheet = true }
+        )
+        .padding(.horizontal, 20)
+        .padding(.bottom, 16)
+    }
+
+    /// Five dots, filled for each distinct day written this week (capped at
+    /// 5 — a week can have more, the row doesn't grow). Non-judgmental by
+    /// design, matching onboarding's "no streaks" promise: no loss language,
+    /// nothing about a gap, just what happened.
+    @ViewBuilder
+    private var weekRow: some View {
+        if vm.entriesLoaded && !vm.recentEntries.isEmpty {
+            let filled = min(vm.daysWrittenThisWeek, 5)
+            HStack(spacing: 9) {
+                HStack(spacing: 4) {
+                    ForEach(0..<5, id: \.self) { i in
+                        Circle()
+                            .fill(i < filled ? AppTheme.terracotta : AppTheme.terracotta.opacity(0.28))
+                            .frame(width: 8, height: 8)
+                    }
+                }
+                Text("\(vm.daysWrittenThisWeek) \(vm.daysWrittenThisWeek == 1 ? "day" : "days") this week")
+                    .font(AppTheme.editorialBody(size: 12))
+                    .foregroundStyle(AppTheme.inkSoft)
+            }
+            .padding(.horizontal, 24)
+            .padding(.bottom, 20)
+        }
+    }
+
+    private func writtenTodayRow(entry: JournalEntry) -> some View {
+        Button {
+            router.showInJournal(entryId: entry.id)
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(AppTheme.terracotta)
+
+                Text("written today")
+                    .font(AppTheme.mono(size: 10))
+                    .foregroundStyle(AppTheme.inkSoft)
+                    .tracking(2)
+                    .textCase(.uppercase)
+
+                Spacer()
+
+                Text("See it in your Journal")
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .foregroundStyle(AppTheme.terracotta)
+                Image(systemName: "arrow.right")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(AppTheme.terracotta)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .background(AppTheme.cream.opacity(0.7))
+            .clipShape(Capsule())
+            .overlay(
+                Capsule().stroke(AppTheme.terracotta.opacity(0.20), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 20)
+        .padding(.bottom, 20)
+        .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+
+    // MARK: - A message from your past
+    //
+    // A Future Self letter you scheduled, or (failing that) a pending Echo the
+    // AI surfaced from one of your own entries. Never both, never a list — the
+    // letter wins because you chose to send it and it's date-certain.
+
+    @ViewBuilder
+    private var pastSlot: some View {
+        if let letter = vm.arrivedLetters.first {
+            letterArrivedCard(letter)
+        } else if let echo = vm.pendingEcho {
+            EchoCardView(
+                echo: echo,
+                onSkip: { vm.skipEcho() },
+                onNotYet: { vm.skipEcho() },
+                onAnswer: { answeringEcho = echo },
+                onThemeTap: { router.showInJournal(entryId: nil) }
+            )
+            .padding(.horizontal, 20)
+            .padding(.bottom, 14)
+        }
+    }
+
+    private func letterArrivedCard(_ entry: JournalEntry) -> some View {
+        Button { vm.openLetter(entry) } label: {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "envelope.open.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(AppTheme.gold)
+                    .padding(.top, 2)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("A LETTER HAS ARRIVED")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundStyle(AppTheme.gold)
+                        .tracking(1.5)
+
+                    Text("From you, \(entry.shortFormattedDate)")
+                        .font(AppTheme.editorialBody(size: 14))
+                        .foregroundStyle(AppTheme.ink)
+
+                    Text("Open it \u{2192}")
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .foregroundStyle(AppTheme.gold)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(16)
+            .background(AppTheme.gold.opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .stroke(AppTheme.gold.opacity(0.25), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 20)
+        .padding(.bottom, 14)
+    }
+
+    // MARK: - Spilr noticed (bridge to Mirror)
+
+    @ViewBuilder
+    private var spilrNoticedCard: some View {
+        if let title = mirrorVM.bridgeInsightTitle {
+            Button { router.showMirror() } label: {
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(AppTheme.lav)
+                        .padding(.top, 2)
+
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("SPILR NOTICED")
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .foregroundStyle(AppTheme.lav)
+                            .tracking(1.5)
+
+                        Text(title)
+                            .font(AppTheme.editorialBody(size: 14))
+                            .foregroundStyle(AppTheme.ink)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .lineLimit(2)
+
+                        Text("See it in Mirror \u{2192}")
+                            .font(.system(size: 13, weight: .bold, design: .rounded))
+                            .foregroundStyle(AppTheme.lav)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(16)
+                .background(AppTheme.lav.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(AppTheme.lav.opacity(0.25), lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 14)
+        }
+    }
+
+    // MARK: - Ask your journal pill
+
+    @ViewBuilder
+    private var askJournalPill: some View {
+        if vm.recentEntries.count >= 5 {
+            Button { showAsk = true } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(AppTheme.terracotta)
+                    Text("Ask your journal anything\u{2026}")
+                        .font(AppTheme.editorialBody(size: 14))
+                        .foregroundStyle(AppTheme.inkSoft)
+                    Spacer()
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 12)
+                .background(AppTheme.cream.opacity(0.7))
+                .clipShape(Capsule())
+                .overlay(
+                    Capsule().stroke(AppTheme.inkSoft.opacity(0.12), lineWidth: 1)
+                )
+                .shadow(color: AppTheme.cardShadow, radius: 8, x: 0, y: 3)
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 24)
+        }
+    }
+
 
     /// First letter of the user's display name (or email) for the avatar chip.
     private var profileInitial: String {
@@ -428,350 +811,5 @@ struct HomeView: View {
             ?? "·"
         return String(source.prefix(1)).uppercased()
     }
-
-    // MARK: - Daily mood check-in
-    //
-    // A partial-screen, journal-free way to log how today feels. Tapping the
-    // CTA writes a MoodLog and never opens the editor.
-    private var moodCheckInSection: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            sectionLabel(vm.todayMood == nil ? "How's today?" : "Today's mood", count: nil)
-                .padding(.horizontal, 24)
-
-            MoodBlobView(existingMood: vm.todayMood) { mood in
-                // Log the mood, then redirect into the journal editor with it
-                // pre-selected so a check-in flows straight into writing.
-                vm.logMood(mood)
-                moodForEditor = mood
-                showingFreeWrite = true
-            }
-            .padding(.horizontal, 20)
-            .padding(.bottom, 32)
-        }
-    }
-
-    // MARK: - Letters section
-    private var lettersSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            sectionLabel("Letters from past you", count: vm.arrivedLetters.count)
-
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 12) {
-                    ForEach(vm.arrivedLetters) { letter in
-                        LetterCardView(entry: letter) {
-                            openedLetter = letter
-                            vm.openLetter(letter)
-                        }
-                    }
-                }
-                .padding(.horizontal, 24)
-                .padding(.bottom, 4)
-            }
-        }
-        .padding(.bottom, 28)
-    }
-
-    // MARK: - Echo section
-    //
-    // Lives above the prompt card. Only renders when there's a surfaceable echo.
-    // The card animates in/out with a combined slide+fade.
-    @ViewBuilder
-    private var echoSection: some View {
-        if let echo = vm.pendingEcho {
-            VStack(alignment: .leading, spacing: 0) {
-                sectionLabel("an echo", count: nil)
-                    .padding(.horizontal, 24)
-
-                EchoCardView(
-                    echo: echo,
-                    onSkip:     { vm.skipEcho() },
-                    onNotYet:   { vm.skipEcho() },
-                    // Capture the echo at tap time — the sheet(item:) binding
-                    // holds its own stable reference so content never flickers
-                    // if vm.pendingEcho is cleared during the dismiss animation.
-                    onAnswer:   { activeEchoForAnswer = echo },
-                    onThemeTap: { activeEchoForTheme  = echo }
-                )
-                .padding(.horizontal, 20)
-                .padding(.bottom, 24)
-            }
-            .transition(.move(edge: .top).combined(with: .opacity))
-        }
-    }
-
-    // MARK: - Daily hook — Today's Read (replaces the prompt card) or fallback prompt
-    //
-    // Per the product pivot, The Read is the active daily vehicle. When a read is
-    // available it takes the primary slot; the plain prompt card is the fallback
-    // for brand-new users (no entries yet) or a held-back read.
-    @ViewBuilder
-    private var promptCard: some View {
-        if let read = vm.todayRead {
-            VStack(alignment: .leading, spacing: 0) {
-                TodayReadCardView(
-                    read:    read,
-                    onReply: { showingNinetySecond = true }
-                )
-                .padding(.horizontal, 20)
-                .padding(.bottom, 32)
-            }
-            .transition(.opacity)
-        } else {
-            fallbackPromptCard
-        }
-    }
-
-    // MARK: - Today's prompt card (fallback)
-    private var fallbackPromptCard: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            sectionLabel("Today's prompt", count: nil)
-                .padding(.horizontal, 24)
-
-            VStack(alignment: .leading, spacing: 20) {
-                // Prompt text
-                Text(LocalAI.todayPrompt())
-                    .font(AppTheme.editorialDisplay(size: 28))
-                    .foregroundStyle(AppTheme.cream)
-                    .lineSpacing(4)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                VStack(spacing: 12) {
-                    // Primary CTA — just start writing.
-                    Button {
-                        showingFreeWrite = true
-                    } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: "pencil.line")
-                                .font(.system(size: 15, weight: .semibold))
-                            Text("Start writing")
-                                .font(.system(size: 16, weight: .semibold))
-                        }
-                        .foregroundStyle(AppTheme.terracotta)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
-                        .background(AppTheme.cream)
-                        .clipShape(Capsule())
-                    }
-
-                    // Secondary — the 90-second mode, quieter.
-                    Button {
-                        showingNinetySecond = true
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "sparkles")
-                                .font(.system(size: 12, weight: .medium))
-                            Text("No words yet? Start with a hint")
-                                .font(.system(size: 13, weight: .medium))
-                        }
-                        .foregroundStyle(AppTheme.cream.opacity(0.85))
-                    }
-                }
-            }
-            .padding(24)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(AppTheme.ink)
-            .clipShape(RoundedRectangle(cornerRadius: 20))
-            .padding(.horizontal, 20)
-            .padding(.bottom, 32)
-        }
-    }
-
-    // MARK: - Recent entries
-    private var recentSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            sectionLabel("Recent entries", count: nil)
-                .padding(.horizontal, 24)
-
-            if vm.isLoading && vm.recentEntries.isEmpty {
-                ProgressView()
-                    .frame(maxWidth: .infinity)
-                    .padding()
-            } else if vm.recentEntries.isEmpty {
-                FriendlyEmptyState(
-                    title: "No entries yet.",
-                    subtitle: "Write as much or as little as you like. Your river starts with one entry."
-                )
-                .padding(.vertical, 28)
-            } else {
-                VStack(spacing: 10) {
-                    ForEach(vm.recentEntries) { entry in
-                        NavigationLink {
-                            JournalEditorView(
-                                userId: vm.userId,
-                                existingEntry: entry
-                            ) { Task { await vm.load() } }
-                        } label: {
-                            JournalCardView(entry: entry)
-                        }
-                        .buttonStyle(.plain)
-                        .padding(.horizontal, 20)
-                    }
-                }
-                .padding(.bottom, 100)
-            }
-        }
-    }
-
-    // MARK: - Helpers
-    private func sectionLabel(_ text: String, count: Int?) -> some View {
-        HStack(spacing: 8) {
-            Text(text.uppercased())
-                .font(AppTheme.mono(size: 10))
-                .foregroundStyle(AppTheme.inkSoft)
-                .tracking(1.5)
-            if let count {
-                Text("\(count)")
-                    .font(AppTheme.mono(size: 10))
-                    .foregroundStyle(AppTheme.cream)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(AppTheme.terracotta)
-                    .clipShape(Capsule())
-            }
-            Rectangle()
-                .fill(AppTheme.inkSoft.opacity(0.15))
-                .frame(height: 1)
-        }
-        .padding(.bottom, 4)
-    }
-
-    private var greetingText: String {
-        let hour = Calendar.current.component(.hour, from: Date())
-        switch hour {
-        case 5..<12:  return "Good morning"
-        case 12..<17: return "Good afternoon"
-        case 17..<22: return "Good evening"
-        default:      return "Late night"
-        }
-    }
-
-    private var firstName: String {
-        let name = authViewModel.currentUser?.displayName ?? authViewModel.currentUser?.email ?? "there"
-        return name.components(separatedBy: " ").first ?? name
-    }
-
-    private var todayFormatted: String {
-        Date().formatted(.dateTime.weekday(.wide)) + "\n" +
-        Date().formatted(.dateTime.month().day().year())
-    }
 }
 
-// MARK: - Letter Card View (horizontal scroll)
-struct LetterCardView: View {
-    let entry: JournalEntry
-    let onTap: () -> Void
-
-    var body: some View {
-        Button(action: onTap) {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Text("✉")
-                        .font(.title2)
-                    Spacer()
-                    Text("tap to open")
-                        .font(AppTheme.mono(size: 9))
-                        .foregroundStyle(AppTheme.inkSoft)
-                        .tracking(1)
-                }
-                Text("From you,")
-                    .font(AppTheme.mono(size: 10))
-                    .foregroundStyle(AppTheme.inkSoft)
-                    .tracking(1)
-                Text(entry.createdAt.formatted(.dateTime.month(.wide).day().year()))
-                    .font(AppTheme.editorialDisplay(size: 15))
-                    .foregroundStyle(AppTheme.ink)
-
-                Text(String(entry.content.prefix(80)) + (entry.content.count > 80 ? "…" : ""))
-                    .font(AppTheme.editorialBody(size: 13))
-                    .foregroundStyle(AppTheme.inkSoft)
-                    .lineLimit(3)
-                    .lineSpacing(2)
-            }
-            .padding(16)
-            .frame(width: 220)
-            .background(AppTheme.cream)
-            .clipShape(RoundedRectangle(cornerRadius: 16))
-            .overlay(
-                RoundedRectangle(cornerRadius: 16)
-                    .stroke(AppTheme.terracotta.opacity(0.3), lineWidth: 1.5)
-            )
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-// MARK: - Letter Read View
-struct LetterReadView: View {
-    let entry: JournalEntry
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            ZStack {
-                AppTheme.paper.ignoresSafeArea()
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 24) {
-                        // Envelope header
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("FROM: YOU")
-                                .font(AppTheme.mono(size: 10))
-                                .foregroundStyle(AppTheme.inkSoft)
-                                .tracking(2)
-                            Text(entry.createdAt.formatted(.dateTime.weekday(.wide).month(.wide).day().year()))
-                                .font(AppTheme.editorialDisplay(size: 22))
-                                .foregroundStyle(AppTheme.ink)
-                            if let deliveryDate = entry.futureSelfDeliveryDate {
-                                Text("Delivered \(deliveryDate.formatted(.dateTime.month(.wide).day().year()))")
-                                    .font(AppTheme.mono(size: 10))
-                                    .foregroundStyle(AppTheme.terracotta)
-                                    .tracking(1)
-                            }
-                        }
-                        .padding(.top, 8)
-
-                        Divider()
-                            .overlay(AppTheme.inkSoft.opacity(0.2))
-
-                        // The entry content
-                        Text(entry.content)
-                            .font(AppTheme.editorialBody(size: 17))
-                            .foregroundStyle(AppTheme.ink)
-                            .lineSpacing(6)
-
-                        // AI summary if present
-                        if !entry.aiSummaryBullets.isEmpty {
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text("WHAT YOU FELT THEN")
-                                    .font(AppTheme.mono(size: 10))
-                                    .foregroundStyle(AppTheme.terracotta)
-                                    .tracking(2)
-                                ForEach(Array(entry.aiSummaryBullets.enumerated()), id: \.offset) { _, bullet in
-                                    HStack(alignment: .top, spacing: 8) {
-                                        Text("—").foregroundStyle(AppTheme.terracotta)
-                                        Text(bullet).foregroundStyle(AppTheme.inkSoft)
-                                    }
-                                    .font(AppTheme.editorialBody(size: 14))
-                                }
-                            }
-                            .padding(16)
-                            .background(AppTheme.paperWarm)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                        }
-
-                        Spacer(minLength: 80)
-                    }
-                    .padding(.horizontal, 24)
-                    .padding(.top, 16)
-                }
-            }
-            .navigationTitle("Letter from past you")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Done") { dismiss() }
-                        .foregroundStyle(AppTheme.terracotta)
-                }
-            }
-        }
-    }
-}

@@ -4,6 +4,7 @@
 //
 
 import Foundation
+import UIKit
 
 @MainActor
 final class JournalEditorViewModel: ObservableObject {
@@ -33,6 +34,17 @@ final class JournalEditorViewModel: ObservableObject {
     private var isDraftEligible: Bool { existingEntry == nil }
 
     var isEditing: Bool { existingEntry != nil }
+
+    /// The date to show in the editor header — the entry's real creation date when
+    /// editing an existing entry, or today for new entries.
+    var entryDate: Date { existingEntry?.createdAt ?? Date() }
+
+    /// Download URL of the entry's attached photo (when viewing an existing entry).
+    var photoURL: String? { existingEntry?.photoURL }
+
+    /// The existing entry's session type, for analytics — irrelevant for a
+    /// brand-new entry (there's nothing to have "viewed" yet).
+    var sessionTypeLabel: String? { existingEntry?.sessionType.rawValue }
 
     /// The entry to render into a shareable card: the freshly-saved one if we
     /// have it, otherwise the entry being edited.
@@ -98,15 +110,23 @@ final class JournalEditorViewModel: ObservableObject {
     // Step 2 (background Task): call Gemini and patch the entry if the API
     //   key is present. Fires-and-forgets — any failure is silently swallowed
     //   so it never blocks the user.
-    func save() {
+    //
+    // `photo` is an optional UIImage to attach (edit mode allows replacing /
+    // adding a photo). When non-nil, it is uploaded in the background and the
+    // entry's photoURL is patched — same pattern as TimedSessionViewModel.
+    func save(photo: UIImage? = nil) {
         guard canSave else { return }
         errorMessage = nil
 
         let trimmed   = content.trimmingCharacters(in: .whitespacesAndNewlines)
         let sentiment = sentimentLabel ?? LocalAI.detectSentiment(from: trimmed)
-        let localRef  = NinetyVoice.localReflection(from: trimmed, sentiment: sentiment)
+        let localRef  = SpilrVoice.localReflection(from: trimmed, sentiment: sentiment)
         let bullets   = aiSummaryBullets.isEmpty ? localRef.observations : aiSummaryBullets
         let question  = aiQuestion ?? localRef.question
+
+        if let selectedMood {
+            AnalyticsManager.shared.trackMoodLogged(mood: selectedMood.rawValue)
+        }
 
         let savedId: String
         if var entry = existingEntry {
@@ -120,6 +140,8 @@ final class JournalEditorViewModel: ObservableObject {
             service.updateEntry(entry)
             savedEntry = entry
             savedId = entry.id
+
+            AnalyticsManager.shared.logEvent(.entryEdited)
         } else {
             // New entry: enrich the user's own tags with a few content-derived
             // topical tags (work, sleep, people, …) so cards aren't limited to a
@@ -141,6 +163,17 @@ final class JournalEditorViewModel: ObservableObject {
             service.createEntry(entry)
             savedEntry = entry
             savedId = entry.id
+
+            let wordCount = trimmed.split(separator: " ").count
+            AnalyticsManager.shared.trackEntryCreated(
+                sessionType: "freeWrite",
+                wordCount: wordCount,
+                hasMood: selectedMood != nil,
+                hasPhoto: photo != nil,
+                hasAI: !bullets.isEmpty,
+                duration: Date().timeIntervalSince(entry.createdAt)
+            )
+            SessionManager.shared.recordEntryWritten()
         }
 
         // The entry is committed — drop any saved draft so it doesn't resurface.
@@ -173,15 +206,29 @@ final class JournalEditorViewModel: ObservableObject {
             }
         }
 
-        // River mark — regenerate on every save (new or edited) so the river
-        // reflects the latest text. Local-first, Gemini-upgraded if keyed.
+        // Mirror analysis (Prompt A) — produces the structured EntryAnalysis that
+        // the whole Mirror / Self-Model / pattern-mining chain depends on. Runs on
+        // every save (new or edited) so re-edited text re-analyses. analyzeEntry
+        // never throws (returns a local fallback) and persists itself to
+        // users/{uid}/entryAnalyses/{entryId}, so this is pure fire-and-forget.
         Task.detached(priority: .background) {
-            await RiverService().generateMark(
-                entryText:      trimmed,
-                entryId:        savedId,
-                userId:         uid,
-                entryCreatedAt: entryCreatedAt
+            _ = await AIService.shared.analyzeEntry(
+                entryId: savedId,
+                userId:  uid,
+                text:    trimmed
             )
+        }
+
+        // Photo upload — best-effort, never blocks the save. Patches the entry
+        // with the download URL once the upload completes.
+        if let photo {
+            Task.detached(priority: .utility) {
+                if let url = await PhotoUploadService.shared.uploadEntryPhoto(
+                    photo, userId: uid, entryId: savedId
+                ) {
+                    svc.updateEntryPhotoURL(entryId: savedId, userId: uid, url: url)
+                }
+            }
         }
     }
 
@@ -191,8 +238,6 @@ final class JournalEditorViewModel: ObservableObject {
     func delete() {
         guard let entry = existingEntry else { return }
         service.deleteEntry(entry)
-        // Derived data follows the entry — drop its river mark too.
-        RiverService().deleteMark(entryId: entry.id, userId: userId)
         didDeleteSuccessfully = true
     }
 

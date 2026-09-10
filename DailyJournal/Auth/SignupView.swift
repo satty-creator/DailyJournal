@@ -31,14 +31,14 @@ struct SignupView: View {
                 VStack(spacing: 8) {
                     Image(systemName: "book.fill")
                         .font(.system(size: 60))
-                        .foregroundColor(AppTheme.primary)
+                        .foregroundStyle(AppTheme.primary)
 
                     Text("Start Your Journey")
                         .font(.largeTitle.bold())
 
                     Text("Create an account to begin")
                         .font(.subheadline)
-                        .foregroundColor(.secondary)
+                        .foregroundStyle(.secondary)
                 }
                 .padding(.top, 60)
 
@@ -86,7 +86,7 @@ struct SignupView: View {
                         if !passwordsMatch {
                             Text("Passwords do not match")
                                 .font(.caption)
-                                .foregroundColor(.red)
+                                .foregroundStyle(.red)
                                 .padding(.leading, 4)
                         }
                     }
@@ -120,16 +120,28 @@ struct SignupView: View {
                 // Switch to Login
                 HStack {
                     Text("Already have an account?")
-                        .foregroundColor(.secondary)
+                        .foregroundStyle(.secondary)
                     Button("Sign In") { onSwitchToLogin() }
-                        .foregroundColor(AppTheme.primary)
+                        .foregroundStyle(AppTheme.primary)
                         .fontWeight(.semibold)
                 }
                 .font(.subheadline)
+
+                // Guest mode — satisfies App Store Guideline 5.1.1(v)
+                Button {
+                    Task { await authViewModel.continueAsGuest() }
+                } label: {
+                    Text("Continue without account")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .underline()
+                }
+                .disabled(authViewModel.isLoading)
 
                 Spacer(minLength: 40)
             }
             .padding(.horizontal, 24)
         }
+        .trackScreen(.authSignup)
     }
 }

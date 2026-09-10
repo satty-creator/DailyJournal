@@ -67,9 +67,11 @@ struct Echo: Identifiable, Codable {
     let createdAt: Date
     var answeredAt: Date?
     /// For .theme type only — the specific keyword / name that recurs across entries
-    /// (e.g. "dad", "the promotion"). Used to drive ThemeCompilationView search.
+    /// (e.g. "dad", "the promotion"). The drill-down view that used this to
+    /// search matching entries was cut (Journal's own search covers it); kept
+    /// here as it's still written by extraction and costs nothing unused.
     var themeKeyword: String?
-    /// ninety's voice line that FRAMES the quote (shown above it). The whole point
+    /// Spilr's voice line that FRAMES the quote (shown above it). The whole point
     /// of an echo's depth — a perspective, not a replay. Optional + default-safe.
     var line: String?
 

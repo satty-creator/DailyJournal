@@ -2,21 +2,20 @@
 //  PushNotificationManager.swift
 //  DailyJournal
 //
-//  Firebase Cloud Messaging (FCM) plumbing for "Today's Read" push.
+//  Firebase Cloud Messaging (FCM) plumbing — device token registration.
 //
 //  Flow:
 //    1. The app asks the user for notification permission, then registers with
 //       APNs (Apple Push Notification service).
 //    2. FCM sits on top of APNs and hands us a device token via the
 //       MessagingDelegate.
-//    3. We persist that token at `users/{uid}/pushTokens/{token}` so the overnight
-//       `generateDailyReads` Cloud Function can target this device when it writes
-//       a fresh read.
+//    3. We persist that token at `users/{uid}/pushTokens/{token}` for any
+//       future server-side push to target this device.
 //
 //  CONSOLE STEP (one-time, not code): an APNs Auth Key (.p8) must be uploaded to
 //  the Firebase project under Project Settings → Cloud Messaging, and the app
 //  target needs the Push Notifications capability + the "remote notification"
-//  background mode. See todaysreadprd.md → "Push notifications".
+//  background mode.
 //
 
 import Foundation

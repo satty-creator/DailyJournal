@@ -10,87 +10,6 @@ import Foundation
 
 enum LocalAI {
 
-    // MARK: - Daily Prompts Bank
-    static let prompts: [String] = [
-        "How are you, actually?",
-        "What's been taking up the most space in your head today?",
-        "What are you pretending not to know?",
-        "Name one thing that felt like resistance today.",
-        "What do you need that you haven't asked for?",
-        "What would you tell a close friend in your exact situation right now?",
-        "What went unnoticed today that deserved more attention?",
-        "What are you doing out of obligation rather than choice?",
-        "What would make tomorrow feel meaningfully different from today?",
-        "Who showed up for you this week, even in a small way?",
-        "What emotion have you been carrying around all day without naming it?",
-        "What's the thing you keep starting but not finishing?",
-        "If today had a weather forecast, what would it be?",
-        "What are you most afraid to admit — even to yourself?",
-        "What would you need to let go of to feel lighter?",
-        "Who's voice is loudest in your head when you imagine failing?",
-        "What small thing brought you unexpected comfort today?",
-        "What's a belief you're holding that might not actually be true?",
-        "What did your body try to tell you today that you ignored?",
-        "What are you tolerating that you don't have to?",
-        "What would the most honest version of you say right now?",
-        "What are you proud of that you haven't said out loud yet?",
-        "If this week were a chapter in a book, what would the title be?",
-        "What conversation have you been avoiding?",
-        "What do you keep returning to, mentally, like a bruise you keep pressing?",
-        "What's something that used to feel hard that now feels easy?",
-        "Where are you being too hard on yourself?",
-        "What are you genuinely curious about right now?",
-        "What feels unfinished — not in a task sense, but emotionally?",
-        "What's one thing you did today that future-you will be glad about?"
-    ]
-
-    static func todayPrompt() -> String {
-        let day = Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 0
-        return prompts[day % prompts.count]
-    }
-
-    // MARK: - Mood-based prompt
-    //
-    // When a user logs a mood and is redirected into the editor, the starter
-    // should meet that mood rather than being generic. Returns one prompt tuned
-    // to the mood's valence.
-    static func moodPrompt(for mood: Mood) -> String {
-        let options: [String]
-        switch mood {
-        case .amazing:
-            options = [
-                "Something's clearly good today — what is it, and what made it land?",
-                "What went right today that you want to remember later?",
-                "Where did the good feeling actually come from?"
-            ]
-        case .good:
-            options = [
-                "What gave today its lift — even a small thing?",
-                "What's one good moment worth keeping from today?",
-                "What made today feel okay-to-good?"
-            ]
-        case .neutral:
-            options = [
-                "Today felt even — what's underneath the ordinary?",
-                "Nothing loud today. What quietly mattered anyway?",
-                "If today felt flat, what were you actually doing?"
-            ]
-        case .bad:
-            options = [
-                "Something weighed on today — what was it? Start anywhere.",
-                "What made today harder than you'd have liked?",
-                "What's the heaviest thing about today, said plainly?"
-            ]
-        case .terrible:
-            options = [
-                "Today was rough. What happened — you don't have to make it tidy.",
-                "What hurt most today? One sentence is enough.",
-                "What do you most need to get off your chest about today?"
-            ]
-        }
-        return options[Int.random(in: 0..<options.count)]
-    }
-
     // MARK: - Sentiment Detection
 
     /// The full set of sentiment labels the app recognises. Shared so the Gemini
@@ -112,33 +31,97 @@ enum LocalAI {
     static func detectSentiment(from text: String) -> String {
         let lower = text.lowercased()
 
+        // Negation context: phrases like "not happy", "don't feel anxious" should
+        // not count toward positive/negative keywords. We check for negation in the
+        // 4 words preceding a match.
+        let words = lower.components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+        let negators = Set(["not", "no", "never", "don't", "didn't", "doesn't",
+                             "won't", "wasn't", "haven't", "can't", "couldn't"])
+
+        /// Counts keyword occurrences in `lower`, discounting those preceded by a negator.
+        func scoreGroup(_ keywords: [String]) -> Double {
+            var score: Double = 0
+            for kw in keywords {
+                var searchRange = lower.startIndex..<lower.endIndex
+                while let range = lower.range(of: kw, range: searchRange) {
+                    // Check for negation: scan back up to 4 tokens before this match
+                    let prefix = String(lower[..<range.lowerBound])
+                    let preWords = prefix
+                        .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                        .filter { !$0.isEmpty }.suffix(4)
+                    let negated = preWords.contains { negators.contains($0) }
+                    score += negated ? -0.5 : 1.0
+                    searchRange = range.upperBound..<lower.endIndex
+                }
+            }
+            return max(score, 0)
+        }
+
+        // Higher-weight phrases are entered first; single words second.
         struct SentimentGroup {
             let label: String
-            let keywords: [String]
+            let weight: Double
+            let phrases: [String]
+            let single: [String]
         }
 
         let groups: [SentimentGroup] = [
-            SentimentGroup(label: "Anxious",    keywords: ["anxious", "anxiety", "worried", "worry", "stress", "stressed", "nervous", "overwhelm", "overwhelmed", "panic", "racing", "dread", "scared", "fear", "afraid", "terrified", "on edge"]),
-            SentimentGroup(label: "Excited",    keywords: ["excited", "thrilled", "amazing", "fantastic", "elated", "joy", "joyful", "ecstatic", "pumped", "stoked", "can't wait", "looking forward", "buzzing"]),
-            SentimentGroup(label: "Happy",      keywords: ["happy", "great", "wonderful", "good day", "content", "glad", "pleased", "smile", "smiled", "laugh", "laughed", "fun", "enjoyed", "lovely"]),
-            SentimentGroup(label: "Grateful",   keywords: ["grateful", "thankful", "gratitude", "blessed", "appreciate", "appreciated", "lucky"]),
-            SentimentGroup(label: "Sad",        keywords: ["sad", "crying", "cried", "tears", "grief", "grieving", "loss", "heartbreak", "heartbroken", "hurt", "devastated", "down", "empty", "blue"]),
-            SentimentGroup(label: "Lonely",     keywords: ["lonely", "alone", "isolated", "left out", "missing", "miss ", "no one", "nobody"]),
-            SentimentGroup(label: "Frustrated", keywords: ["frustrated", "annoyed", "irritated", "angry", "anger", "furious", "mad", "upset", "fed up", "sick of", "resent", "rage"]),
-            SentimentGroup(label: "Tired",      keywords: ["tired", "exhausted", "drained", "burnt out", "burned out", "worn out", "no energy", "sleepy", "depleted"]),
-            SentimentGroup(label: "Calm",       keywords: ["calm", "peaceful", "serene", "relaxed", "quiet", "still", "centred", "centered", "balanced", "grounded", "at ease", "settled"]),
-            SentimentGroup(label: "Hopeful",    keywords: ["hopeful", "optimistic", "looking up", "better", "progress", "forward", "beginning", "fresh start", "things will"]),
-            SentimentGroup(label: "Proud",      keywords: ["proud", "accomplished", "achieved", "nailed it", "did it", "finished", "shipped", "won"]),
-            SentimentGroup(label: "Uncertain",  keywords: ["not sure", "don't know", "confused", "unsure", "unclear", "lost", "no idea", "maybe", "perhaps", "wondering", "torn", "conflicted"])
+            SentimentGroup(label: "Anxious", weight: 1.0,
+                phrases: ["can't stop thinking", "what if", "on edge", "can't breathe", "heart racing", "about to lose it"],
+                single: ["anxious", "anxiety", "worried", "worry", "stress", "stressed", "nervous",
+                         "overwhelm", "overwhelmed", "panic", "dread", "scared", "fear", "afraid", "terrified"]),
+            SentimentGroup(label: "Excited", weight: 1.2,
+                phrases: ["can't wait", "looking forward", "so excited", "really excited", "finally happening"],
+                single: ["excited", "thrilled", "elated", "joy", "joyful", "ecstatic", "pumped",
+                         "stoked", "buzzing", "fantastic", "over the moon"]),
+            SentimentGroup(label: "Happy", weight: 1.0,
+                phrases: ["good day", "really good", "feeling good", "felt good", "made me happy",
+                          "made me smile", "nice day"],
+                single: ["happy", "wonderful", "content", "glad", "pleased", "smile", "smiled",
+                         "laugh", "laughed", "fun", "enjoyed", "lovely", "great day"]),
+            SentimentGroup(label: "Grateful", weight: 1.1,
+                phrases: ["so grateful", "really grateful", "feel lucky", "feeling lucky", "feel blessed"],
+                single: ["grateful", "thankful", "gratitude", "blessed", "appreciate", "appreciated", "lucky"]),
+            SentimentGroup(label: "Sad", weight: 1.1,
+                phrases: ["heartbroken", "fell apart", "can't stop crying", "broke my heart", "feeling empty", "feel empty"],
+                single: ["sad", "crying", "cried", "tears", "grief", "grieving", "loss",
+                         "heartbreak", "hurt", "devastated", "empty", "blue", "hollow", "gutted"]),
+            SentimentGroup(label: "Lonely", weight: 1.1,
+                phrases: ["no one understands", "no one cares", "left out", "miss them", "no one to talk to", "all alone"],
+                single: ["lonely", "isolated", "missing", "nobody", "disconnected"]),
+            SentimentGroup(label: "Frustrated", weight: 1.0,
+                phrases: ["fed up", "sick of", "so annoying", "drives me crazy", "so angry"],
+                single: ["frustrated", "annoyed", "irritated", "angry", "anger", "furious",
+                         "mad", "resent", "rage", "fuming", "resentful"]),
+            SentimentGroup(label: "Tired", weight: 1.0,
+                phrases: ["burnt out", "burned out", "worn out", "no energy", "can't keep going", "running on empty"],
+                single: ["exhausted", "drained", "depleted", "tired", "sleepy", "fatigued"]),
+            SentimentGroup(label: "Calm", weight: 0.9,
+                phrases: ["at peace", "at ease", "feeling settled", "feeling calm", "slowed down", "nice and quiet"],
+                single: ["calm", "peaceful", "serene", "relaxed", "still", "centred", "centered",
+                         "balanced", "grounded", "settled"]),
+            SentimentGroup(label: "Hopeful", weight: 1.0,
+                phrases: ["things are looking up", "fresh start", "new beginning", "feel hopeful", "getting better"],
+                single: ["hopeful", "optimistic", "encouraged", "turning around", "positive"]),
+            SentimentGroup(label: "Proud", weight: 1.1,
+                phrases: ["really proud", "so proud", "nailed it", "did it", "finally finished", "shipped it"],
+                single: ["proud", "accomplished", "achieved", "succeeded", "completed", "breakthrough"]),
+            SentimentGroup(label: "Uncertain", weight: 0.9,
+                phrases: ["not sure", "don't know", "no idea", "can't decide", "going back and forth", "torn between"],
+                single: ["confused", "unsure", "unclear", "lost", "wondering", "conflicted", "ambivalent"])
         ]
 
-        var scores: [String: Int] = [:]
+        var scores: [String: Double] = [:]
         for group in groups {
-            let count = group.keywords.filter { lower.contains($0) }.count
-            if count > 0 { scores[group.label] = count }
+            let phraseScore = scoreGroup(group.phrases) * 1.8 // phrases worth more
+            let wordScore   = scoreGroup(group.single)
+            let total = (phraseScore + wordScore) * group.weight
+            if total > 0 { scores[group.label] = total }
         }
 
-        // Only fall back to "Reflective" when nothing emotional registers at all.
+        // Tie-break: if two labels are within 10% of each other, prefer the one
+        // with stronger phrase matches.
         return scores.max(by: { $0.value < $1.value })?.key ?? "Reflective"
     }
 
@@ -147,32 +130,125 @@ enum LocalAI {
     // Light, on-device topic extraction so entries pick up meaningful subject
     // tags (work, sleep, people, …) beyond the mood/sentiment word. Returns at
     // most `limit` tags, ordered by how strongly each topic registers.
+    //
+    // Design notes:
+    // • A topic must reach a minimum score threshold to appear — single-word
+    //   coincidences ("I was tired" → "sleep") no longer win a tag.
+    // • High-signal phrases (e.g. "project deadline") score 2×.
+    // • Ambiguous words that appear in multiple categories are downweighted.
     static func extractTopics(from text: String, limit: Int = 3) -> [String] {
         let lower = text.lowercased()
 
-        let topics: [(tag: String, keywords: [String])] = [
-            ("work",     ["work", "job", "boss", "meeting", "deadline", "project", "office", "career", "colleague", "manager", "shift", "client"]),
-            ("sleep",    ["sleep", "slept", "tired", "insomnia", "nap", "rest", "bed", "exhausted", "awake"]),
-            ("people",   ["friend", "friends", "family", "mum", "mom", "dad", "partner", "wife", "husband", "people", "conversation", "talked", "call", "called"]),
-            ("money",    ["money", "rent", "bills", "budget", "salary", "spent", "broke", "afford", "savings", "pay"]),
-            ("food",     ["food", "ate", "eating", "meal", "cooked", "dinner", "lunch", "breakfast", "hungry", "snack"]),
-            ("health",   ["sick", "doctor", "health", "pain", "headache", "anxiety", "therapy", "meds", "ill"]),
-            ("exercise", ["gym", "run", "ran", "running", "walk", "walked", "workout", "exercise", "yoga", "lifted", "training"]),
-            ("home",     ["home", "house", "apartment", "clean", "chores", "laundry", "tidy", "room"]),
-            ("love",     ["love", "relationship", "date", "dating", "crush", "breakup", "ex ", "romance"]),
-            ("study",    ["study", "studying", "exam", "class", "school", "homework", "assignment", "uni", "university", "course"]),
-            ("creativity", ["wrote", "writing", "music", "paint", "painting", "draw", "drawing", "create", "creative", "art"]),
-            ("nature",   ["outside", "walk", "park", "beach", "garden", "sun", "rain", "weather", "nature", "sky"])
+        struct TopicDef {
+            let tag: String
+            let phrases: [String]   // 2-word or distinctive phrases (score 2 each)
+            let single: [String]    // individual words (score 1 each)
+            let minScore: Int       // minimum to qualify
+        }
+
+        let topics: [TopicDef] = [
+            TopicDef(tag: "work",
+                phrases: ["at work", "the office", "my boss", "my manager", "work meeting",
+                          "project deadline", "work project", "my colleague", "my job", "new job"],
+                single: ["work", "job", "boss", "meeting", "deadline", "project", "office",
+                         "career", "colleague", "manager", "shift", "client", "presentation"],
+                minScore: 2),
+            TopicDef(tag: "sleep",
+                phrases: ["couldn't sleep", "can't sleep", "slept badly", "up all night",
+                          "sleep deprived", "barely slept", "woke up"],
+                single: ["insomnia", "sleepless", "slept", "nap", "exhausted", "awake", "bedtime"],
+                minScore: 2),
+            TopicDef(tag: "people",
+                phrases: ["my friend", "my family", "talked to", "called them", "called her",
+                          "called him", "my partner", "my mum", "my mom", "my dad"],
+                single: ["friend", "friends", "family", "mum", "mom", "dad", "partner",
+                         "wife", "husband", "brother", "sister", "colleague", "coworker"],
+                minScore: 2),
+            TopicDef(tag: "money",
+                phrases: ["can't afford", "money stress", "paying rent", "financial stress",
+                          "saving up", "spent too much", "money problem"],
+                single: ["money", "rent", "bills", "budget", "salary", "broke", "afford",
+                         "savings", "debt", "loan", "pay", "financial"],
+                minScore: 2),
+            TopicDef(tag: "food",
+                phrases: ["had dinner", "had lunch", "had breakfast", "ate too much",
+                          "skipped eating", "cooked a meal", "what i ate"],
+                single: ["eating", "meal", "cooked", "dinner", "lunch", "breakfast", "hungry", "snack"],
+                minScore: 2),
+            TopicDef(tag: "health",
+                phrases: ["went to the doctor", "seeing a therapist", "mental health",
+                          "feeling sick", "chronic pain", "panic attack", "anxiety attack"],
+                single: ["doctor", "health", "pain", "headache", "therapy", "therapist",
+                         "meds", "medication", "ill", "sick", "symptoms"],
+                minScore: 2),
+            TopicDef(tag: "exercise",
+                phrases: ["went for a run", "went to the gym", "worked out", "yoga class",
+                          "went for a walk", "did a workout", "morning run"],
+                single: ["gym", "running", "workout", "exercise", "yoga", "training", "cycling", "swimming"],
+                minScore: 2),
+            TopicDef(tag: "home",
+                phrases: ["at home", "my apartment", "tidied up", "cleaned the house",
+                          "around the house"],
+                single: ["apartment", "chores", "laundry", "tidying", "declutter", "renovate"],
+                minScore: 2),
+            TopicDef(tag: "love",
+                phrases: ["my relationship", "we broke up", "going on a date",
+                          "my partner and i", "feeling lonely in"],
+                single: ["relationship", "dating", "crush", "breakup", "romance",
+                         "ex-", "heartbroken", "attraction", "intimacy"],
+                minScore: 2),
+            TopicDef(tag: "study",
+                phrases: ["studying for", "my exam", "at university", "my homework",
+                          "my assignment", "failing class", "studying hard"],
+                single: ["studying", "exam", "class", "school", "homework", "assignment",
+                         "uni", "university", "course", "degree", "lecture"],
+                minScore: 2),
+            TopicDef(tag: "creativity",
+                phrases: ["working on music", "writing a song", "my painting",
+                          "creative project", "artistic block", "making art"],
+                single: ["writing", "music", "painting", "drawing", "creative", "art",
+                         "composing", "sketching", "crafting", "poetry"],
+                minScore: 2),
+            TopicDef(tag: "nature",
+                phrases: ["went outside", "in the park", "at the beach", "in the garden",
+                          "out in nature", "beautiful day outside"],
+                single: ["park", "beach", "garden", "nature", "outdoors", "hiking", "forest", "trail"],
+                minScore: 2)
         ]
 
-        let scored = topics
-            .map { topic -> (tag: String, score: Int) in
-                (topic.tag, topic.keywords.filter { lower.contains($0) }.count)
-            }
-            .filter { $0.score > 0 }
-            .sorted { $0.score > $1.score }
+        let scored = topics.compactMap { topic -> (tag: String, score: Int)? in
+            let phraseScore = topic.phrases.filter { lower.contains($0) }.count * 2
+            let singleScore = topic.single.filter { lower.contains($0) }.count
+            let total = phraseScore + singleScore
+            guard total >= topic.minScore else { return nil }
+            return (topic.tag, total)
+        }
+        .sorted { $0.score > $1.score }
 
         return Array(scored.prefix(limit)).map { $0.tag }
+    }
+
+    // MARK: - Tiny act
+    /// A small, concrete, behavioural suggestion (NOT a question) derived from the
+    /// text's dominant topic — mirrors the prototype's "Today's Tiny Act."
+    static func tinyAct(from text: String) -> String {
+        let acts: [String: String] = [
+            "work":       "Write tomorrow's first task on a sticky note, then close the laptop.",
+            "sleep":      "Tonight: dim the lights and put your phone across the room.",
+            "people":     "Send one honest sentence to someone — skip the perfect reply.",
+            "money":      "Open the banking app once, look, and close it. No fixing tonight.",
+            "food":       "Drink one glass of water before your next meal.",
+            "health":     "Take three slow breaths, longer on the exhale.",
+            "exercise":   "Take a 7-minute walk and notice one physical sensation.",
+            "home":       "Clear one surface — just one — and stop there.",
+            "love":       "Name one thing you appreciate about them, out loud if you can.",
+            "study":      "Set a 10-minute timer and start the smallest piece.",
+            "creativity": "Make something tiny and bad on purpose for two minutes.",
+            "nature":     "Step outside for two minutes and look up."
+        ]
+        let topic = extractTopics(from: text, limit: 1).first
+        return acts[topic ?? ""]
+            ?? "Pick one tiny thing future-you would thank you for — keep it two minutes small."
     }
 
     // MARK: - Summary Bullets

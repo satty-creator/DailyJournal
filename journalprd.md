@@ -20,19 +20,32 @@ month-grouped list with a custom header, plus the entry editor (free-write and
 ### Header (custom, not the system large title)
 
 The list uses an inline custom header instead of `.navigationTitle`, with the
-navigation bar hidden. This guarantees the title colour (it previously rendered
-white/invisible in dark mode because the palette is fixed-light; the app is now
-also pinned to `.preferredColorScheme(.light)` in `RootView`).
+navigation bar hidden. This guarantees the title colour renders correctly. (The
+app's colour scheme is now driven per-theme by `ThemeManager` — see
+`themesprd.md` — replacing the old hard `.preferredColorScheme(.light)` pin in
+`RootView`. Light themes render light; Moon renders dark.)
 
 - Title: "Your **journal**" (`AppTheme.ink`).
 - Subtitle: `"{N} entries"`, plus `" · {M}-day best streak"` when the best streak
   is ≥ 2. Best streak = longest run of consecutive calendar days with ≥ 1 entry
   (`bestStreakDays`).
+
+### Week-streak row on Home (Spilr "resilience week")
+
+`HomeView.streakSection` renders a row of 7 day-pills (Mon–Sun of the current
+week) under the Home header, mirroring the prototype's streak row. A pill is
+"done" (terracotta→sun gradient) when a recently-loaded entry falls on that day,
+and the current day gets a terracotta outline. It is a **light, decorative
+signal** derived from `vm.recentEntries` (capped at 5) — *not* the source of
+truth for streaks; `bestStreakDays` above remains authoritative. Framed as
+resilience, not pressure.
 - Custom search field (book icon + clear button) bound to `searchText`.
-- Mood filter chips: "All" + one chip per mood the user has actually logged
-  (`availableMoods`). Each chip shows a coloured dot (`AppTheme.moodColor`) and a
-  short scale label (`Great / Good / Okay / Low / Tough`). Tapping toggles
-  `moodFilter`; the selected chip fills with `AppTheme.ink`.
+- **Tag filter chips (2026-06-11):** "All" + one chip per tag that actually
+  appears in the user's entries (`availableTags`, most-used first). Tapping
+  toggles `tagFilter`; the selected chip fills with `AppTheme.ink`; the row hides
+  when there are no tags. This replaced the old mood-based chips so the filters
+  always reflect the real tags in the journal. `filteredEntries` filters by
+  `tagFilter` (then `searchText`).
 
 ### Sorting
 
@@ -46,8 +59,18 @@ are ordered newest-month-first; entries within a group are newest-first.
 
 ### Compose
 
-A floating circular pencil FAB (bottom-trailing, terracotta) opens the editor for
-a new entry. Editing an existing entry is a push via `NavigationLink`.
+A floating circular pencil FAB (bottom-trailing, terracotta) opens
+**`SpillWriteView`** for a new entry (2026-06-11 — was `JournalEditorView`), so
+the pencil matches the Home write actions and opens with a starter "question."
+The same FAB is added to the **River** and **Patterns** tabs via the reusable
+`.composeFAB(userId:)` modifier (`Components/ComposeFAB.swift`); Home is excluded
+(it has its own write entry). Editing an existing entry still pushes
+`JournalEditorView` (full editor with mood / tags / future-self / attached photo).
+
+### Attached photo in the editor
+
+When viewing an existing entry, `JournalEditorView` renders `entry.photoURL` as a
+220 pt `AsyncImage` (with loading / failure states) below the content.
 
 ### Optimistic save
 
@@ -81,6 +104,33 @@ Entries used to surface only a handful of labels. Two changes widen this:
 `LocalAI.sentimentLabels` is the single source of truth for the recognised set.
 
 ---
+
+## Photos (Firebase Storage)
+
+**Files:** `Journal/PhotoUploadService.swift`, `Journal/JournalService.swift`,
+`Journal/JournalEntry.swift`, `Home/SpillWriteView.swift`, `Home/NinetySecondSessionView.swift`,
+`Journal/JournalCardView.swift`, `storage.rules`, `firebase.json`.
+
+Entries can carry one optional attached photo.
+
+- **Model:** `JournalEntry.photoURL: String?` — the Storage download URL, persisted
+  to Firestore (default-safe for older entries).
+- **Upload:** `PhotoUploadService.uploadEntryPhoto(_:userId:entryId:)` downscales
+  (longest edge ≤ 1600 pt) and re-encodes to JPEG (q 0.7), uploads to
+  `users/{uid}/entryPhotos/{entryId}.jpg` in Firebase Storage via the
+  `FirebaseStorage` SDK, and returns the download URL. There is **no custom
+  server** — Storage is a managed bucket; this is client Swift only.
+- **Flow:** `SpillWriteView` keeps the picked `UIImage` and passes it to
+  `NinetySecondViewModel.saveEntry(photo:)`. Save is never blocked: the entry is
+  created immediately, then a **detached** task uploads the photo and patches the
+  doc via `JournalService.updateEntryPhotoURL(entryId:userId:url:)` (same
+  fire-and-forget pattern as Gemini insights). A failed/slow upload is silent.
+- **Display:** `JournalCardView` shows the photo as a 120 pt `AsyncImage`
+  thumbnail when `photoURL` is set.
+- **Security:** `storage.rules` locks `users/{userId}/entryPhotos/**` to the
+  owning user (mirrors the Firestore entry rules). Registered in `firebase.json`.
+- **Dependency:** `FirebaseStorage` added to `Package.swift` and the app target in
+  `DailyJournal.xcodeproj` (SPM product).
 
 ## What triggers a PRD update
 

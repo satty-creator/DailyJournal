@@ -11,25 +11,74 @@ import Foundation
 final class JournalListViewModel: ObservableObject {
 
     @Published var entries: [JournalEntry] = []
-    @Published var isLoading = false
+    /// Starts TRUE. With `false`, the very first body evaluation ran before
+    /// `loadEntries()` had set the flag, so `isLoading && entries.isEmpty` was false
+    /// and the view fell straight through to "Your journal is empty." — shown to
+    /// users with dozens of entries, right before the spinner.
+    @Published var isLoading = true
     @Published var errorMessage: String?
-    @Published var searchText = ""
-    /// Active mood filter chip. nil == "All".
-    @Published var moodFilter: Mood?
+    @Published var searchText = "" {
+        didSet {
+            // Debounced so typing doesn't spam an event per keystroke — only log
+            // once the query has held still for a beat. Length only, never the
+            // text itself — see `AnalyticsManager.trackJournalSearched`.
+            searchLogTask?.cancel()
+            let query = searchText
+            guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+            searchLogTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 600_000_000)
+                guard !Task.isCancelled, self?.searchText == query else { return }
+                AnalyticsManager.shared.trackJournalSearched(queryLength: query.count)
+            }
+        }
+    }
+    /// Active tag filter chip. nil == "All".
+    @Published var tagFilter: String? {
+        didSet {
+            if tagFilter != nil {
+                AnalyticsManager.shared.trackJournalFiltered()
+            }
+        }
+    }
 
     private let service = JournalService()
     private let userId: String
+    private var photoObserver: NSObjectProtocol?
+    private var searchLogTask: Task<Void, Never>?
 
     init(userId: String) {
         self.userId = userId
+        // Patches a row's `photoURL` in place once a detached upload (started by
+        // the editor, which has usually already dismissed by the time it
+        // finishes) completes — see `JournalService.updateEntryPhotoURL`. Without
+        // this, a freshly-attached photo doesn't appear until the next full
+        // `loadEntries()`, and a cache-first fetch can serve a pre-upload
+        // snapshot even then.
+        photoObserver = NotificationCenter.default.addObserver(
+            forName: .journalEntryPhotoUploaded, object: nil, queue: .main
+        ) { [weak self] note in
+            guard
+                let self,
+                let info = note.userInfo,
+                info["userId"] as? String == self.userId,
+                let entryId = info["entryId"] as? String,
+                let photoURL = info["photoURL"] as? String,
+                let index = self.entries.firstIndex(where: { $0.id == entryId })
+            else { return }
+            self.entries[index].photoURL = photoURL
+        }
+    }
+
+    deinit {
+        if let photoObserver { NotificationCenter.default.removeObserver(photoObserver) }
     }
 
     // MARK: - Computed
 
     var filteredEntries: [JournalEntry] {
         var result = entries
-        if let moodFilter {
-            result = result.filter { $0.mood == moodFilter }
+        if let tagFilter {
+            result = result.filter { $0.tags.contains(tagFilter) }
         }
         guard !searchText.isEmpty else { return result }
         let query = searchText.lowercased()
@@ -43,29 +92,16 @@ final class JournalListViewModel: ObservableObject {
     /// Total entries (unfiltered) — for the header subtitle.
     var entryCount: Int { entries.count }
 
-    /// The longest run of consecutive calendar days with at least one entry.
-    var bestStreakDays: Int {
-        let cal = Calendar.current
-        let days = Set(entries.map { cal.startOfDay(for: $0.createdAt) }).sorted()
-        guard !days.isEmpty else { return 0 }
-        var best = 1
-        var run = 1
-        for i in 1..<max(days.count, 1) {
-            if let diff = cal.dateComponents([.day], from: days[i - 1], to: days[i]).day, diff == 1 {
-                run += 1
-                best = max(best, run)
-            } else {
-                run = 1
-            }
-        }
-        return best
-    }
+    var earliestEntryDate: Date? { entries.map(\.createdAt).min() }
 
-    /// Which moods actually appear in the user's entries — drives which filter
-    /// chips we show (no point offering a mood they've never logged).
-    var availableMoods: [Mood] {
-        let present = Set(entries.compactMap { $0.mood })
-        return Mood.allCases.filter { present.contains($0) }
+    /// Which tags actually appear in the user's entries (most-used first) — drives
+    /// the filter chips so they always reflect the real tags in the journal.
+    var availableTags: [String] {
+        var counts: [String: Int] = [:]
+        for entry in entries {
+            for tag in entry.tags { counts[tag, default: 0] += 1 }
+        }
+        return counts.sorted { $0.value > $1.value }.map { $0.key }
     }
 
     var groupedEntries: [(month: String, entries: [JournalEntry])] {

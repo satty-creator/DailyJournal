@@ -6,16 +6,29 @@ This file tells Claude how to work in this codebase.
 
 ## PRD maintenance rule (mandatory)
 
-**Every time you add a new feature or edit an existing one, you must add or update the corresponding PRD file before considering the task done.**
+> **⏸️ PAUSED (2026-08-11):** PRD updates are temporarily **skipped**. Do NOT update or
+> create PRD files when changing features for now — focus on the code changes only.
+> Re-enable this rule when the pause note is removed.
+
+
 
 The PRDs live at the root of the project:
 
 | Feature | PRD file |
 |---|---|
 | Echoes (AI callbacks from past entries) | `echoesprd.md` |
-| Hints / Hint Ladder / Pebble Picker | `hintsprd.md` |
+| Hints / Hint Ladder | `hintsprd.md` |
 | Today's Read (daily hook + receipts + feedback engine) | `todaysreadprd.md` |
 | Journal (list, filters, sorting, streak, topical tags + sentiment) | `journalprd.md` |
+| Patterns (resilience, activity grid, AI insight cards, mood/stats) | `patternsprd.md` |
+| Themes (selectable vibes, ThemeManager, theme picker) | `themesprd.md` |
+| Onboarding (vibe picker, 7-day promise, first-entry celebration, feedback) | `onboardingprd.md` |
+| Memory layer (recurring themes, entities, emotional vocab, coping patterns) | `memoryprd.md` |
+| Privacy & Trust (encryption, AI controls, export/delete) | `privacyprd.md` |
+| Mirror (Today's Mirror, evidence drawer, seeds, blind spots, First Sketch, navigation) | `mirrorprd.md` |
+| Profile Intelligence (Self Model, episodes, NBQ, corrections, First Sketch) | `profileintelligenceprd.md` |
+| Daily Chat (interactive chat → woven journal entry, home entry point) | `dailychatprd.md` |
+| Thought Journal (throughout-the-day thought capture, silent-by-default, bridges to Daily Chat + woven entries, feeds pattern engine) | `thoughtjournalprd.md` |
 
 When you add a feature that doesn't have a PRD yet, create one at the project root named `{featurename}prd.md` and add it to the table above.
 
@@ -34,7 +47,7 @@ When in doubt: if a PRD section describes the thing you changed, update that sec
 
 ## Project overview
 
-**ninety** — a private iOS journaling app. SwiftUI, Firebase (Firestore + Auth + Cloud Functions), Gemini 2.0 Flash via a server-side proxy.
+**ninety** — a private iOS journaling app. SwiftUI, Firebase (Firestore + Auth + Cloud Functions), Gemini 2.5 Flash Lite via a server-side proxy.
 
 Key design principles:
 - Local-first: every feature works offline or without AI; AI enriches silently.
@@ -48,19 +61,24 @@ Key design principles:
 
 ```
 DailyJournal/
-├── App/            DailyJournalApp.swift, RootView.swift
-├── Auth/           Auth flow (email/Google/Apple sign-in)
-├── Components/     Shared UI (SpeechManager, MascotView, FlowLayout, …)
+├── Analytics/      AnalyticsManager, SessionManager, ScreenTrackingModifier
+├── App/            DailyJournalApp.swift, RootView.swift, AppRouter, FirestoreSchema
+├── Auth/           Auth flow (email/Google/Apple sign-in), EntitlementService
+├── Chat/           Daily Chat (ChatMode, ChatSession, AIService+Chat, DailyChatView)
+├── Components/     Shared UI (SpeechManager, MascotView, FlowLayout, FutureSelfSheet, …)
 ├── Echo/           Echo data model, EchoService, EchoExtractionService, card views
-├── Hints/          HintLadder, HintEngine, AIService+Hints, PebblePickerView
-├── Home/           HomeView, HomeViewModel, AIService, NinetyVoice, LocalAI, NinetySecondSessionView
-├── Journal/        JournalEntry, JournalService, editor, list, card views
+├── Hints/          HintLadder, HintEngine, ReadService, AIService+Read, UniversalQuestionBank
+├── Home/           HomeView, HomeViewModel (in HomeView.swift), AIService, SpilrVoice, LocalAI,
+│                   TimedSessionViewModel, SpillWriteView
+├── Journal/        JournalEntry, JournalService, editor, list, card views, RollupService
 ├── Memory/         MemoryProfile, MemoryProfileService
-├── Mood/           MoodLog, MoodLogService, MoodBlobView
-├── Pattern/        PatternCallback, PatternDetectionService, PatternCallbackService, card views
-├── Patterns/       PatternsView (tab), WeeklyWrappedCard
-├── River/          River, RiverMark, RiverService, AIService+River, RiverView
-├── Theme/          AppTheme.swift (all colours, fonts, markers)
+├── Mirror/         MirrorView (tab), SelfModel, PatternHypothesis-driven pattern surfacing,
+│                   EvidenceDrawerView, FirstSketchView, SelfModelView
+├── Notifications/  PushNotificationManager
+├── Onboarding/     OnboardingView
+├── Pattern/        PatternDetectionService (crisis-corpus safety gate only — the
+│                   PatternCallback engine was cut, see PATTERNS_MERGE_PLAN.md)
+├── Theme/          AppTheme.swift (all colours, fonts, markers), ThemeManager, ThemePickerView
 functions/          Firebase Cloud Functions (geminiProxy)
 ```
 
@@ -68,11 +86,16 @@ functions/          Firebase Cloud Functions (geminiProxy)
 
 ## AI layer
 
-- **Backend:** Gemini 2.0 Flash via `geminiProxy` Cloud Function at `us-central1-dailyjournal-12a35.cloudfunctions.net/geminiProxy`.
+- **Backend:** Gemini via `geminiProxy` Cloud Function at `us-central1-spilr-100f7.cloudfunctions.net/geminiProxy`. Model `gemini-3.5-flash-lite` (see `functions/index.js`). Project migrated from `dailyjournal-12a35` → `spilr-100f7`.
 - **Auth:** Firebase ID token in `Authorization: Bearer {token}` header — no API key in the app.
 - **Available when:** `AIService.shared.isAIAvailable` == `Auth.auth().currentUser != nil`.
-- **All prompts** begin with `NinetyVoice.system` and end with `MemoryProfileService.shared.cachedPromptContext()`.
-- **Local fallbacks** exist for every AI feature: `LocalAI`, `NinetyVoice.localReflection`, `NinetyVoice.localEchoLine`, `LocalRiver`, `LocalPatternDetector`.
+- **All prompts** begin with `SpilrVoice.system` and end with `MemoryProfileService.shared.cachedPromptContext()`.
+- **Local fallbacks** exist for every AI feature: `LocalAI`, `SpilrVoice.localReflection`, `SpilrVoice.localEchoLine`, `LocalPatternDetector`.
+- **Every prompt must contain a safety block.** Two exist and they are not interchangeable:
+  - `SpilrVoice.safetyRules` — for the **reflection** surfaces (Echo, River, Mirror, Reads, Patterns). Its rules 8 and 10 instruct the model to return an *empty result* when it can't produce something safe and grounded. Prompts built on `SpilrVoice.system` inherit it automatically.
+  - `SpilrVoice.chatSafetyRules` — for **live conversation** (Daily Chat, both modes, plus the Thought Journal weave). Same prohibitions, but the fallback is "ask a plain question", not silence — in chat the user is waiting on a reply. Injected by `ChatPrompts.systemPrompt(for:)`.
+
+  A prompt that uses neither must paste the appropriate one in explicitly. The server mirror is `SAFETY_RULES` in `functions/index.js`; keep it in sync with `safetyRules`.
 
 ---
 

@@ -55,10 +55,15 @@ final class EchoService {
         // no echo ever surfaced. We now fetch pending echoes and do the surface-date
         // gate + highest-confidence pick on the client. Cache-first so it works
         // offline and on first paint.
-        let snapshot = try await getDocuments(
+        // FirestoreCacheFirst rather than the local `getDocuments`: "no pending
+        // echoes" is the normal answer, and `getDocuments` reads an empty cache
+        // result as a miss — so this hit the server on every Home load while
+        // gating first paint.
+        let snapshot = try await FirestoreCacheFirst.documents(
             collection(for: userId)
                 .whereField("status", isEqualTo: EchoStatus.pending.rawValue)
-                .limit(to: 50)
+                .limit(to: 50),
+            key: "pendingEchoes.\(userId)"
         )
 
         // Schedule decay asynchronously — never awaited
@@ -75,23 +80,6 @@ final class EchoService {
                 return $0.surfaceAfterDate < $1.surfaceAfterDate
             }
             .first
-    }
-
-    // MARK: - Browse (Echoes feed)
-
-    /// Recent echoes for the Echoes/Memories feed — newest source-entry first.
-    /// Unlike `fetchTopPendingEcho`, this is for browsing, so it returns pending
-    /// AND answered echoes (the feed shows resurfaced moments, answered or not)
-    /// and ignores the surface-after gate. Dismissed/expired are filtered out.
-    func fetchAll(for userId: String, limit: Int = 12) async throws -> [Echo] {
-        let snapshot = try await collection(for: userId)
-            .order(by: "sourceEntryCreatedAt", descending: true)
-            .limit(to: limit)
-            .getDocuments()
-
-        return snapshot.documents
-            .compactMap { Echo(from: $0.data()) }
-            .filter { $0.status == .pending || $0.status == .answered }
     }
 
     // MARK: - Skip / decay
@@ -124,22 +112,38 @@ final class EchoService {
 
     // MARK: - Decay
 
-    /// Marks any pending echoes older than 7 days as expired in a single batch.
-    /// Runs in the background — failure is intentionally silent.
+    /// Marks any pending echo as expired once 7 days have passed since it FIRST
+    /// became surfaceable — not 7 days since it was created.
+    ///
+    /// This used to key off `createdAt`, which is wrong: `surfaceAfterHours` can
+    /// itself be up to 336h (14 days, for `.mood_marker`), so a fixed 7-day
+    /// cutoff from creation could expire an echo before, or at the exact moment,
+    /// it was first allowed to surface at all (`.theme` surfaces at 168h/7 days —
+    /// the same instant it became decay-eligible under the old rule). Filtering
+    /// in Swift rather than a single range query, same pattern as
+    /// `fetchTopPendingEcho` just above: this mixes an equality filter with a
+    /// derived-field comparison, not a single indexed inequality.
     private func decayExpiredEchoes(for userId: String) async throws {
-        let cutoff = Timestamp(date: Date().addingTimeInterval(-7 * 24 * 3600))
+        let now = Date()
 
         let snapshot = try await collection(for: userId)
-            .whereField("status",    isEqualTo: EchoStatus.pending.rawValue)
-            .whereField("createdAt", isLessThan: cutoff)
+            .whereField("status", isEqualTo: EchoStatus.pending.rawValue)
             .getDocuments()
 
-        guard !snapshot.documents.isEmpty else { return }
+        let expired = snapshot.documents.filter { doc in
+            guard let echo = Echo(from: doc.data()) else { return false }
+            return echo.surfaceAfterDate.addingTimeInterval(7 * 24 * 3600) < now
+        }
+        guard !expired.isEmpty else { return }
 
         let batch = db.batch()
-        for doc in snapshot.documents {
+        for doc in expired {
             batch.updateData(["status": EchoStatus.expired.rawValue], forDocument: doc.reference)
         }
         try await batch.commit()
+
+        for _ in expired {
+            await AnalyticsManager.shared.logEvent(.echoExpired)
+        }
     }
 }

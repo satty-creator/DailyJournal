@@ -2,44 +2,48 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Users can only read/write their own profile
+    // Rate-limit counters — written only by the geminiProxy Cloud Function via
+    // Admin SDK. Clients must never read or write these directly.
+    match /rateLimits/{uid} {
+      allow read, write: if false;
+    }
+
+    // AI entitlement + usage budget (ai-cost-audit-2026-09-06.md Phase 4/5).
+    // Written only by geminiProxy (usage counters) and the RevenueCat webhook
+    // (entitlement), both via the Admin SDK.
+    //
+    // TOP-LEVEL and deny-all deliberately, NOT a field on the user doc: the
+    // `users/{userId}` rule below grants the owner full read/write over their
+    // own doc and everything beneath it, so an `entitlement` field living
+    // there would be client-writable — any signed-in user could set
+    // themselves to "paid". Keeping this collection outside that recursive
+    // rule, alongside `rateLimits` above, is what makes it a real
+    // enforcement boundary instead of a client-side suggestion.
+    match /aiUsage/{uid} {
+      allow read, write: if false;
+    }
+    match /entitlements/{uid} {
+      allow read, write: if false;
+    }
+
+    // Everything under a user's own document is private to that user: the profile
+    // doc itself AND every subcollection beneath it.
+    //
+    // Why the recursive wildcard: the app stores a growing set of per-user
+    // subcollections (entries, echoes, moodLogs, patternCallbacks, riverMarks,
+    // dailyReads, pushTokens, selfModel, profileCorrections, patternHypotheses,
+    // entryAnalyses, mirror cards/graph, …). Whitelisting them one by one meant any
+    // NEW subcollection was silently denied — which is exactly what starved the AI
+    // of context (selfModel / patternHypotheses / entryAnalyses all failed with
+    // "Missing or insufficient permissions"). A single owner-scoped recursive rule
+    // covers the whole subtree and prevents that class of bug from recurring.
+    //
+    // Cloud Functions use the Admin SDK, which bypasses these rules entirely, so the
+    // overnight generators are unaffected.
     match /users/{userId} {
       allow read, write: if request.auth != null && request.auth.uid == userId;
 
-      // Journal entries are private to each user
-      match /entries/{entryId} {
-        allow read, write: if request.auth != null && request.auth.uid == userId;
-      }
-
-      // Echoes are private to each user
-      match /echoes/{echoId} {
-        allow read, write: if request.auth != null && request.auth.uid == userId;
-      }
-
-      // Daily mood check-ins are private to each user
-      match /moodLogs/{logId} {
-        allow read, write: if request.auth != null && request.auth.uid == userId;
-      }
-
-      // Pattern callbacks are private to each user
-      match /patternCallbacks/{callbackId} {
-        allow read, write: if request.auth != null && request.auth.uid == userId;
-      }
-
-      // River marks (derived per-entry signals) are private to each user
-      match /riverMarks/{markId} {
-        allow read, write: if request.auth != null && request.auth.uid == userId;
-      }
-
-      // Today's Read — one doc per local date. The client reads it and writes
-      // feedback / local fallbacks; the overnight function writes via Admin SDK.
-      match /dailyReads/{readId} {
-        allow read, write: if request.auth != null && request.auth.uid == userId;
-      }
-
-      // FCM push tokens for this user's devices. Written by the client, read by
-      // the Cloud Function (Admin SDK bypasses rules).
-      match /pushTokens/{token} {
+      match /{document=**} {
         allow read, write: if request.auth != null && request.auth.uid == userId;
       }
     }

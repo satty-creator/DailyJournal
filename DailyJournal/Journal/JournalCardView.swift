@@ -2,107 +2,98 @@
 //  JournalCardView.swift
 //  DailyJournal
 //
+//  The journal list row — Spilr Redesign screen 1e ("mood-tinted, safe"): the
+//  card is tinted by its own mood/sentiment colour instead of wearing a plain
+//  4px accent stripe, the AI summary reads as a real pull-quote, and tags
+//  become soft chips. Same underlying JournalEntry, no new data.
+//
 
 import SwiftUI
 
 struct JournalCardView: View {
     let entry: JournalEntry
 
+    private var summaryHeadline: String {
+        entry.aiSummaryBullets.first ?? entry.displayTitle
+    }
+
+    private var metaLine: String {
+        "\(entry.shortFormattedDate.uppercased()) · \(entry.wordCount) WORDS"
+    }
+
     var body: some View {
-        HStack(spacing: 0) {
-            // Left accent stripe — mood / sentiment color
-            Rectangle()
-                .fill(entry.accentColor)
-                .frame(width: 4)
-                .clipShape(
-                    UnevenRoundedRectangle(
-                        topLeadingRadius: 16,
-                        bottomLeadingRadius: 16,
-                        bottomTrailingRadius: 0,
-                        topTrailingRadius: 0
-                    )
-                )
+        VStack(alignment: .leading, spacing: 11) {
+            HStack(spacing: 7) {
+                if let mood = entry.mood {
+                    Text(mood.faceEmoji)
+                        .font(.system(size: 15))
+                }
+                Text(metaLine)
+                    .font(AppTheme.mono(size: 10))
+                    .tracking(1.4)
+                    .foregroundStyle(AppTheme.inkSoft)
+            }
 
-            VStack(alignment: .leading, spacing: 10) {
+            Text(summaryHeadline)
+                .font(AppTheme.editorialDisplay(size: 17, weight: .bold))
+                .foregroundStyle(AppTheme.ink)
+                .lineLimit(3)
+                .lineSpacing(2)
+                .fixedSize(horizontal: false, vertical: true)
 
-                // Top row: date + 90s badge + mood + letter icon
-                HStack(spacing: 6) {
-                    Text(entry.formattedDate)
-                        .font(AppTheme.mono(size: 10))
-                        .foregroundStyle(AppTheme.inkSoft)
-                        .tracking(0.5)
-
-                    if entry.sessionType == .ninetySecond {
-                        Text("90s")
-                            .font(AppTheme.mono(size: 9))
-                            .foregroundStyle(AppTheme.terracotta)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 2)
-                            .background(AppTheme.terracotta.opacity(0.1))
-                            .clipShape(Capsule())
-                    }
-
-                    Spacer()
-
-                    if let mood = entry.mood {
-                        Text(mood.faceEmoji).font(.system(size: 15))
-                    }
-
-                    if entry.isScheduledLetter {
-                        Image(systemName: entry.futureSelfOpened ? "envelope.open" : "envelope.fill")
-                            .font(.system(size: 12))
-                            .foregroundStyle(AppTheme.inkSoft.opacity(0.6))
+            // Attached photo (if any) — not drawn in the 1e mockup, but silently
+            // dropping a real photo would lose data the user attached.
+            if let urlString = entry.photoURL, let url = URL(string: urlString) {
+                AsyncImage(url: url) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image.resizable().scaledToFill()
+                    case .failure:
+                        Color.clear
+                    default:
+                        AppTheme.paperWarm
                     }
                 }
+                .frame(height: 120)
+                .frame(maxWidth: .infinity)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            }
 
-                // Content preview / title
-                Text(entry.displayTitle)
-                    .font(AppTheme.editorialBody(size: 15))
-                    .foregroundStyle(AppTheme.ink)
-                    .lineLimit(2)
-                    .lineSpacing(2)
-
-                // First AI bullet if available
-                if let firstBullet = entry.aiSummaryBullets.first {
-                    HStack(alignment: .top, spacing: 5) {
-                        Text("—")
-                            .font(AppTheme.mono(size: 10))
-                            .foregroundStyle(entry.accentColor)
-                        Text(firstBullet)
-                            .font(AppTheme.mono(size: 11))
-                            .foregroundStyle(AppTheme.inkSoft)
-                            .lineLimit(1)
-                    }
-                }
-
-                // Bottom row
-                HStack(spacing: 6) {
-                    Text("\(entry.wordCount) words")
-                        .font(AppTheme.mono(size: 10))
-                        .foregroundStyle(AppTheme.slate)
-
-                    if let sentiment = entry.sentimentLabel {
-                        Text("·").foregroundStyle(AppTheme.slate)
-                            .font(AppTheme.mono(size: 10))
-                        Text(sentiment)
-                            .font(AppTheme.mono(size: 10))
-                            .foregroundStyle(entry.accentColor)
-                    }
-
-                    Spacer()
-
-                    ForEach(entry.tags.prefix(2), id: \.self) { tag in
+            if !entry.tags.isEmpty {
+                FlowLayout(spacing: 6) {
+                    ForEach(entry.tags.prefix(4), id: \.self) { tag in
                         Text("#\(tag)")
-                            .font(AppTheme.mono(size: 10))
-                            .foregroundStyle(AppTheme.terracotta)
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(entry.accentColor.mix(with: AppTheme.ink, by: 0.35))
+                            .padding(.horizontal, 11)
+                            .padding(.vertical, 6)
+                            .background(entry.accentColor.opacity(0.32))
+                            .clipShape(Capsule())
                     }
                 }
             }
-            .padding(.vertical, 14)
-            .padding(.horizontal, 14)
         }
-        .background(AppTheme.cream)
-        .clipShape(RoundedRectangle(cornerRadius: 16))
-        .shadow(color: AppTheme.ink.opacity(0.06), radius: 8, x: 0, y: 3)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            ZStack {
+                AppTheme.cream
+                LinearGradient(
+                    colors: [entry.accentColor.opacity(0.30), AppTheme.cream.opacity(0.65)],
+                    startPoint: .topLeading, endPoint: .bottomTrailing
+                )
+                // A soft glow off the top-trailing corner, echoing 1e's blurred
+                // circle — clipped by the card's own corner radius below.
+                GeometryReader { geo in
+                    Circle()
+                        .fill(entry.accentColor.opacity(0.24))
+                        .frame(width: 86, height: 86)
+                        .position(x: geo.size.width, y: 0)
+                }
+            }
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+        .shadow(color: AppTheme.cardShadow, radius: 8, x: 0, y: 3)
     }
 }

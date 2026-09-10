@@ -15,6 +15,10 @@ struct LoginView: View {
     @State private var password = ""
     @FocusState private var focusedField: Field?
 
+    // Forgot-password flow
+    @State private var showForgotPassword = false
+    @State private var resetEmail = ""
+
     enum Field { case email, password }
 
     var body: some View {
@@ -25,14 +29,14 @@ struct LoginView: View {
                 VStack(spacing: 8) {
                     Image(systemName: "book.fill")
                         .font(.system(size: 60))
-                        .foregroundColor(AppTheme.primary)
+                        .foregroundStyle(AppTheme.primary)
 
                     Text("Welcome Back")
                         .font(.largeTitle.bold())
 
                     Text("Continue your journey")
                         .font(.subheadline)
-                        .foregroundColor(.secondary)
+                        .foregroundStyle(.secondary)
                 }
                 .padding(.top, 60)
 
@@ -57,11 +61,29 @@ struct LoginView: View {
                     .focused($focusedField, equals: .password)
                     .submitLabel(.done)
                     .onSubmit { Task { await authViewModel.signIn(email: email, password: password) } }
+
+                    // Forgot password — right-aligned below the password field
+                    HStack {
+                        Spacer()
+                        Button("Forgot password?") {
+                            resetEmail = email  // pre-fill with whatever's typed
+                            showForgotPassword = true
+                        }
+                        .font(.footnote)
+                        .foregroundStyle(AppTheme.terracotta)
+                    }
                 }
 
-                // Error Message
+                // Error / reset-password messages
                 if let error = authViewModel.errorMessage {
                     ErrorBanner(message: error)
+                }
+                if let msg = authViewModel.resetPasswordMessage {
+                    Text(msg)
+                        .font(.footnote)
+                        .foregroundStyle(msg.contains("sent") ? AppTheme.terracotta : .red)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 4)
                 }
 
                 // Login Button
@@ -86,16 +108,43 @@ struct LoginView: View {
                 // Switch to Signup
                 HStack {
                     Text("Don't have an account?")
-                        .foregroundColor(.secondary)
+                        .foregroundStyle(.secondary)
                     Button("Sign Up") { onSwitchToSignup() }
-                        .foregroundColor(AppTheme.primary)
+                        .foregroundStyle(AppTheme.primary)
                         .fontWeight(.semibold)
                 }
                 .font(.subheadline)
+
+                // Guest mode — satisfies App Store Guideline 5.1.1(v)
+                Button {
+                    Task { await authViewModel.continueAsGuest() }
+                } label: {
+                    Text("Continue without account")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .underline()
+                }
+                .disabled(authViewModel.isLoading)
 
                 Spacer(minLength: 40)
             }
             .padding(.horizontal, 24)
         }
+        // Forgot-password email input
+        .alert("Reset password", isPresented: $showForgotPassword) {
+            TextField("Email address", text: $resetEmail)
+                .keyboardType(.emailAddress)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Button("Send reset link") {
+                authViewModel.resetPasswordMessage = nil
+                Task { await authViewModel.resetPassword(email: resetEmail) }
+            }
+            .disabled(authViewModel.isResettingPassword)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("We'll email you a link to reset your password.")
+        }
+        .trackScreen(.authLogin)
     }
 }

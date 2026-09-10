@@ -62,9 +62,9 @@ final class EchoExtractionService {
         // 3. Confidence gate — belt-and-suspenders on top of the prompt instruction
         guard result.confidence >= 0.8 else { return }
 
-        // 4. Persist — always attach a ninety-voice line (model's, or a local fallback
+        // 4. Persist — always attach a Spilr-voice line (model's, or a local fallback
         //    so an echo never resurfaces as a bare quote).
-        let line = result.line ?? NinetyVoice.localEchoLine(
+        let line = result.line ?? SpilrVoice.localEchoLine(
             type: result.type, quote: result.quote, daysAgo: 0
         )
         let echo = Echo(

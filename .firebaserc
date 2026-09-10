@@ -1,5 +1,7 @@
 {
   "projects": {
-    "default": "dailyjournal-12a35"
+    "default": "spilr-100f7",
+    "spilr": "spilr-100f7",
+    "dailyjournal": "dailyjournal-12a35"
   }
 }

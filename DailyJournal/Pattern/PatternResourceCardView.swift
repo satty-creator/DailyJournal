@@ -94,7 +94,7 @@ struct PatternResourceCardView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             Button(action: onDismiss) {
-                Text("okay")
+                Text("Okay")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(AppTheme.dusk)
                     .padding(.top, 2)

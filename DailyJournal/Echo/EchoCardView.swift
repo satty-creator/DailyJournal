@@ -31,7 +31,7 @@ struct EchoCardView: View {
             headerRow
                 .padding(.bottom, 10)
 
-            // ninety's voice — the framing that gives the echo depth. Shown first,
+            // Spilr's voice — the framing that gives the echo depth. Shown first,
             // larger; the quote sits beneath it as the evidence it's pointing at.
             if let line = echo.line, !line.isEmpty {
                 Text(line)
@@ -140,7 +140,7 @@ struct EchoCardView: View {
         HStack(spacing: 8) {
             // "Not yet" — left, secondary
             Button(action: onNotYet) {
-                Text("not yet")
+                Text("Not yet")
                     .font(.system(size: 11, weight: .regular))
                     .foregroundStyle(AppTheme.inkSoft)
                     .frame(maxWidth: .infinity)
@@ -166,9 +166,12 @@ struct EchoCardView: View {
     }
 
     private var themeActionButton: some View {
-        Button(action: onThemeTap) {
+        Button {
+            AnalyticsManager.shared.logEvent(.echoThemeExplored)
+            onThemeTap()
+        } label: {
             HStack {
-                Text("read them together")
+                Text("Read them together")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(AppTheme.cream)
                 Spacer()

@@ -1,0 +1,12 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Entry photos are private to each user — same ownership model as the
+    // Firestore `users/{userId}/entries` collection. Path written by the client:
+    // users/{userId}/entryPhotos/{entryId}.jpg
+    match /users/{userId}/entryPhotos/{fileName} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+  }
+}

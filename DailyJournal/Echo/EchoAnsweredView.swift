@@ -4,7 +4,7 @@
 //
 //  Shown as a sheet when the user confirms an echo ("done ✓", "it happened", etc.).
 //  Shows the past quote, an optional free-text response the user can leave,
-//  and a quiet closing note from ninety. No celebration, no streak counter,
+//  and a quiet closing note from Spilr. No celebration, no streak counter,
 //  no green checkmark. Just a small closing line — then it's gone.
 //
 
@@ -191,11 +191,11 @@ struct EchoAnsweredView: View {
         )
     }
 
-    // MARK: - Ninety's gentle closing note
+    // MARK: - Spilr's gentle closing note
 
     private var gentleNote: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Ninety, quietly")
+            Text("Spilr, quietly")
                 .font(AppTheme.mono(size: 9))
                 .foregroundStyle(AppTheme.terracotta)
                 .tracking(1.5)

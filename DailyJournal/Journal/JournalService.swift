@@ -34,39 +34,9 @@ final class JournalService {
         entriesCollection(for: entry.userId)
             .document(entry.id)
             .setData(entry.toFirestoreData())
-    }
-
-    // MARK: - Save a hint-ladder trace
-    //
-    // A "trace" is the ladder's floor: the user couldn't (or didn't want to)
-    // write or talk, but still showed up. We persist a tiny presence mark so the
-    // day still becomes a pebble in the river. The raw-entry pipelines (insights,
-    // echoes, Gemini river marks) all guard on length and harmlessly no-op on
-    // these — a trace is never analysed or "noticed".
-    @discardableResult
-    func saveTrace(userId: String, pebbles: [String], feelings: [String] = [], blank: Bool) -> JournalEntry {
-        let summary: String
-        if blank {
-            summary = "A blank present — showed up with no words today."
-        } else if !feelings.isEmpty {
-            summary = "A trace: " + feelings.joined(separator: " · ")
-        } else if !pebbles.isEmpty {
-            summary = "A trace: " + pebbles.joined(separator: " · ")
-        } else {
-            summary = "A quiet trace — present, without words."
-        }
-
-        var tags = pebbles
-        tags.append(blank ? "blank-drop" : "trace")
-
-        let entry = JournalEntry(
-            userId:      userId,
-            content:     summary,
-            tags:        tags,
-            sessionType: .ninetySecond
-        )
-        createEntry(entry)
-        return entry
+        // Keeps `rollups/stats.entryCount` current without anyone having to fetch
+        // (and decrypt) the corpus to count it — see RollupStats.swift.
+        RollupService.shared.recordEntryCreated(userId: entry.userId, at: entry.createdAt)
     }
 
     // MARK: - Update
@@ -101,6 +71,7 @@ final class JournalService {
         entriesCollection(for: entry.userId)
             .document(entry.id)
             .delete(completion: nil)
+        RollupService.shared.recordEntryDeleted(userId: entry.userId)
     }
 
     // MARK: - Update AI insights (called after Gemini returns)
@@ -115,11 +86,39 @@ final class JournalService {
             ])
     }
 
+    // MARK: - Update attached photo URL (called after Storage upload returns)
+    // Fire-and-forget: same pattern as all other writes.
+    func updateEntryPhotoURL(entryId: String, userId: String, url: String) {
+        entriesCollection(for: userId)
+            .document(entryId)
+            .updateData(["photoURL": url])
+
+        // The upload that produced `url` runs detached, well after the editor has
+        // already dismissed and handed a photo-less entry to the list via
+        // `upsert(_:)` (the entry object is built and inserted before the upload
+        // even starts — see `JournalEditorViewModel.save(photo:)`). Firestore's own
+        // write completes fine, but nothing was telling the already-visible list
+        // row about it, so the photo silently never appeared until the next full
+        // reload. This is the only signal that closes that gap without adding a
+        // live Firestore listener, which nothing else in the app uses.
+        NotificationCenter.default.post(
+            name: .journalEntryPhotoUploaded,
+            object: nil,
+            userInfo: ["entryId": entryId, "userId": userId, "photoURL": url]
+        )
+    }
+
     // MARK: - Fetch all (descending)
+    //
+    // Capped at 300 so a cold-start network fetch doesn't download an unbounded
+    // collection. Pull-to-refresh in JournalListView will still reconcile against
+    // the cache once it's warm. 300 covers the vast majority of users; heavy
+    // journalers who exceed this will see older entries on the next refresh.
     func fetchEntries(for userId: String) async throws -> [JournalEntry] {
         let snapshot = try await getDocuments(
             entriesCollection(for: userId)
                 .order(by: "createdAt", descending: true)
+                .limit(to: 300)
         )
         return snapshot.documents.compactMap { JournalEntry(from: $0.data()) }
     }
@@ -135,12 +134,21 @@ final class JournalService {
     }
 
     // MARK: - Fetch arrived letters
+    //
+    // Uses FirestoreCacheFirst, not the local `getDocuments`, because "no letters"
+    // is the correct answer for most users — and `getDocuments` treats an empty
+    // cache result as a miss, so this query went to the server on every Home load
+    // forever while gating first paint. Also `.limit(to:)`: an unbounded
+    // two-field query on the entries collection is the wrong shape for a lookup
+    // that renders at most a couple of cards.
     func fetchArrivedLetters(for userId: String) async throws -> [JournalEntry] {
         let now = Timestamp(date: Date())
-        let snapshot = try await getDocuments(
+        let snapshot = try await FirestoreCacheFirst.documents(
             entriesCollection(for: userId)
-                .whereField("futureSelfDeliveryDate", isLessThanOrEqualTo: now)
                 .whereField("futureSelfOpened", isEqualTo: false)
+                .whereField("futureSelfDeliveryDate", isLessThanOrEqualTo: now)
+                .limit(to: 10),
+            key: "arrivedLetters.\(userId)"
         )
         return snapshot.documents.compactMap { JournalEntry(from: $0.data()) }
     }
@@ -153,4 +161,45 @@ final class JournalService {
         )
         return snapshot.documents.compactMap { JournalEntry(from: $0.data()) }
     }
+
+    // MARK: - Fetch capped, newest-first (Mirror's maturity gating + Ask)
+    //
+    // Mirror used `fetchAllEntries` — the only UNBOUNDED entry query in the app —
+    // just to get a count and a corpus for `AskView`. Every maturity gate tops out
+    // at 90 entries (`MirrorMaturity`), and Ask ranks/filters its own candidates
+    // from whatever it's given, so neither needs the true full history. This is
+    // `fetchEntries`'s proven cache-friendly shape (capped, descending) at a limit
+    // sized for Mirror instead of the list screen's 300 — deliberately NOT a
+    // change to `fetchAllEntries` itself, since PatternsView, MemoryProfileService,
+    // PatternDetectionService and ThemeCompilationView all call that expecting the
+    // real full corpus.
+    func fetchEntriesForMirror(for userId: String, limit: Int = 100) async throws -> [JournalEntry] {
+        let snapshot = try await getDocuments(
+            entriesCollection(for: userId)
+                .order(by: "createdAt", descending: true)
+                .limit(to: limit)
+        )
+        return snapshot.documents.compactMap { JournalEntry(from: $0.data()) }
+    }
+
+    // MARK: - Count (for RollupService backfill)
+    //
+    // A Firestore COUNT aggregation query — the server returns a number, not
+    // documents, so this is the one entry "read" that costs neither a download
+    // nor a decryption. Used only to backfill `rollups/stats` for a user whose
+    // counter doc doesn't exist yet (pre-rollup accounts, or a first write that
+    // hasn't synced). `.server`, not cache-first: a stale cached count would
+    // defeat the point of a backfill.
+    func countEntries(for userId: String) async throws -> Int {
+        let snapshot = try await entriesCollection(for: userId).count.getAggregation(source: .server)
+        return snapshot.count.intValue
+    }
+
+}
+
+extension Notification.Name {
+    /// Posted by `JournalService.updateEntryPhotoURL` once a detached photo
+    /// upload has patched an entry's `photoURL` in Firestore. `userInfo` carries
+    /// `"entryId"`, `"userId"`, and `"photoURL"` (all `String`).
+    static let journalEntryPhotoUploaded = Notification.Name("journalEntryPhotoUploaded")
 }

@@ -6,7 +6,7 @@ A quiet iOS journaling app. No streaks. No badges. No gamification. Just a space
 
 ## What it does
 
-**ninety** gives users a structured but gentle way to journal daily. The name refers to the 90-second timed session — the minimum viable moment of reflection. Every feature is designed to feel like it's on the user's side, not pushing them toward a metric.
+**Spilr** gives users a structured but gentle way to journal daily. Every feature is designed to feel like it's on the user's side, not pushing them toward a metric.
 
 ### Core features
 
@@ -63,7 +63,7 @@ DailyJournal/
 │
 ├── Home/
 │   ├── HomeView.swift             — Main screen: header, letters, echo card, prompt, recents
-│   ├── NinetySecondSessionView.swift — Timed 90s session UI + ViewModel
+│   ├── TimedSessionView.swift — Timed session UI + ViewModel
 │   ├── AIService.swift            — Gemini 2.0 Flash: insights + echo extraction
 │   └── LocalAI.swift              — Offline fallback: sentiment, bullets, 30 daily prompts
 │

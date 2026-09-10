@@ -2,7 +2,7 @@
 //  MemoryProfile.swift
 //  DailyJournal
 //
-//  A lightweight, persistent "what ninety knows about you" layer.
+//  A lightweight, persistent "what Spilr knows about you" layer.
 //
 //  Until now every Gemini call was stateless: hints saw only pebbles, insights
 //  saw only the current entry, echoes saw 3 recent snippets, patterns saw a
@@ -12,7 +12,7 @@
 //
 //  It powers two things:
 //   1. The Echoes (Memories) feed — "things about you" that are always there.
-//   2. A compact `promptContext()` block injected into AI prompts so ninety's
+//   2. A compact `promptContext()` block injected into AI prompts so Spilr's
 //      "a friend who's been reading your journal" voice is finally backed by data.
 //
 //  It is intentionally derived + cached, never hand-edited, and never contains
@@ -33,6 +33,20 @@ struct MemoryProfile: Codable, Equatable {
     var recurringThemes: [Theme]
     /// Names / places / subjects that recur (from pattern callbacks + tags).
     var recurringEntities: [String]
+    /// The person's own non-standard emotional vocabulary — words like "wired",
+    /// "spiralling", "numb", "flat" that they use instead of the standard labels.
+    /// These are injected into prompts so the AI mirrors their language back.
+    var emotionalVocabulary: [String]
+    /// Observed coping signals: short phrases like "walks help" / "screens make
+    /// it worse" extracted from the person's own entries.
+    var copingPatterns: [String]
+    /// A couple of the most salient recent `JournalEvent`s, rendered as short
+    /// "situation → outcome" lines (see `EventService.fetchRecent` /
+    /// `JournalEvent.salience`). This is the one field in this struct that
+    /// isn't a frequency count — it's what upgrades `promptContext()` from
+    /// "themes: work (12), tired (9)" to a specific, checkable moment, at the
+    /// same 10 call sites that already read this block.
+    var notableMoments: [String]
     /// Dominant mood over the recent window, as `Mood.rawValue` (nil if unknown).
     var topMoodRaw: String?
     /// Lifetime + recent cadence.
@@ -47,7 +61,9 @@ struct MemoryProfile: Codable, Equatable {
     var hasContent: Bool { totalEntries > 0 }
 
     static let empty = MemoryProfile(
-        recurringThemes: [], recurringEntities: [], topMoodRaw: nil,
+        recurringThemes: [], recurringEntities: [],
+        emotionalVocabulary: [], copingPatterns: [], notableMoments: [],
+        topMoodRaw: nil,
         totalEntries: 0, activeDaysLast30: 0, activeDaysThisWeek: 0,
         firstEntryDate: nil, lastEntryDate: nil, generatedAt: .distantPast
     )
@@ -81,6 +97,22 @@ struct MemoryProfile: Codable, Equatable {
         if !recurringEntities.isEmpty {
             lines.append("- Names/places that recur: \(recurringEntities.prefix(5).joined(separator: ", "))")
         }
+        // Emotional vocabulary — use their actual words, not ours
+        if !emotionalVocabulary.isEmpty {
+            lines.append("- Their emotional vocabulary (use these words, not standard labels): "
+                + emotionalVocabulary.prefix(6).joined(separator: ", "))
+        }
+        // Coping patterns — useful context for grounding observations
+        if !copingPatterns.isEmpty {
+            lines.append("- Observed coping signals: "
+                + copingPatterns.prefix(4).joined(separator: "; "))
+        }
+        // Specific remembered moments — the one line here that's a checkable
+        // episode rather than a frequency count. See JournalEvent.swift.
+        if !notableMoments.isEmpty {
+            lines.append("- Specific moments worth remembering: "
+                + notableMoments.prefix(3).joined(separator: "; "))
+        }
         if let mood = topMood {
             lines.append("- Mood lately tends toward: \(mood.scaleLabel.lowercased())")
         }
@@ -97,7 +129,8 @@ struct MemoryProfile: Codable, Equatable {
 
         WHAT YOU ALREADY KNOW ABOUT THIS PERSON (context only — use it to make ONE
         line feel personally aware; NEVER list these facts back to them, never say
-        "I notice you often…" like a profile readout):
+        "I notice you often…" like a profile readout. Use their own words for
+        emotions where possible — their vocabulary, not generic labels):
         \(lines.joined(separator: "\n"))
         """
     }

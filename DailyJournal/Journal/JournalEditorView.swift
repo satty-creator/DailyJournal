@@ -4,6 +4,8 @@
 //
 
 import SwiftUI
+import PhotosUI
+import UIKit
 
 struct JournalEditorView: View {
 
@@ -11,12 +13,11 @@ struct JournalEditorView: View {
     @StateObject private var speech = SpeechManager()
     @Environment(\.dismiss) private var dismiss
     @FocusState private var isContentFocused: Bool
-    @State private var showFutureSelfSheet = false
     @State private var showDeleteConfirm = false
     @State private var micError: String?
-    // True only when the user explicitly taps the "send to future self" button.
-    // A normal save no longer forces the future-self sheet open.
-    @State private var wantsFutureSelf = false
+    // Photo picker state (edit mode)
+    @State private var photoItem: PhotosPickerItem?
+    @State private var photoUIImage: UIImage?
 
     private let onSave: (() -> Void)?
     /// Fires with the just-saved entry so a list can insert it optimistically
@@ -65,20 +66,13 @@ struct JournalEditorView: View {
                             }
                         }
                         moodWeatherPicker
-                        // A way in for the blank page — an AI-sharpened, probing
-                        // starter the user can tap to drop in. Only for brand-new,
-                        // still-empty entries; vanishes the moment they write.
-                        if !viewModel.isEditing && viewModel.content.isEmpty {
-                            FreeWriteStarterView(initialMood: viewModel.selectedMood) { fragment in
-                                viewModel.content = fragment
-                                viewModel.updateSentiment()
-                                viewModel.persistDraft()
-                                isContentFocused = true
-                            }
-                            .padding(.bottom, 24)
-                            .transition(.opacity)
-                        }
                         contentArea
+                        // Was gated on `isEditing`, so a brand-new free-write entry
+                        // had no way to attach a photo at all — the picker only
+                        // appeared after saving and reopening. `save(photo:)`
+                        // already handles the new-entry upload path correctly; this
+                        // was purely the view withholding the affordance.
+                        photoSection
                         if !viewModel.aiSummaryBullets.isEmpty && viewModel.isEditing {
                             aiSummarySection
                         }
@@ -95,6 +89,12 @@ struct JournalEditorView: View {
                 if !viewModel.isEditing { isContentFocused = true }
                 // Mic permission is requested lazily when the user taps the mic
                 // in the bottom bar — not when the editor opens.
+                if let sessionType = viewModel.sessionTypeLabel {
+                    AnalyticsManager.shared.trackEntryViewed(
+                        sessionType: sessionType,
+                        age: Date().timeIntervalSince(viewModel.entryDate)
+                    )
+                }
             }
             .safeAreaInset(edge: .bottom) { micBottomBar }
             .onDisappear { speech.stop() }
@@ -102,27 +102,18 @@ struct JournalEditorView: View {
             // as the user speaks. The final result also flows through here, so
             // nothing extra needs to be committed when recording stops.
             .onChange(of: speech.liveText) { _, live in
-                // liveText only mutates during an active recognition session, so
-                // this never overwrites text the user types after recording ends.
+                // Only mirror liveText → content while recording is active.
+                // Guarding on isRecording prevents a stale liveText value from
+                // a previous session from clobbering text the user typed after
+                // recording ended.
+                guard speech.isRecording else { return }
                 viewModel.content = live
             }
             .onChange(of: viewModel.didSaveSuccessfully) { _, saved in
                 if saved {
                     if let savedEntry = viewModel.savedEntry { onSaveEntry?(savedEntry) }
                     onSave?()
-                    // Only open the future-self sheet when the user explicitly
-                    // asked for it via the toolbar; a plain save just dismisses.
-                    if wantsFutureSelf && !viewModel.isEditing {
-                        showFutureSelfSheet = true
-                    } else {
-                        dismiss()
-                    }
-                }
-            }
-            // onDismiss fires whether user picks a date OR taps "Not now"
-            .sheet(isPresented: $showFutureSelfSheet, onDismiss: { dismiss() }) {
-                if let entry = viewModel.savedEntry {
-                    FutureSelfSheet(entry: entry) { /* sheet will dismiss, onDismiss → editor dismisses */ }
+                    dismiss()
                 }
             }
             .onChange(of: viewModel.didDeleteSuccessfully) { _, deleted in
@@ -134,6 +125,16 @@ struct JournalEditorView: View {
             // Surface mic/speech errors so failures are never silent
             .onChange(of: speech.errorMessage) { _, message in
                 micError = message
+            }
+            // Load selected photo into UIImage for preview and upload
+            .onChange(of: photoItem) { _, item in
+                guard let item else { return }
+                Task {
+                    if let data = try? await item.loadTransferable(type: Data.self),
+                       let ui = UIImage(data: data) {
+                        photoUIImage = ui
+                    }
+                }
             }
             .alert("Microphone unavailable", isPresented: Binding(
                 get: { micError != nil },
@@ -162,11 +163,12 @@ struct JournalEditorView: View {
                 Text("This can't be undone.")
             }
         }
+        .trackScreen(.entryEditor)
     }
 
     // MARK: - Date stamp
     private var dateStamp: some View {
-        Text(Date().formatted(.dateTime.weekday(.wide).month(.wide).day().year()))
+        Text(viewModel.entryDate.formatted(.dateTime.weekday(.wide).month(.wide).day().year()))
             .font(AppTheme.mono(size: 11))
             .foregroundStyle(AppTheme.inkSoft)
             .tracking(0.5)
@@ -186,6 +188,9 @@ struct JournalEditorView: View {
                 ForEach(Mood.allCases, id: \.self) { mood in
                     Button {
                         viewModel.selectedMood = viewModel.selectedMood == mood ? nil : mood
+                        if viewModel.selectedMood == mood {
+                            AnalyticsManager.shared.logEvent(.moodClicked, parameters: ["mood": mood.rawValue])
+                        }
                     } label: {
                         VStack(spacing: 4) {
                             Text(mood.faceEmoji).font(.title3)
@@ -227,7 +232,7 @@ struct JournalEditorView: View {
                     Circle()
                         .fill(AppTheme.sentimentColor(sentiment))
                         .frame(width: 6, height: 6)
-                    Text(sentiment.lowercased())
+                    Text(SpilrVoice.sentenceCased(sentiment))
                         .font(AppTheme.mono(size: 10))
                         .foregroundStyle(AppTheme.sentimentColor(sentiment))
                         .tracking(1)
@@ -282,11 +287,115 @@ struct JournalEditorView: View {
         }
     }
 
+    // MARK: - Photo section (edit mode: shows existing + allows add/change)
+    @ViewBuilder
+    private var photoSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            // Show new locally-picked photo (preview before upload)
+            if let uiImage = photoUIImage {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("PHOTO")
+                            .font(AppTheme.mono(size: 10))
+                            .foregroundStyle(AppTheme.inkSoft)
+                            .tracking(2)
+                        Spacer()
+                        PhotosPicker(selection: $photoItem, matching: .images) {
+                            Text("Change")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(AppTheme.terracotta)
+                        }
+                    }
+                    Image(uiImage: uiImage)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 220)
+                        .clipped()
+                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                }
+                .padding(.bottom, 20)
+            } else if let urlString = viewModel.photoURL, let url = URL(string: urlString) {
+                // Show existing saved photo
+                HStack {
+                    Text("PHOTO")
+                        .font(AppTheme.mono(size: 10))
+                        .foregroundStyle(AppTheme.inkSoft)
+                        .tracking(2)
+                    Spacer()
+                    PhotosPicker(selection: $photoItem, matching: .images) {
+                        Text("Change")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(AppTheme.terracotta)
+                    }
+                }
+                entryPhoto(url)
+            } else {
+                // No photo yet — show an add button
+                PhotosPicker(selection: $photoItem, matching: .images) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "photo.badge.plus")
+                            .font(.system(size: 16))
+                            .foregroundStyle(AppTheme.terracotta)
+                        Text("Add a photo")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(AppTheme.terracotta)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+                    .background(AppTheme.terracotta.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .strokeBorder(AppTheme.terracotta.opacity(0.35),
+                                          style: StrokeStyle(lineWidth: 1.2, dash: [5, 4]))
+                    )
+                }
+                .buttonStyle(.plain)
+                .padding(.bottom, 20)
+            }
+        }
+    }
+
+    // MARK: - Attached photo (shown when viewing an existing entry)
+    private func entryPhoto(_ url: URL) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("PHOTO")
+                .font(AppTheme.mono(size: 10))
+                .foregroundStyle(AppTheme.inkSoft)
+                .tracking(2)
+            AsyncImage(url: url) { phase in
+                switch phase {
+                case .success(let image):
+                    image.resizable().scaledToFill()
+                case .failure:
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle")
+                        Text("Couldn't load photo")
+                    }
+                    .font(AppTheme.mono(size: 11))
+                    .foregroundStyle(AppTheme.inkSoft)
+                    .frame(maxWidth: .infinity, minHeight: 80)
+                default:
+                    ProgressView()
+                        .tint(AppTheme.terracotta)
+                        .frame(maxWidth: .infinity, minHeight: 120)
+                        .background(AppTheme.paperWarm)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 220)
+            .clipped()
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        }
+        .padding(.bottom, 20)
+    }
+
     // MARK: - AI summary (shown when editing an existing entry)
     private var aiSummarySection: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("NINETY HEARD")
+                Text("SPILR HEARD")
                     .font(AppTheme.mono(size: 10))
                     .foregroundStyle(AppTheme.terracotta)
                     .tracking(2)
@@ -331,6 +440,9 @@ struct JournalEditorView: View {
             Divider()
                 .overlay(AppTheme.inkSoft.opacity(0.12))
                 .padding(.vertical, 16)
+        }
+        .onAppear {
+            AnalyticsManager.shared.logEvent(.aiInsightsViewed)
         }
     }
 
@@ -410,26 +522,13 @@ struct JournalEditorView: View {
                 .foregroundStyle(AppTheme.inkSoft)
                 .tracking(1)
         }
-        // Send to future self — opt-in. Saves the entry, then opens the
-        // delivery-date sheet. Only offered for new entries.
-        ToolbarItem(placement: .navigationBarTrailing) {
-            if !viewModel.isEditing {
-                Button {
-                    wantsFutureSelf = true
-                    viewModel.save()
-                } label: {
-                    Image(systemName: "paperplane")
-                        .font(.system(size: 15))
-                        .foregroundStyle(viewModel.canSave ? AppTheme.terracotta : AppTheme.slate)
-                }
-                .disabled(!viewModel.canSave)
-            }
-        }
-        // Save / Update — the mic now lives in the bottom bar (see micBottomBar)
+        // Save / Update — the mic now lives in the bottom bar (see micBottomBar).
+        // "Send to future self" now lives on SpillWriteView, the screen that
+        // actually creates new entries — this editor only ever opens on an
+        // existing one, so there's nothing left here to schedule a delivery for.
         ToolbarItem(placement: .navigationBarTrailing) {
             Button(viewModel.isEditing ? "Update" : "Save") {
-                wantsFutureSelf = false
-                viewModel.save()
+                viewModel.save(photo: photoUIImage)
             }
             .font(.system(size: 15, weight: .semibold))
             .foregroundStyle(viewModel.canSave ? AppTheme.terracotta : AppTheme.slate)
@@ -484,103 +583,5 @@ struct JournalEditorView: View {
         .padding(.horizontal, 24)
         .padding(.vertical, 10)
         .background(.ultraThinMaterial)
-    }
-}
-
-// MARK: - Free-write starter
-//
-// Brings the Hint Ladder's starter to the open blank page. It owns its own
-// HintEngine (empty pebbles, write mode), so it shows a sharp local starter
-// instantly and quietly upgrades to the AI-sharpened one when it arrives. The
-// user can re-roll the angle (gentler / direct / weirder) or tap to drop it in.
-private struct FreeWriteStarterView: View {
-    let initialMood: Mood?
-    let onUse: (String) -> Void
-
-    @StateObject private var hints = HintEngine(
-        context: HintContext(pebbles: [], personal: .safe, mode: .write)
-    )
-    @State private var prompt: String
-    /// Once the user re-rolls, stop auto-adopting the AI starter over their choice.
-    @State private var userRerolled = false
-
-    init(initialMood: Mood? = nil, onUse: @escaping (String) -> Void) {
-        self.initialMood = initialMood
-        self.onUse = onUse
-        // If we arrived here from a mood check-in, open with a mood-tuned prompt
-        // rather than a generic one.
-        if let mood = initialMood {
-            _prompt = State(initialValue: LocalAI.moodPrompt(for: mood))
-        } else {
-            _prompt = State(initialValue: HintLadder.starterPrompt(pebbles: [], personal: .safe))
-        }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("NEED A WAY IN?")
-                    .font(AppTheme.mono(size: 10))
-                    .foregroundStyle(AppTheme.inkSoft)
-                    .tracking(2)
-                Spacer()
-                if hints.bundle.source == "gemini" {
-                    Text("for you")
-                        .font(AppTheme.mono(size: 9)).tracking(1)
-                        .foregroundStyle(AppTheme.terracotta)
-                        .padding(.horizontal, 8).padding(.vertical, 4)
-                        .background(AppTheme.terracotta.opacity(0.10))
-                        .clipShape(Capsule())
-                }
-            }
-
-            Button { onUse(prompt) } label: {
-                Text(prompt)
-                    .font(AppTheme.editorialDisplay(size: 20))
-                    .foregroundStyle(AppTheme.ink)
-                    .multilineTextAlignment(.leading)
-                    .lineSpacing(3)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(16)
-                    .background(AppTheme.rose2.opacity(0.5))
-                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-            }
-            .buttonStyle(.plain)
-            .animation(.easeInOut(duration: 0.2), value: prompt)
-
-            HStack(spacing: 8) {
-                pill("gentler")     { reroll(.gentle) }
-                pill("more direct") { reroll(.direct) }
-                pill("weirder")     { reroll(.weird) }
-                Spacer()
-                Text("tap to use")
-                    .font(AppTheme.mono(size: 9)).tracking(1)
-                    .foregroundStyle(AppTheme.slate)
-            }
-        }
-        .onChange(of: hints.bundle) { _, newBundle in
-            // Don't let the generic AI starter clobber a mood-tuned prompt or a
-            // prompt the user has already reshaped.
-            guard initialMood == nil, !userRerolled, newBundle.source == "gemini" else { return }
-            withAnimation { prompt = newBundle.starterWrite }
-        }
-    }
-
-    private func reroll(_ style: HintLadder.PromptStyle) {
-        userRerolled = true
-        prompt = hints.restyledStarter(style)
-    }
-
-    private func pill(_ title: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(AppTheme.inkSoft)
-                .padding(.horizontal, 12).padding(.vertical, 7)
-                .background(AppTheme.paperWarm)
-                .clipShape(Capsule())
-        }
-        .buttonStyle(.plain)
     }
 }

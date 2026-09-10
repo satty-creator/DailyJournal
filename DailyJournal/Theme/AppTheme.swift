@@ -2,11 +2,22 @@
 //  AppTheme.swift
 //  DailyJournal
 //
-//  Pastel "cute, but meaningful" design system.
+//  "Cute, but meaningful" design system — now themeable.
 //
-//  All the original property names + typography function signatures are kept
-//  so existing screens keep compiling. Only the values changed (editorial
-//  terracotta → soft pastel) and a River colour vocabulary was added.
+//  Originally this was a single fixed pastel palette. It is now backed by a
+//  swappable `ThemePalette` (see ThemeManager) so the whole app can switch
+//  between vibes (Bloom / Moon / Forest / Graphite / Sunset) à la the Spilr
+//  prototype.
+//
+//  IMPORTANT — backwards compatibility:
+//  Every original property name and typography signature is preserved. The only
+//  change is that the colour properties are now computed `static var`s that read
+//  from `AppTheme.active` (the currently selected palette) instead of being
+//  fixed `let`s. The default palette (`.bloom`) reproduces the previous values
+//  EXACTLY, so existing screens render identically until the user picks another
+//  theme. No call-site changes are required anywhere.
+//
+//  See themesprd.md for the full feature spec.
 //
 
 import SwiftUI
@@ -34,43 +45,302 @@ extension Color {
     }
 }
 
-// MARK: - App Theme
-struct AppTheme {
+// MARK: - Theme identity
+//
+// The set of user-selectable vibes. `rawValue` is the persistence key.
+enum ThemeID: String, CaseIterable, Identifiable {
+    case bloom      // soft + cute (default — the original Spilr palette)
+    case moon       // night + calm (dark)
+    case forest     // grounded
+    case graphite   // data-first
+    case sunset     // warm
 
-    // ── Pastel palette ─────────────────────────────────────────────────
-    // Soft, screenshot-friendly tones. Backgrounds are warm-white; "ink" is a
-    // deep aubergine rather than near-black so dark surfaces still feel gentle.
-    static let paper          = Color(hex: "FFF8F2")   // warm app background
-    static let paperWarm      = Color(hex: "FBEFE9")   // slightly deeper surface
-    static let cream          = Color(hex: "FFFDFB")   // card / on-dark text
-    static let ink            = Color(hex: "2B2440")   // deep aubergine (headlines / dark cards)
-    static let inkSoft        = Color(hex: "766F84")   // muted lavender-grey (secondary text)
+    var id: String { rawValue }
 
-    // Accents — "terracotta" name kept for back-compat but now a soft rose.
-    static let terracotta     = Color(hex: "F58BA6")   // primary rose
-    static let terracottaDeep = Color(hex: "E0567C")   // deeper rose (timer urgency etc.)
+    /// Short display name shown in the picker tile.
+    var title: String {
+        switch self {
+        case .bloom:    return "Bloom"
+        case .moon:     return "Moon"
+        case .forest:   return "Forest"
+        case .graphite: return "Graphite"
+        case .sunset:   return "Sunset"
+        }
+    }
+
+    /// One-line subtitle shown under the name.
+    var subtitle: String {
+        switch self {
+        case .bloom:    return "soft + cute"
+        case .moon:     return "night + calm"
+        case .forest:   return "grounded"
+        case .graphite: return "data-first"
+        case .sunset:   return "warm"
+        }
+    }
+
+    /// Whether this palette is a dark UI (drives `preferredColorScheme`).
+    var colorScheme: ColorScheme {
+        self == .moon ? .dark : .light
+    }
+
+    /// The three swatch colours used on the picker tile (bg, primary, accent).
+    var swatch: [Color] {
+        let p = palette
+        return [p.paper, p.terracotta, p.sun]
+    }
+
+    /// The concrete palette for this theme.
+    var palette: ThemePalette { ThemePalette.palette(for: self) }
+}
+
+// MARK: - Theme palette
+//
+// A full set of design tokens. Colours are stored as concrete `Color` values
+// (parsed once at construction) so look-ups are cheap.
+struct ThemePalette {
+    // Surfaces & text
+    let paper: Color        // app background
+    let paperWarm: Color    // slightly deeper surface
+    let cream: Color        // card surface / inverse (on-dark) text
+    let ink: Color          // headlines, dark cards, primary text
+    let inkSoft: Color      // secondary text
+
+    // Primary accent
+    let terracotta: Color
+    let terracottaDeep: Color
 
     // Pastel companions
-    static let rose           = Color(hex: "FFB8C6")
-    static let rose2          = Color(hex: "FFE1E8")
-    static let peach          = Color(hex: "FFD7AD")
-    static let mint           = Color(hex: "A9F1D3")
-    static let blue           = Color(hex: "BDE7FF")
-    static let lav            = Color(hex: "D8CCFF")
-    static let sun            = Color(hex: "FFE77A")
+    let rose: Color
+    let rose2: Color
+    let peach: Color
+    let mint: Color
+    let blue: Color
+    let lav: Color
+    let sun: Color
 
-    // Legacy semantic names mapped onto the pastel set.
-    static let moss           = Color(hex: "8FD9B6")   // calm / content
-    static let dusk           = Color(hex: "B7A6E8")   // sad / heavy (soft lavender)
-    static let gold           = Color(hex: "FFCF6B")   // joy / excitement
-    static let slate          = Color(hex: "A9A2B8")   // neutral
+    // Legacy semantic names (mood vocabulary)
+    let moss: Color
+    let dusk: Color
+    let gold: Color
+    let slate: Color
+
+    // Cold/extreme lavender used at the bottom of the valence scale.
+    let valenceCold: Color
+
+    // Soft shadow tint
+    let cardShadow: Color
+
+    // ── Spilr Redesign additions (3a/3b/3c) ─────────────────────────────
+    // A deeper, more saturated lavender than `lav` — used for small eyebrow
+    // labels and marks that need to read against a light surface (`lav` itself
+    // is too pale to hold as text). `lavWash` is the pale tinted-fill counterpart
+    // (a wash, not a text colour). `inkRaised` is the lighter stop in the dark
+    // hero card's ink→inkRaised gradient.
+    let lavDeep: Color
+    let lavWash: Color
+    let inkRaised: Color
+
+    // MARK: Palette factory
+    static func palette(for id: ThemeID) -> ThemePalette {
+        switch id {
+        case .bloom:    return bloom
+        case .moon:     return moon
+        case .forest:   return forest
+        case .graphite: return graphite
+        case .sunset:   return sunset
+        }
+    }
+
+    // ── Bloom (default) — reproduces the original Spilr palette EXACTLY ──
+    static let bloom = ThemePalette(
+        paper:          Color(hex: "FFF8F2"),
+        paperWarm:      Color(hex: "FBEFE9"),
+        cream:          Color(hex: "FFFDFB"),
+        ink:            Color(hex: "2B2440"),
+        inkSoft:        Color(hex: "766F84"),
+        terracotta:     Color(hex: "F58BA6"),
+        terracottaDeep: Color(hex: "E0567C"),
+        rose:           Color(hex: "FFB8C6"),
+        rose2:          Color(hex: "FFE1E8"),
+        peach:          Color(hex: "FFD7AD"),
+        mint:           Color(hex: "A9F1D3"),
+        blue:           Color(hex: "BDE7FF"),
+        lav:            Color(hex: "D8CCFF"),
+        sun:            Color(hex: "FFE77A"),
+        moss:           Color(hex: "8FD9B6"),
+        dusk:           Color(hex: "B7A6E8"),
+        gold:           Color(hex: "FFCF6B"),
+        slate:          Color(hex: "A9A2B8"),
+        valenceCold:    Color(hex: "9C86C9"),
+        cardShadow:     Color(hex: "392A4C").opacity(0.10),
+        lavDeep:        Color(hex: "8E79C9"),
+        lavWash:        Color(hex: "EDE6FF"),
+        inkRaised:      Color(hex: "4A3A63")
+    )
+
+    // ── Moon — night + calm (dark). The one dark palette. ────────────────
+    // cream is a dark card surface here; ink flips to near-white text.
+    static let moon = ThemePalette(
+        paper:          Color(hex: "12132B"),
+        paperWarm:      Color(hex: "211638"),
+        cream:          Color(hex: "1E2240"),
+        ink:            Color(hex: "F7F4FF"),
+        inkSoft:        Color(hex: "B9ADC8"),
+        terracotta:     Color(hex: "A78BFA"),
+        terracottaDeep: Color(hex: "8B5CF6"),
+        rose:           Color(hex: "E58AB0"),
+        rose2:          Color(hex: "3A2A4A"),
+        peach:          Color(hex: "E5A45A"),
+        mint:           Color(hex: "5EEAD4"),
+        blue:           Color(hex: "38BDF8"),
+        lav:            Color(hex: "A78BFA"),
+        sun:            Color(hex: "F8D66D"),
+        moss:           Color(hex: "5FD0A0"),
+        dusk:           Color(hex: "8B7FB8"),
+        gold:           Color(hex: "F8D66D"),
+        slate:          Color(hex: "8780A0"),
+        valenceCold:    Color(hex: "6E5AA6"),
+        cardShadow:     Color.black.opacity(0.40),
+        // `lav` is already pinned to the same violet as `terracotta` here, so
+        // `lavDeep` is a lighter, more pastel violet — distinct from both and
+        // still legible as a label/mark against the dark `cream` card surface.
+        lavDeep:        Color(hex: "C4B5FD"),
+        // A dark theme's "wash" is a tinted panel, not a pale tint — a violet
+        // step above `paper`, matching how `paperWarm`/`cream` work here.
+        lavWash:        Color(hex: "2A2150"),
+        // `ink` is already near-white text in Moon, so the hero card's gradient
+        // becomes a soft bright card popping off the dark page — the same
+        // "loudest card on screen" role `ink→inkRaised` plays in the light
+        // palettes, just inverted the way every dark-theme hero naturally is.
+        inkRaised:      Color(hex: "E8E0FF")
+    )
+
+    // ── Forest — grounded greens + warm sand ─────────────────────────────
+    static let forest = ThemePalette(
+        paper:          Color(hex: "EDF8F1"),
+        paperWarm:      Color(hex: "F4F0DC"),
+        cream:          Color(hex: "FCFEF6"),
+        ink:            Color(hex: "163326"),
+        inkSoft:        Color(hex: "5E6F66"),
+        terracotta:     Color(hex: "2FBF71"),
+        terracottaDeep: Color(hex: "0E7490"),
+        rose:           Color(hex: "E59A8E"),
+        rose2:          Color(hex: "DDEFE3"),
+        peach:          Color(hex: "F0C879"),
+        mint:           Color(hex: "9DE8C0"),
+        blue:           Color(hex: "7FCBD3"),
+        lav:            Color(hex: "A7C8C0"),
+        sun:            Color(hex: "F6C453"),
+        moss:           Color(hex: "5FBF8C"),
+        dusk:           Color(hex: "7FA89A"),
+        gold:           Color(hex: "E8B84B"),
+        slate:          Color(hex: "9DB0A6"),
+        valenceCold:    Color(hex: "6FA39A"),
+        cardShadow:     Color(hex: "0F3D2A").opacity(0.12),
+        lavDeep:        Color(hex: "4F7A70"),
+        lavWash:        Color(hex: "E3F0E9"),
+        inkRaised:      Color(hex: "2E5943")
+    )
+
+    // ── Graphite — cool, data-first ──────────────────────────────────────
+    static let graphite = ThemePalette(
+        paper:          Color(hex: "EEF1F5"),
+        paperWarm:      Color(hex: "DEE5EC"),
+        cream:          Color(hex: "FFFFFF"),
+        ink:            Color(hex: "151B25"),
+        inkSoft:        Color(hex: "5E6878"),
+        terracotta:     Color(hex: "2563EB"),
+        terracottaDeep: Color(hex: "0F172A"),
+        rose:           Color(hex: "F08A8A"),
+        rose2:          Color(hex: "E3E9F1"),
+        peach:          Color(hex: "F6A86A"),
+        mint:           Color(hex: "5BD68C"),
+        blue:           Color(hex: "60A5FA"),
+        lav:            Color(hex: "8C93F0"),
+        sun:            Color(hex: "F5C518"),
+        moss:           Color(hex: "22C55E"),
+        dusk:           Color(hex: "7E8AA0"),
+        gold:           Color(hex: "EAB308"),
+        slate:          Color(hex: "94A3B8"),
+        valenceCold:    Color(hex: "7480A8"),
+        cardShadow:     Color(hex: "16203A").opacity(0.14),
+        lavDeep:        Color(hex: "5A63C4"),
+        lavWash:        Color(hex: "E3E6FA"),
+        inkRaised:      Color(hex: "2B3648")
+    )
+
+    // ── Sunset — warm dusk ───────────────────────────────────────────────
+    static let sunset = ThemePalette(
+        paper:          Color(hex: "FFF0DF"),
+        paperWarm:      Color(hex: "FFE3E0"),
+        cream:          Color(hex: "FFFBF6"),
+        ink:            Color(hex: "2D1A12"),
+        inkSoft:        Color(hex: "8A6657"),
+        terracotta:     Color(hex: "FF6B35"),
+        terracottaDeep: Color(hex: "B45309"),
+        rose:           Color(hex: "FF8FA3"),
+        rose2:          Color(hex: "FFE0D5"),
+        peach:          Color(hex: "FFB088"),
+        mint:           Color(hex: "EFC98A"),
+        blue:           Color(hex: "EAB07A"),
+        lav:            Color(hex: "E2A6C5"),
+        sun:            Color(hex: "FACC15"),
+        moss:           Color(hex: "E0954F"),
+        dusk:           Color(hex: "C08A6A"),
+        gold:           Color(hex: "F5B829"),
+        slate:          Color(hex: "B5998C"),
+        valenceCold:    Color(hex: "C28A8A"),
+        cardShadow:     Color(hex: "703018").opacity(0.16),
+        lavDeep:        Color(hex: "B06B8F"),
+        lavWash:        Color(hex: "F7E0EC"),
+        inkRaised:      Color(hex: "4A2E1E")
+    )
+}
+
+// MARK: - App Theme
+//
+// The public design-system surface. Colour properties proxy to `active` so a
+// theme change is reflected everywhere these tokens are read. `active` is set
+// by ThemeManager; default is `.bloom`.
+struct AppTheme {
+
+    /// The currently selected palette. Mutated by ThemeManager.
+    static var active: ThemePalette = .bloom
+
+    // ── Pastel palette (now theme-driven) ──────────────────────────────
+    static var paper: Color          { active.paper }
+    static var paperWarm: Color      { active.paperWarm }
+    static var cream: Color          { active.cream }
+    static var ink: Color            { active.ink }
+    static var inkSoft: Color        { active.inkSoft }
+
+    static var terracotta: Color     { active.terracotta }
+    static var terracottaDeep: Color { active.terracottaDeep }
+
+    static var rose: Color           { active.rose }
+    static var rose2: Color          { active.rose2 }
+    static var peach: Color          { active.peach }
+    static var mint: Color           { active.mint }
+    static var blue: Color           { active.blue }
+    static var lav: Color            { active.lav }
+    static var sun: Color            { active.sun }
+
+    static var moss: Color           { active.moss }
+    static var dusk: Color           { active.dusk }
+    static var gold: Color           { active.gold }
+    static var slate: Color          { active.slate }
+
+    static var lavDeep: Color        { active.lavDeep }
+    static var lavWash: Color        { active.lavWash }
+    static var inkRaised: Color      { active.inkRaised }
 
     // ── Semantic aliases ───────────────────────────────────────────────
-    static let primary      = terracotta
-    static let background   = paper
-    static let surface      = cream
-    static let textPrimary  = ink
-    static let textSecond   = inkSoft
+    static var primary: Color      { active.terracotta }
+    static var background: Color   { active.paper }
+    static var surface: Color      { active.cream }
+    static var textPrimary: Color  { active.ink }
+    static var textSecond: Color   { active.inkSoft }
 
     // ── Mood → accent color ────────────────────────────────────────────
     static func moodColor(_ mood: Mood?) -> Color {
@@ -80,7 +350,7 @@ struct AppTheme {
         case .good:     return moss
         case .neutral:  return slate
         case .bad:      return dusk
-        case .terrible: return Color(hex: "9C86C9")
+        case .terrible: return active.valenceCold
         }
     }
 
@@ -110,55 +380,17 @@ struct AppTheme {
     // The river renderer maps derived signals (valence/activation/clarity) onto
     // colour so a user can learn to "read" their own week. Deterministic — the
     // model proposes a visual_spec, but the actual colours come from here so
-    // every river is recognisably ninety.
+    // every river is recognisably Spilr.
 
     /// Valence -3…+3 → a hue from cool/heavy to warm/bright.
     static func valenceColor(_ valence: Int) -> Color {
         switch valence {
-        case ...(-2): return Color(hex: "9C86C9")   // cold lavender
+        case ...(-2): return active.valenceCold   // cold lavender
         case -1:      return dusk
         case 0:       return blue
         case 1:       return mint
         case 2:       return peach
-        default:      return sun                     // +3 bright
-        }
-    }
-
-    /// A river-marker glyph + tint for the cute-but-semantic vocabulary.
-    enum RiverMarker: String {
-        case water    // a normal entry day
-        case mist     // a quiet / no-entry day
-        case bridge   // return after a gap
-        case glimmer  // softer self-talk / relief
-        case stone    // recurring theme
-        case rapid    // pressure / intensity
-        case pool     // emotionally heavy / dense entry
-        case fork     // ambivalence
-
-        var glyph: String {
-            switch self {
-            case .water:   return "💧"
-            case .mist:    return "🌫️"
-            case .bridge:  return "🌉"
-            case .glimmer: return "✨"
-            case .stone:   return "🪨"
-            case .rapid:   return "🌊"
-            case .pool:    return "🌀"
-            case .fork:    return "🜊"
-            }
-        }
-
-        var tint: Color {
-            switch self {
-            case .water:   return AppTheme.blue
-            case .mist:    return AppTheme.paperWarm
-            case .bridge:  return AppTheme.lav
-            case .glimmer: return AppTheme.sun
-            case .stone:   return AppTheme.slate
-            case .rapid:   return AppTheme.rose
-            case .pool:    return AppTheme.dusk
-            case .fork:    return AppTheme.peach
-            }
+        default:      return sun                   // +3 bright
         }
     }
 
@@ -178,7 +410,7 @@ struct AppTheme {
     }
 
     // ── Soft shadow helper ──────────────────────────────────────────────
-    static let cardShadow = Color(hex: "392A4C").opacity(0.10)
+    static var cardShadow: Color { active.cardShadow }
 }
 
 // MARK: - Soft card modifier

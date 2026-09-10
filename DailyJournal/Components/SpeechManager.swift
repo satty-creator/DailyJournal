@@ -31,6 +31,11 @@ final class SpeechManager: ObservableObject {
     // already wrote.
     private var baseText = ""
 
+    /// Set by `stop()`, cleared by `start()`. Gates the recognition callback so a
+    /// result that was already in flight when the session ended can't write back to
+    /// `liveText` after the caller has taken the transcript and moved on.
+    private var discardPendingResults = false
+
     private var recognizer: SFSpeechRecognizer?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
@@ -114,6 +119,7 @@ final class SpeechManager: ObservableObject {
         baseText = existingText
         liveText = existingText
         errorMessage = nil
+        discardPendingResults = false
 
         do {
             // Configure audio session.
@@ -159,6 +165,14 @@ final class SpeechManager: ObservableObject {
             recognitionTask = recognizer.recognitionTask(with: recognitionRequest) { [weak self] result, error in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
+                    // Drop anything that arrives after an explicit stop(). Cancelling
+                    // the recognition task doesn't cancel callbacks already in flight,
+                    // and each one hops to the main actor separately — so a straggler
+                    // could land after the caller had already taken the transcript and
+                    // cleared its field, silently re-populating it. Note the internal
+                    // stop() calls below run AFTER this write in the same block, so a
+                    // genuine final correction is still delivered.
+                    guard !self.discardPendingResults else { return }
                     if let result {
                         let spoken = result.bestTranscription.formattedString
                         // CRITICAL: ignore empty transcriptions. When recording is
@@ -196,6 +210,10 @@ final class SpeechManager: ObservableObject {
 
     // MARK: - Stop
     func stop() {
+        // Close the gate first: from here on, any recognition callback still in
+        // flight is stale and must not write back to `liveText`.
+        discardPendingResults = true
+
         // Remove tap before stopping the engine
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()

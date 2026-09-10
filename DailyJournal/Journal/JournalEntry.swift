@@ -9,8 +9,20 @@ import SwiftUI
 
 // MARK: - Session Type
 enum SessionType: String, Codable, CaseIterable {
-    case ninetySecond = "ninetySecond"
+    case timed        = "ninetySecond"   // raw value kept for Firestore back-compat
     case freeWrite    = "freeWrite"
+    /// An entry woven from a Daily Chat conversation with Spilr (Day One-style
+    /// interactive journaling). Behaves exactly like any other entry downstream —
+    /// Echoes, River and Patterns all treat it as normal prose.
+    case dailyChat    = "dailyChat"
+    /// A structured thought-journal card produced by the "Unpack Stress" chat
+    /// mode. Stored as markdown; behaves like any other entry downstream.
+    case cbtReframe   = "cbtReframe"
+    /// A guided template run (`TemplateRunnerViewModel`) — a short structured
+    /// exercise whose answers were woven into prose. Behaves like any other
+    /// entry downstream; see `templateId` / `templateScaleBefore` /
+    /// `templateScaleAfter` below for the metadata specific to it.
+    case template     = "template"
 }
 
 // MARK: - Mood
@@ -75,6 +87,20 @@ struct JournalEntry: Identifiable, Codable {
     var aiSummaryBullets: [String]
     var aiQuestion: String?
     var sentimentLabel: String?
+    /// Download URL of an optional attached photo (Firebase Storage). nil = none.
+    var photoURL: String?
+    /// The `JournalTemplate.id` this entry was woven from, if any. Metadata
+    /// only — the answer text itself is never persisted (only `content`,
+    /// the woven prose, is encrypted at rest; raw structured answers would
+    /// be plaintext, which the two scale values below sidestep by being
+    /// non-sensitive numbers rather than free text).
+    var templateId: String?
+    /// Before/after 0–10 self-ratings, present only for a template whose
+    /// steps include both a `.before` and `.after` scale (currently
+    /// "Untangle a decision"). Lets the delta shown on the review screen be
+    /// compared across entries later, not just shown once and discarded.
+    var templateScaleBefore: Int?
+    var templateScaleAfter: Int?
 
     // MARK: - New entry init
     init(
@@ -87,7 +113,11 @@ struct JournalEntry: Identifiable, Codable {
         futureSelfDeliveryDate: Date? = nil,
         aiSummaryBullets: [String] = [],
         aiQuestion: String? = nil,
-        sentimentLabel: String? = nil
+        sentimentLabel: String? = nil,
+        photoURL: String? = nil,
+        templateId: String? = nil,
+        templateScaleBefore: Int? = nil,
+        templateScaleAfter: Int? = nil
     ) {
         self.id                     = UUID().uuidString
         self.userId                 = userId
@@ -103,6 +133,10 @@ struct JournalEntry: Identifiable, Codable {
         self.aiSummaryBullets       = aiSummaryBullets
         self.aiQuestion             = aiQuestion
         self.sentimentLabel         = sentimentLabel
+        self.photoURL               = photoURL
+        self.templateId             = templateId
+        self.templateScaleBefore    = templateScaleBefore
+        self.templateScaleAfter     = templateScaleAfter
     }
 
     // MARK: - Firestore init
@@ -110,10 +144,15 @@ struct JournalEntry: Identifiable, Codable {
         guard
             let id        = data["id"]      as? String,
             let userId    = data["userId"]  as? String,
-            let content   = data["content"] as? String,
+            let rawContent = data["content"] as? String,
             let createdAt = (data["createdAt"] as? Timestamp)?.dateValue(),
             let updatedAt = (data["updatedAt"] as? Timestamp)?.dateValue()
         else { return nil }
+
+        let isEncrypted = data["encrypted"] as? Bool ?? false
+        let content = isEncrypted
+            ? (EntryEncryption.decrypt(rawContent) ?? rawContent)
+            : rawContent
 
         self.id        = id
         self.userId    = userId
@@ -131,15 +170,21 @@ struct JournalEntry: Identifiable, Codable {
         self.aiSummaryBullets       = data["aiSummaryBullets"]  as? [String] ?? []
         self.aiQuestion             = data["aiQuestion"]         as? String
         self.sentimentLabel         = data["sentimentLabel"]     as? String
+        self.photoURL               = data["photoURL"]           as? String
+        self.templateId             = data["templateId"]           as? String
+        self.templateScaleBefore    = data["templateScaleBefore"]  as? Int
+        self.templateScaleAfter     = data["templateScaleAfter"]   as? Int
     }
 
     // MARK: - Firestore write
     func toFirestoreData() -> [String: Any] {
+        let encryptedContent = EntryEncryption.encrypt(content) ?? content
         var data: [String: Any] = [
             "id":               id,
             "userId":           userId,
             "title":            title,
-            "content":          content,
+            "content":          encryptedContent,
+            "encrypted":        true,
             "mood":             mood?.rawValue ?? "",
             "tags":             tags,
             "createdAt":        Timestamp(date: createdAt),
@@ -151,6 +196,10 @@ struct JournalEntry: Identifiable, Codable {
         if let d = futureSelfDeliveryDate { data["futureSelfDeliveryDate"] = Timestamp(date: d) }
         if let q = aiQuestion             { data["aiQuestion"]             = q }
         if let s = sentimentLabel         { data["sentimentLabel"]         = s }
+        if let p = photoURL               { data["photoURL"]               = p }
+        if let t = templateId             { data["templateId"]             = t }
+        if let b = templateScaleBefore    { data["templateScaleBefore"]    = b }
+        if let a = templateScaleAfter     { data["templateScaleAfter"]     = a }
         return data
     }
 
@@ -165,6 +214,10 @@ struct JournalEntry: Identifiable, Codable {
 
     var formattedDate: String {
         createdAt.formatted(.dateTime.weekday(.wide).month(.wide).day())
+    }
+
+    var shortFormattedDate: String {
+        createdAt.formatted(.dateTime.weekday(.abbreviated).day().month(.abbreviated))
     }
 
     var isScheduledLetter: Bool { futureSelfDeliveryDate != nil }

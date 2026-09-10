@@ -6,7 +6,7 @@ A quiet iOS journaling app. No streaks. No badges. No gamification. Just a space
 
 ## What it does
 
-**ninety** gives users a structured but gentle way to journal daily. The name refers to the 90-second timed session — the minimum viable moment of reflection. Every feature is designed to feel like it's on the user's side, not pushing them toward a metric.
+**Spilr** gives users a structured but gentle way to journal daily. Every feature is designed to feel like it's on the user's side, not pushing them toward a metric.
 
 ### Core features
 
@@ -68,7 +68,7 @@ DailyJournal/
 │
 ├── Home/
 │   ├── HomeView.swift             — Main screen: header, letters, echo card, prompt, recents
-│   ├── NinetySecondSessionView.swift — Timed 90s session UI + ViewModel
+│   ├── TimedSessionView.swift — Timed session UI + ViewModel
 │   ├── AIService.swift            — Gemini 2.5 Flash: insights + echo extraction
 │   └── LocalAI.swift              — Offline fallback: sentiment, bullets, 30 daily prompts
 │
@@ -209,7 +209,7 @@ Until both are on, the button will render but sign-in will fail at the Firebase 
 
 ## What's new in this iteration
 
-- **AI model bumped to `gemini-2.5-flash`** — the previous `gemini-2.0-flash` was retired by Google (Mar 2026) and was silently failing into the LocalAI fallback.
+- **AI model bumped to `gemini-3.5-flash-lite`** — Google now returns a 404 (`no longer available to new users`) for the `gemini-2.5-*` line on newly-issued API keys (Aug 2026). `gemini-3.5-flash-lite` is the current stable, fast, low-cost successor; the proxy and Mirror service now point at it.
 - **Live voice transcription** in the editor; **one-time mic hint** on the 90-second screen.
 - **Mood blob** logs a per-day `MoodLog`, collapses to a compact summary once logged, and adds a haptic + bounce + gentle affirmation on log. Labels are a pleasant ↔ unpleasant valence scale with face emoji.
 - **Mascot empty states** (`MascotView` / `FriendlyEmptyState`) on Home recents and the Journal list.

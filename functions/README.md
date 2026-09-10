@@ -12,7 +12,7 @@ The app **never** holds a key, and users are **never** asked for one.
 
 1. **Get a Gemini key.** Go to <https://aistudio.google.com/apikey>, sign in,
    "Create API key", let it use your Google Cloud project, copy the key.
-   Free tier covers `gemini-2.5-flash` (≈10 requests/min, 250/day — fine for a beta).
+   Free tier covers `gemini-3.5-flash-lite` (≈10 requests/min, 250/day — fine for a beta).
 
    > **Important (deadline):** from **June 19, 2026** Google no longer allows
    > "unrestricted" keys. In AI Studio / Google Cloud Console → Credentials, open
