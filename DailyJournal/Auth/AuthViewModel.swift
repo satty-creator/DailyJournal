@@ -28,6 +28,40 @@ final class AuthViewModel: ObservableObject {
     private let authService = AuthService()
     private var authStateListener: AuthStateDidChangeListenerHandle?
 
+    /// The demo account handed to App Review in App Store Connect.
+    ///
+    /// Nobody reads this mailbox, so the verification email Firebase sends on
+    /// sign-up can never be opened and `isEmailVerified` stays false forever.
+    /// Reviewers therefore signed in successfully and then hit
+    /// `VerificationView`'s "Check your inbox" wall, which they reported as the
+    /// app demanding an authentication code — Guideline 2.1(a), submission
+    /// 7225aa5b, September 2026.
+    private static let reviewDemoEmail = "test@spilr.com"
+
+    /// True for the App Review demo account, whatever its verification state.
+    ///
+    /// The address must stay byte-identical to the Demo Account username in
+    /// App Store Connect → App Review Information. Firebase already lower-cases
+    /// the addresses it stores, but both sides are normalised anyway: the cost
+    /// is nothing, and the failure mode of a near-miss — a silent no-op that
+    /// resurfaces weeks later as another rejection — is expensive.
+    private static func isReviewDemoAccount(_ user: User) -> Bool {
+        guard let email = user.email?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        else { return false }
+        return email == reviewDemoEmail
+    }
+
+    /// Email verification proves the person owns the address. The review
+    /// account's address is ours, it exists only for review, and it is still
+    /// protected by its password — so waiving *that one* check costs nothing
+    /// and grants nothing. The account is an ordinary signed-in user
+    /// afterwards, with no extra entitlement or privilege anywhere.
+    private static func passesVerificationGate(_ user: User) -> Bool {
+        user.isEmailVerified || isReviewDemoAccount(user)
+    }
+
     init() {
         listenToAuthState()
     }
@@ -44,13 +78,20 @@ final class AuthViewModel: ObservableObject {
             Task { @MainActor in
                 if let user = user {
                     self?.currentUser = AppUser(id: user.uid, email: user.email ?? "", displayName: user.displayName)
+                    // Closes the launch-time race where FCM hands us a
+                    // cached token before this listener resolves a uid.
+                    PushNotificationManager.shared.resaveCurrentTokenIfNeeded()
                     if user.isAnonymous {
                         // Guest users go straight to the app — no email to verify.
                         self?.authState = .authenticated
                     } else {
                         // Gate email/password accounts behind verification.
-                        // Google/Apple return isEmailVerified == true so they pass through.
-                        self?.authState = user.isEmailVerified ? .authenticated : .unverified
+                        // Google/Apple return isEmailVerified == true so they pass through,
+                        // as does the App Review demo account — see reviewDemoEmail.
+                        self?.authState = Self.passesVerificationGate(user) ? .authenticated : .unverified
+                        // Restores RevenueCat's identification on relaunch — see
+                        // AuthService.reidentifyRevenueCat's doc comment.
+                        await self?.authService.reidentifyRevenueCat(uid: user.uid)
                     }
                 } else {
                     self?.currentUser = nil
@@ -78,7 +119,9 @@ final class AuthViewModel: ObservableObject {
             SessionManager.shared.recordSignupDate()
 
             // The auth state listener will move us to .unverified (verification
-            // email has been sent by AuthService).
+            // email has been sent by AuthService). That send counts against the
+            // throttle, so the cooldown starts here rather than on first tap.
+            startResendCooldown()
         } catch {
             errorMessage = error.localizedDescription
             AnalyticsManager.shared.trackError(error, context: "signup_failed")
@@ -90,9 +133,49 @@ final class AuthViewModel: ObservableObject {
     // MARK: - Email verification
     @Published var verificationMessage: String?
 
+    /// Seconds remaining before another verification email may be requested.
+    /// 0 means the Resend button is live.
+    ///
+    /// Firebase throttles `sendOobCode` per IP *and* per address, and the quota
+    /// is small. Without a cooldown a new user waiting on a slow corporate inbox
+    /// can tap Resend four times in ten seconds and trip it — which surfaces as
+    /// `AuthError.tooManyRequests` on the one screen they cannot get past.
+    @Published private(set) var resendCooldown: Int = 0
+
+    private var resendCooldownTask: Task<Void, Never>?
+    private static let resendCooldownSeconds = 60
+
+    /// Starts (or restarts) the countdown. Called after every *attempted* send,
+    /// including the automatic one at sign-up.
+    private func startResendCooldown() {
+        resendCooldownTask?.cancel()
+        resendCooldown = Self.resendCooldownSeconds
+        // @MainActor is inherited here, so the mutations below stay on main.
+        resendCooldownTask = Task { [weak self] in
+            while true {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if Task.isCancelled { return }
+                guard let self else { return }
+                self.resendCooldown = max(0, self.resendCooldown - 1)
+                if self.resendCooldown == 0 { return }
+            }
+        }
+    }
+
     /// Re-checks verification status after the user taps the link in their inbox.
     func refreshVerificationStatus() async {
         verificationMessage = nil
+
+        // The demo account's waiver is a local string comparison, so it is
+        // settled before any network call. The listener normally means App
+        // Review never reaches this screen at all; if some ordering quirk puts
+        // them here anyway, a reload that fails on a flaky connection must not
+        // be what strands them on it.
+        if let user = Auth.auth().currentUser, Self.isReviewDemoAccount(user) {
+            authState = .authenticated
+            return
+        }
+
         do {
             let verified = try await authService.reloadEmailVerified()
             if verified {
@@ -105,14 +188,19 @@ final class AuthViewModel: ObservableObject {
         }
     }
 
-    /// Resends the verification email.
+    /// Resends the verification email. No-ops while the cooldown is running.
     func resendVerificationEmail() async {
+        guard resendCooldown == 0 else { return }
         verificationMessage = nil
         do {
             try await authService.sendEmailVerification()
             verificationMessage = "Verification email sent."
+            startResendCooldown()
         } catch {
             verificationMessage = error.localizedDescription
+            // A throttle rejection means the send was refused, not that we may
+            // retry at once — back off exactly as we would after a success.
+            if case AuthError.tooManyRequests = error { startResendCooldown() }
         }
     }
 
@@ -189,6 +277,8 @@ final class AuthViewModel: ObservableObject {
             currentUser = try await authService.linkGuestWithEmail(
                 email: email, password: password, displayName: displayName
             )
+            // linkGuestWithEmail sends a verification email too — same reason.
+            startResendCooldown()
         } catch {
             upgradeErrorMessage = error.localizedDescription
         }
@@ -275,8 +365,12 @@ final class AuthViewModel: ObservableObject {
 
     // MARK: - Sign Out
     func signOut() {
+        // Read the uid first — it is gone by the time the sign-out returns, and
+        // the on-device memory digest is keyed by it.
+        let uid = Auth.auth().currentUser?.uid
         do {
             try authService.signOut()
+            if let uid { MemoryProfileService.shared.clearCache(for: uid) }
             AnalyticsManager.shared.logEvent(.signoutCompleted)
         } catch {
             errorMessage = error.localizedDescription
@@ -289,26 +383,39 @@ final class AuthViewModel: ObservableObject {
     @Published var isDeletingAccount = false
     @Published var deleteErrorMessage: String?
 
+    /// Entry point for the Delete-account button.
+    ///
+    /// Apple accounts detour through a fresh Sign in with Apple, not to prove
+    /// who they are — the server needs no reauthentication — but because
+    /// Apple's token revocation needs a one-time authorizationCode that only a
+    /// new ASAuthorization yields. Everything else deletes on the first tap.
+    func beginAccountDeletion() {
+        deleteErrorMessage = nil
+        if isAppleUser {
+            pendingAppleDeletion = true
+        } else {
+            Task { await deleteAccount() }
+        }
+    }
+
     /// Permanently deletes the account and all associated data.
     ///
-    /// For Sign in with Apple users, pass the `authorizationCode` from a
-    /// fresh `ASAuthorizationAppleIDCredential` so Apple can revoke the
-    /// token (required by App Store guidelines).
+    /// For Sign in with Apple users, `appleAuthorizationCode` lets Apple revoke
+    /// the token (required by App Store guidelines).
     func deleteAccount(appleAuthorizationCode: String? = nil) async {
         isDeletingAccount = true
         deleteErrorMessage = nil
         defer { isDeletingAccount = false }
 
+        let uid = Auth.auth().currentUser?.uid
         do {
             try await authService.deleteAccount(appleAuthorizationCode: appleAuthorizationCode)
+            if let uid { MemoryProfileService.shared.clearCache(for: uid) }
             AnalyticsManager.shared.logEvent(.accountDeleted)
-            // Auth state listener fires automatically → .unauthenticated
-        } catch let nsErr as NSError
-            where nsErr.code == AuthErrorCode.requiresRecentLogin.rawValue
-        {
-            deleteErrorMessage = "For your security, please sign out and sign back in before deleting your account."
+            // AuthService signs out on success → listener → .unauthenticated
         } catch {
             deleteErrorMessage = error.localizedDescription
+            AnalyticsManager.shared.trackError(error, context: "account_delete_failed")
         }
     }
 
@@ -318,12 +425,11 @@ final class AuthViewModel: ObservableObject {
             .contains(where: { $0.providerID == "apple.com" }) ?? false
     }
 
-    // MARK: - Apple re-auth for account deletion
+    // MARK: - Apple authorization for account deletion
     //
-    // Deletion of an Apple-linked account requires a fresh Apple authorization
-    // to obtain the one-time authorizationCode for token revocation.
-    // `pendingAppleDeletion` signals the UI to trigger a new Sign in with Apple
-    // sheet, whose completion should call `confirmAppleDeletion`.
+    // `pendingAppleDeletion` signals the UI to present a Sign in with Apple
+    // sheet, whose completion calls `confirmAppleDeletion`. The only thing
+    // taken from the result is the one-time authorizationCode.
 
     @Published var pendingAppleDeletion = false
 
@@ -339,14 +445,17 @@ final class AuthViewModel: ObservableObject {
                 deleteErrorMessage = error.localizedDescription
             }
         case .success(let auth):
-            guard
-                let credential = auth.credential as? ASAuthorizationAppleIDCredential,
-                let codeData = credential.authorizationCode,
-                let code = String(data: codeData, encoding: .utf8)
-            else {
-                deleteErrorMessage = "Apple authorisation failed. Please try again."
-                return
-            }
+            // The nonce this request was prepared with is spent either way; it
+            // must not leak into a later sign-in attempt.
+            currentNonce = nil
+
+            let code = (auth.credential as? ASAuthorizationAppleIDCredential)?
+                .authorizationCode
+                .flatMap { String(data: $0, encoding: .utf8) }
+
+            // A missing code costs only Apple-side revocation — the account
+            // still deletes — so this proceeds rather than dead-ending the
+            // user on a flow they have now confirmed twice.
             await deleteAccount(appleAuthorizationCode: code)
         }
     }
