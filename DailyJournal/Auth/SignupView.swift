@@ -127,17 +127,6 @@ struct SignupView: View {
                 }
                 .font(.subheadline)
 
-                // Guest mode — satisfies App Store Guideline 5.1.1(v)
-                Button {
-                    Task { await authViewModel.continueAsGuest() }
-                } label: {
-                    Text("Continue without account")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .underline()
-                }
-                .disabled(authViewModel.isLoading)
-
                 Spacer(minLength: 40)
             }
             .padding(.horizontal, 24)

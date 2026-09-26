@@ -86,6 +86,32 @@ final class JournalService {
             ])
     }
 
+    // MARK: - Observe a single entry
+    // Every other read here is one-shot, which is fine for lists that are re-fetched
+    // on appear. It is NOT fine for a surface that is already on screen while a
+    // detached enrichment task is still writing to the entry it is displaying — the
+    // first-entry celebration sheet is opened from a snapshot taken milliseconds
+    // after `createEntry`, so `updateEntryInsights` always lands after it. This
+    // returns a live listener so that surface can redraw when the patch arrives.
+    //
+    // The caller owns the returned registration and MUST `remove()` it — see
+    // `EntryInsightsObserver`, which ties it to the view's lifetime.
+    func observeEntry(
+        entryId: String,
+        userId: String,
+        onChange: @escaping (JournalEntry) -> Void
+    ) -> ListenerRegistration {
+        entriesCollection(for: userId)
+            .document(entryId)
+            .addSnapshotListener { snapshot, _ in
+                guard
+                    let data = snapshot?.data(),
+                    let entry = JournalEntry(from: data)
+                else { return }
+                onChange(entry)
+            }
+    }
+
     // MARK: - Update attached photo URL (called after Storage upload returns)
     // Fire-and-forget: same pattern as all other writes.
     func updateEntryPhotoURL(entryId: String, userId: String, url: String) {

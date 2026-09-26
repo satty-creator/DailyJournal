@@ -117,7 +117,7 @@ Organized by feature:
 | **Patterns** | 5 | pattern_surfaced, pattern_dismissed, pattern_explored, pattern_evidence_viewed, pattern_detection_failed |
 | **Mirror** | 3 | mirror_hypothesis_viewed, mirror_hypothesis_edited, mirror_graph_viewed |
 | **Hints** | 4 | today_read_viewed, hint_ladder_started, hint_ladder_completed, question_answered |
-| **Chat** | 2 | daily_chat_started, daily_chat_completed |
+| **Chat** | 4 | daily_chat_started, daily_chat_completed, cbt_mode_started, cbt_mode_completed |
 | **Journal** | 4 | journal_filtered, journal_searched, journal_sorted, entry_viewed |
 | **Settings** | 3 | theme_changed, settings_opened, feedback_sent |
 | **Session** | 4 | session_started, session_ended, app_foregrounded, app_backgrounded |

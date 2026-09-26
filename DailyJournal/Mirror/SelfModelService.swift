@@ -356,6 +356,75 @@ final class SelfModelService: ObservableObject {
             .setData(ctx.toFirestoreData()) { _ in }
     }
 
+    // MARK: - Model ops audit trail (chat write-back)
+    //
+    // The counterweight to "natural language, applied silently" (Daily Chat's
+    // extractModelOps): nothing it writes is undiscoverable. Every applied op
+    // is recorded here with the verbatim quote that licensed it, listed in
+    // "What changed" (SelfModelView), and reversible.
+
+    @Published private(set) var modelOps: [ModelOp] = []
+
+    /// Records that a chat-derived op was applied. Fire-and-forget, same
+    /// discipline as every other write in this file.
+    func recordModelOp(_ op: ModelOp, userId: String) {
+        Firestore.firestore()
+            .collection("users").document(userId)
+            .collection("modelOps").document(op.id)
+            .setData(op.toFirestoreData()) { _ in }
+        modelOps.insert(op, at: 0)
+    }
+
+    /// Fetches the most recent chat-derived ops, most recent first.
+    func loadModelOps(userId: String) async {
+        guard let snapshot = try? await FirestoreCacheFirst.documents(
+            Firestore.firestore()
+                .collection("users").document(userId)
+                .collection("modelOps")
+                .order(by: "appliedAt", descending: true)
+                .limit(to: 20),
+            key: "modelOps.\(userId)"
+        ) else { return }
+        modelOps = snapshot.documents.compactMap { ModelOp(id: $0.documentID, from: $0.data()) }
+    }
+
+    /// Reverses one applied op: stamps `undoneAt` and puts back whatever field
+    /// it touched. Best-effort on the revert half — an item the nightly miner
+    /// has since retired, or a topic already removed some other way, has
+    /// nothing left underneath to put back, but the op still gets marked
+    /// undone so "What changed" stops showing it as active.
+    func undoModelOp(_ op: ModelOp, userId: String) {
+        Firestore.firestore()
+            .collection("users").document(userId)
+            .collection("modelOps").document(op.id)
+            .updateData(["undoneAt": Timestamp(date: Date())]) { _ in }
+
+        if let idx = modelOps.firstIndex(where: { $0.id == op.id }) {
+            modelOps[idx].undoneAt = Date()
+        }
+
+        switch op.op {
+        case .confirm, .notMe:
+            guard let itemId = op.targetItemId else { return }
+            DerivedService.shared.markPersonModelItemStatus(
+                itemId: itemId, userStatus: "unrated", userId: userId)
+        case .untrackTopic:
+            Task { [subject = op.subject] in
+                var ctx = await self.lifeContext(for: userId)
+                ctx.sensitiveTopicsDisabled.removeAll { $0.caseInsensitiveCompare(subject) == .orderedSame }
+                self.saveLifeContext(ctx, userId: userId)
+                AIService.cacheLifeContext(ctx)
+            }
+        case .track:
+            Task { [subject = op.subject] in
+                var ctx = await self.lifeContext(for: userId)
+                ctx.primaryFocus.removeAll { $0.caseInsensitiveCompare(subject) == .orderedSame }
+                self.saveLifeContext(ctx, userId: userId)
+                AIService.cacheLifeContext(ctx)
+            }
+        }
+    }
+
     // MARK: - Private helpers
 
     /// Walks all hypothesis-bearing sections of the SelfModel and updates userStatus

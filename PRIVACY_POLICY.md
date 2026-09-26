@@ -1,6 +1,6 @@
 # Spilr — Privacy Policy
 
-**Last updated: 13 August 2026**
+**Last updated: 18 September 2026**
 
 > **Maintainers:** this is the hostable copy of the text in
 > `DailyJournal/App/PrivacyPolicyView.swift`. App Store Connect requires a publicly
@@ -38,8 +38,18 @@ with other users.
 **Your account details.** Email address, display name, sign-in method, time zone, and
 the notification token for your device.
 
-That is the whole list. We do not collect your contacts, your location, your health
-data, or your activity in other apps.
+**Your Google Calendar, if you connect it.** This is entirely optional and off by
+default. If you connect it, the app reads your primary calendar's event titles, times,
+and locations, directly from Google, to show them to you in Spilr's own Calendar view.
+We request read-only access and never create, edit, or delete anything on your calendar.
+This data is not stored on our servers and not sent to any AI — it's fetched live from
+Google each time you open the Calendar view, and only stays in memory on your device.
+You can disconnect at any time from Settings, or revoke access entirely from your Google
+Account's permissions page.
+
+That is the whole list. We do not collect your contacts, your location (beyond what
+you've chosen to put in a connected calendar event), your health data, or your activity
+in other apps.
 
 ---
 

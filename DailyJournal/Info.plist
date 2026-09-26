@@ -27,5 +27,13 @@
 	<string>spilr uses your microphone so you can speak your journal entry instead of typing.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>spilr transcribes your voice into text so you can journal hands-free.</string>
+	<!-- Firebase's automatic screen reporting names screens after the UIKit
+	     view controller on top. In a SwiftUI app every real screen is the same
+	     hosting controller, so the only rows it ever produced were system
+	     chrome: PlatformAlertController and PUPickerUnavailableAssetsViewController.
+	     AnalyticsManager.trackScreenView now sends proper screen_view events
+	     via .trackScreen(_:), so this is off to keep the Screens report clean. -->
+	<key>FirebaseAutomaticScreenReportingEnabled</key>
+	<false/>
 </dict>
 </plist>

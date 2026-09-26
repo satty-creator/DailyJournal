@@ -132,25 +132,68 @@ struct SelfModelView: View {
     @State private var correctionText = ""
     @State private var showingHypothesisId: String? = nil
 
-    init(userId: String, selfModel: SelfModel) {
+    /// The model as the PARENT currently has it, kept alongside `vm.selfModel`.
+    ///
+    /// `@StateObject` is initialised exactly once, which was harmless while this
+    /// view was pushed from MirrorView only after a load had finished. As the
+    /// Mirror tab's root it is instead constructed while `MirrorViewModel.selfModel`
+    /// is still `SelfModel.empty` — so without re-syncing, the screen would seed
+    /// itself with version 0 and render "Still learning" forever. See the
+    /// `.onChange` below.
+    private let incoming: SelfModel
+
+    /// Non-nil when the host wants the Ask entry point above the profile — the
+    /// Mirror tab passes it, gated on entry count. Nil elsewhere.
+    private let onAsk: (() -> Void)?
+
+    /// The current weekly letter, if any — MirrorView owns loading it. Nil
+    /// (rather than absent) covers "hasn't loaded yet" and "none exists" alike;
+    /// `isFreshAndUnread` decides whether the banner actually renders.
+    private let weeklyLetter: MirrorLetter?
+    /// Non-nil when the host wants the weekly-letter banner wired up. The Mirror
+    /// tab passes it; nil elsewhere (previews, any other host) simply omits the
+    /// banner regardless of `weeklyLetter`.
+    private let onOpenLetter: (() -> Void)?
+
+    init(userId: String, selfModel: SelfModel, onAsk: (() -> Void)? = nil,
+         weeklyLetter: MirrorLetter? = nil, onOpenLetter: (() -> Void)? = nil) {
+        incoming = selfModel
+        self.onAsk = onAsk
+        self.weeklyLetter = weeklyLetter
+        self.onOpenLetter = onOpenLetter
         _vm = StateObject(wrappedValue: SelfModelViewModel(userId: userId, selfModel: selfModel))
     }
 
     var body: some View {
-        // Not its own NavigationStack — this view is always pushed via a
-        // `.navigationDestination` from MirrorView, which already owns the
-        // stack. A nested NavigationStack here doubled the nav bar and broke
-        // the interactive swipe-back gesture (mirror-v3-prd-2026-09-10.md,
-        // Week 1).
+        // Not its own NavigationStack — MirrorView owns the stack and hosts this
+        // view as the Mirror tab's content. A nested NavigationStack here doubled
+        // the nav bar and broke the interactive swipe-back gesture
+        // (mirror-v3-prd-2026-09-10.md, Week 1).
         Group {
             ZStack {
                 AppTheme.paper.ignoresSafeArea()
 
-                if vm.selfModel.version == 0 {
-                    emptyState
-                } else {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 20) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 20) {
+                        if let onAsk {
+                            MirrorAskCard(onTap: onAsk)
+                        }
+
+                        // §5.5 / T4.1: Ask pill → weekly-letter banner (only if
+                        // fresh) → Today card → … Deliberately outside the
+                        // `version == 0` gate below — a letter can exist before
+                        // the Person Model has anything to show.
+                        if let weeklyLetter, weeklyLetter.isFreshAndUnread, let onOpenLetter {
+                            WeeklyLetterBanner(onTap: onOpenLetter)
+                        }
+
+                        // The empty state lives INSIDE the scroll rather than
+                        // beside it, so an account whose profile hasn't been
+                        // mined yet still gets the Ask card above "Still
+                        // learning" instead of losing it entirely.
+                        if vm.selfModel.version == 0 {
+                            emptyState
+                        } else {
                             maturityBanner
                             if let narrative = vm.narrative {
                                 narrativeHeader(narrative)
@@ -199,16 +242,27 @@ struct SelfModelView: View {
                             if isProfileEmpty {
                                 profileEmptyState
                             }
-                            Spacer(minLength: 60)
                         }
-                        .padding(.horizontal, 20)
-                        .padding(.top, 16)
+
+                        Spacer(minLength: 60)
                     }
-                    .scrollIndicators(.hidden)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 16)
                 }
+                .scrollIndicators(.hidden)
             }
-            .navigationTitle("My Mirror")
-            .navigationBarTitleDisplayMode(.large)
+            // No `navigationTitle` here: MirrorView owns the NavigationStack and
+            // sets the title on it, so the bar reads "Mirror" during the cold-load
+            // spinner too — not just once this content has appeared.
+            //
+            // Re-seed the view model whenever the parent hands down a genuinely
+            // newer model. Keyed on `updatedAt` rather than the whole value
+            // (SelfModel isn't Equatable) and rather than `version` — this fires
+            // only on a real server write, so the optimistic local edits made by
+            // markHypothesis/hideHypothesis survive in between.
+            .onChange(of: incoming.updatedAt) { _, _ in
+                vm.selfModel = incoming
+            }
             .task {
                 await vm.loadNarrative()
                 AnalyticsManager.shared.logEvent(.mirrorHypothesisViewed)
@@ -235,7 +289,10 @@ struct SelfModelView: View {
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 40)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // `maxHeight: .infinity` centred this when it was a sibling of the
+        // ScrollView; inside one it would collapse to its intrinsic height and
+        // sit under the nav bar. A minimum height keeps it visually centred.
+        .frame(maxWidth: .infinity, minHeight: 420)
     }
 
     // MARK: - Maturity banner

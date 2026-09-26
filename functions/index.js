@@ -17,6 +17,11 @@ const { onTaskDispatched } = require("firebase-functions/v2/tasks");
 const { defineSecret } = require("firebase-functions/params");
 const admin = require("firebase-admin");
 const { getFunctions } = require("firebase-admin/functions");
+// Modular imports, not `Timestamp` etc.: the Functions
+// emulator's firebase-admin shim drops those namespace statics (they came
+// back `undefined` under the E2E run, crashing geminiProxy), while these
+// work identically in the emulator and in production.
+const { FieldValue, Timestamp, FieldPath } = require("firebase-admin/firestore");
 
 // Pure logic lives in ./lib so it can be unit-tested without emulators or
 // network (`npm test` → node:test). Mirror v3 is almost entirely arithmetic,
@@ -52,6 +57,11 @@ const {
 const {
   buildFormulationPrompt, buildNextQuestionPrompt, buildMirrorMPrompt, buildAskPrompt,
 } = require("./lib/prompts");
+const {
+  isOwnerToken, decideAccess, hasAIAccess, resolveAppUserId, entitlementUpdateFromEvent,
+} = require("./lib/entitlement");
+const { isStubEnabled, stubGeminiResponse } = require("./lib/geminiStub");
+const { buildAuthEmail, rewriteVerifyLink } = require("./lib/authEmail");
 
 admin.initializeApp();
 
@@ -170,7 +180,7 @@ async function enqueueForUsers(queueName, uids, payloadFor, runDate) {
  */
 async function fetchUserPage(db, fields, cursor) {
   let q = db.collection("users")
-    .orderBy(admin.firestore.FieldPath.documentId())
+    .orderBy(FieldPath.documentId())
     .limit(DISPATCH_PAGE_SIZE);
   if (fields.length) q = q.select(...fields); else q = q.select();
   if (cursor) q = q.startAfter(cursor);
@@ -237,7 +247,7 @@ const MODEL = "gemini-3.5-flash-lite";
 const KNOWN_SURFACES = new Set([
   "journal_insights", "echo_extraction",
   "chat_turn", "chat_turn_cbt", "chat_weave_entry", "chat_weave_thought_journal",
-  "chat_session_state",
+  "chat_session_state", "chat_model_ops",
   "todays_read_client",
   // "mirror_narrative" removed — Prompt F was deleted client-side in Mirror
   // v3 (the weekly letter replaces it), so the tag can no longer be sent.
@@ -270,35 +280,31 @@ const MAX_CONTENTS_TURNS = 40;
  *  `aiUsage` is Admin-SDK-only, exactly like the `rateLimits` collection it
  *  replaces as the cost-control mechanism.
  *
- *  There is no billing stack wired up yet (RevenueCat webhook — see
- *  ai-cost-audit-2026-09-06.md §5, Phase 5), so a user's FIRST AI call
- *  bootstraps them into "trial" here. Once the webhook exists it promotes a
- *  user to "paid" or "expired" by writing this same doc; nothing else in this
- *  file needs to change.
+ *  Spilr Pro (Sept 2026): a user's FIRST AI call bootstraps them into a
+ *  short FREE PREVIEW (days + tokens, see lib/entitlement.js). Starting the
+ *  App Store trial or paying makes `revenueCatWebhook` set "paid" (with the
+ *  subscription's expiry); lapsing sets "expired". Owners bypass. Once the
+ *  preview is over, AI stops server-side — here, and in the server's own
+ *  AI jobs via `serverAIAllowed` — and writing keeps working.
  *
- *  Degrade, never 429: a budget miss returns 402 without calling Gemini. The
- *  client's existing contract already treats any non-2xx as "fall back to the
- *  local engine" on every single AI surface (LocalAI, HintLadder.localBundle,
- *  LocalPatternDetector, localNextTurn, LocalReadEngine) — so no client change
- *  was needed to make this land as "a plainer app," not a visible error.
+ *  Degrade, never 429: a miss returns 402 { reason } without calling Gemini.
+ *  Every client AI surface already degrades on non-2xx; the client also reads
+ *  `reason` to decide whether to show the Spilr Pro paywall.
  * ────────────────────────────────────────────────────────────────────────── */
-const TRIAL_BUDGET = { inTok: 500000, outTok: 80000 };       // cumulative for the whole trial
-const PAID_DAILY_BUDGET = { inTok: 150000, outTok: 25000 };  // resets daily
-// No single surface may consume more than this fraction of the total budget —
-// stops one runaway surface (e.g. a chat bug looping) from eating every other
-// surface's allowance too.
-const SURFACE_SHARE_CAP = 0.5;
+// Budgets, preview length and owner allowlist live in ./lib/entitlement.js
+// (pure, unit-tested). This file only does the Firestore I/O around them.
 
 function utcDayKey(d) {
   return d.toISOString().slice(0, 10); // "yyyy-MM-dd"
 }
 
 /**
- * Checks whether `uid` has budget left for a call tagged `surface`, bootstrapping
- * a fresh `aiUsage/{uid}` doc (entitlement: "trial") on first-ever use. Returns
- * `{ allowed, entitlement }`. Never calls Gemini — purely a Firestore check.
+ * Checks whether `uid` may make an AI call tagged `surface`, bootstrapping a
+ * fresh `aiUsage/{uid}` doc (entitlement: "free", preview starts now) on
+ * first-ever use. Returns `decideAccess`'s `{ allowed, entitlement, reason,
+ * ledger }`. Never calls Gemini — purely a Firestore check.
  */
-async function checkAIBudget(db, uid, surface) {
+async function checkAIBudget(db, uid, surface, isOwner = false) {
   const ref = db.collection("aiUsage").doc(uid);
   const now = new Date();
   const today = utcDayKey(now);
@@ -309,56 +315,69 @@ async function checkAIBudget(db, uid, surface) {
 
     if (!data) {
       data = {
-        entitlement: "trial",
-        trialStartedAt: admin.firestore.Timestamp.fromDate(now),
+        entitlement: "free",
+        trialStartedAt: Timestamp.fromDate(now),
+        previewStartedAt: Timestamp.fromDate(now),
         trialInTok: 0, trialOutTok: 0, trialPerSurface: {},
         day: today, dayInTok: 0, dayOutTok: 0, dayPerSurface: {},
       };
+      if (isOwner) data.owner = true;
       tx.set(ref, data);
+    } else {
+      const patch = {};
+      // Roll the daily counters over on a UTC day change. Preview counters
+      // are cumulative for the whole preview and are never reset here.
+      if (data.day !== today) {
+        Object.assign(patch, { day: today, dayInTok: 0, dayOutTok: 0, dayPerSurface: {} });
+      }
+      // Stamped so the nightly/server-side jobs, which have no ID token to
+      // check, can recognise an owner from the doc alone.
+      if (isOwner && data.owner !== true) patch.owner = true;
+      // Pre-policy accounts (old token-only "trial") start their free preview
+      // on their first AI call after this deploy — see lib/entitlement.js.
+      // Their old preview-token counters are reset too, so the preview is a
+      // real one rather than already spent by August usage.
+      if (!data.previewStartedAt) {
+        Object.assign(patch, {
+          previewStartedAt: Timestamp.fromDate(now),
+          trialInTok: 0, trialOutTok: 0, trialPerSurface: {},
+        });
+      }
+      if (Object.keys(patch).length) {
+        tx.update(ref, patch);
+        data = { ...data, ...patch };
+      }
     }
 
-    if (data.entitlement === "expired") {
-      return { allowed: false, entitlement: "expired" };
-    }
-
-    // Roll the PAID daily counters over on a UTC day change. Trial counters are
-    // cumulative for the whole trial and are never touched here.
-    if (data.day !== today) {
-      tx.update(ref, { day: today, dayInTok: 0, dayOutTok: 0, dayPerSurface: {} });
-      data = { ...data, day: today, dayInTok: 0, dayOutTok: 0, dayPerSurface: {} };
-    }
-
-    const isPaid = data.entitlement === "paid";
-    const budget = isPaid ? PAID_DAILY_BUDGET : TRIAL_BUDGET;
-    const usedIn = isPaid ? (data.dayInTok || 0) : (data.trialInTok || 0);
-    const usedOut = isPaid ? (data.dayOutTok || 0) : (data.trialOutTok || 0);
-    if (usedIn >= budget.inTok || usedOut >= budget.outTok) {
-      return { allowed: false, entitlement: data.entitlement };
-    }
-
-    const perSurface = (isPaid ? data.dayPerSurface : data.trialPerSurface) || {};
-    const surfaceUsed = perSurface[surface] || { inTok: 0, outTok: 0 };
-    if (surfaceUsed.inTok >= budget.inTok * SURFACE_SHARE_CAP ||
-        surfaceUsed.outTok >= budget.outTok * SURFACE_SHARE_CAP) {
-      return { allowed: false, entitlement: data.entitlement };
-    }
-
-    return { allowed: true, entitlement: data.entitlement };
+    return decideAccess(data, now.getTime(), surface, isOwner);
   });
+}
+
+/** Status-only gate for server-side AI work (see hasAIAccess). Fails OPEN on
+ *  a read error, same trade as geminiProxy: an infra hiccup must not switch
+ *  AI off for paying users. */
+async function serverAIAllowed(db, uid) {
+  try {
+    const snap = await db.collection("aiUsage").doc(uid).get();
+    return hasAIAccess(snap.exists ? snap.data() : null, Date.now());
+  } catch (e) {
+    console.error("serverAIAllowed read failed, allowing", { uid, error: String(e) });
+    return true;
+  }
 }
 
 /**
  * Records actual token spend after a successful call, into whichever counter
- * pair `entitlement` uses. Best-effort — a failure here must never affect the
+ * pair `ledger` names ("day" or "trial"). Best-effort — a failure here must never affect the
  * response already sent to the client, so callers wrap this and swallow.
  */
-function recordAIUsage(db, uid, surface, entitlement, inTok, outTok) {
-  const prefix = entitlement === "paid" ? "day" : "trial";
+function recordAIUsage(db, uid, surface, ledger, inTok, outTok) {
+  const prefix = ledger === "day" ? "day" : "trial";
   return db.collection("aiUsage").doc(uid).set({
-    [`${prefix}InTok`]: admin.firestore.FieldValue.increment(inTok),
-    [`${prefix}OutTok`]: admin.firestore.FieldValue.increment(outTok),
-    [`${prefix}PerSurface.${surface}.inTok`]: admin.firestore.FieldValue.increment(inTok),
-    [`${prefix}PerSurface.${surface}.outTok`]: admin.firestore.FieldValue.increment(outTok),
+    [`${prefix}InTok`]: FieldValue.increment(inTok),
+    [`${prefix}OutTok`]: FieldValue.increment(outTok),
+    [`${prefix}PerSurface.${surface}.inTok`]: FieldValue.increment(inTok),
+    [`${prefix}PerSurface.${surface}.outTok`]: FieldValue.increment(outTok),
   }, { merge: true });
 }
 
@@ -404,9 +423,11 @@ exports.geminiProxy = onRequest(
       return;
     }
     let uid;
+    let isOwner = false;
     try {
       const decoded = await admin.auth().verifyIdToken(match[1]);
       uid = decoded.uid;
+      isOwner = isOwnerToken(decoded);
 
       // Block anonymous users from AI access — require a real account.
       if (decoded.firebase.sign_in_provider === "anonymous") {
@@ -444,12 +465,19 @@ exports.geminiProxy = onRequest(
     // Degrade, never 429: a miss here returns 402 without calling Gemini, and
     // every client call site already falls back to its local engine on any
     // non-2xx response.
-    let entitlement;
+    let ledger = "trial";
     try {
-      const budgetCheck = await checkAIBudget(admin.firestore(), uid, surface);
-      entitlement = budgetCheck.entitlement;
+      const budgetCheck = await checkAIBudget(admin.firestore(), uid, surface, isOwner);
+      ledger = budgetCheck.ledger;
       if (!budgetCheck.allowed) {
-        res.status(402).json({ error: "AI budget exceeded", entitlement });
+        // `reason` lets the client tell "your preview is over — here's Pro"
+        // (preview_ended / expired) apart from "a paying user hit today's cap"
+        // (daily_budget / surface_cap), where a paywall would be an insult.
+        res.status(402).json({
+          error: "AI budget exceeded",
+          entitlement: budgetCheck.entitlement,
+          reason: budgetCheck.reason,
+        });
         return;
       }
     } catch (e) {
@@ -459,7 +487,6 @@ exports.geminiProxy = onRequest(
       // so this is a deliberate trade: rare infra failures don't take the whole
       // AI layer down with them.
       console.error("AI budget check failed, proceeding without enforcement", { uid, surface, error: String(e) });
-      entitlement = "unknown";
     }
 
     // 3. Forward to Gemini. Node 20 has global fetch.
@@ -498,6 +525,17 @@ exports.geminiProxy = onRequest(
     };
     if (body.systemInstruction) {
       upstreamBody.systemInstruction = body.systemInstruction;
+    }
+
+    // Emulator-only canned responses for the iOS UI tests — see lib/geminiStub.js.
+    // Placed after auth and the Spilr Pro gate so those still run for real.
+    if (isStubEnabled()) {
+      const stub = stubGeminiResponse(surface, generationConfig);
+      recordAIUsage(admin.firestore(), uid, surface, ledger,
+        stub.usageMetadata.promptTokenCount, stub.usageMetadata.candidatesTokenCount)
+        .catch(() => {});
+      res.status(200).json(stub);
+      return;
     }
 
     // Fetch timeout via AbortController. The function's own timeout is 60s
@@ -558,7 +596,7 @@ exports.geminiProxy = onRequest(
           });
           // Charge the budget against what was actually spent. Best-effort: a
           // failure here must not affect the response already streaming back.
-          recordAIUsage(admin.firestore(), uid, surface, entitlement, inTok, outTok)
+          recordAIUsage(admin.firestore(), uid, surface, ledger, inTok, outTok)
             .catch((e) => console.error("recordAIUsage failed", { uid, surface, error: String(e) }));
         }
       } catch (e) {
@@ -653,6 +691,11 @@ const SAFETY_RULES = `NON-NEGOTIABLE SAFETY RULES. These override every other in
 // retired), so this is a constant rather than a per-user lookup.
 const WEEKLY_LETTER_HOUR = 18;
 
+// Fixed local hour for the daily reading push — 8am. Same rationale as
+// WEEKLY_LETTER_HOUR: no per-user preferredHour field exists, so this is a
+// constant rather than a per-user lookup.
+const DAILY_READING_HOUR = 8;
+
 // `localWeekdayAndHour` now comes from ./lib/time, where it is a thin wrapper
 // over the fuller `localDateParts` the derived jobs need (dateKey + band +
 // weekday). One implementation, one set of timezone bugs.
@@ -694,6 +737,24 @@ exports.dispatchUserWork = onTaskDispatched(
         ? await enqueueForUsers("buildUserWeeklyLetter", due, (uid) => ({ uid, runDate }), runDate)
         : 0;
       console.log("dispatch weeklyLetter page", { size: docs.length, due: due.length, enqueued, nextCursor });
+      return;
+    }
+
+    if (job === "dailyReading") {
+      // Hourly dispatch (see generateDailyReadingPush below), filtered here
+      // to each user's own local morning hour — a fixed UTC cron would fire
+      // at the same instant for everyone regardless of timezone.
+      const now = new Date(runDate);
+      const { docs, nextCursor } = await fetchUserPage(db, ["timezone"], cursor);
+      if (nextCursor) await enqueueNextPage(job, nextCursor, runDate);
+      const due = docs.filter((d) => {
+        const { hour } = localWeekdayAndHour(now, (d.data() || {}).timezone);
+        return hour === DAILY_READING_HOUR;
+      }).map((d) => d.id);
+      const enqueued = due.length
+        ? await enqueueForUsers("sendDailyReadingPush", due, (uid) => ({ uid, runDate }), runDate)
+        : 0;
+      console.log("dispatch dailyReading page", { size: docs.length, due: due.length, enqueued, nextCursor });
       return;
     }
 
@@ -1160,7 +1221,7 @@ async function markCorrectionsConsumed(db, refs, now) {
   for (const ref of refs.slice(0, 400)) {
     // `appliedAt` is the name the Swift decoder reads, so the client can show
     // the user that their correction actually landed.
-    batch.set(ref, { appliedAt: admin.firestore.Timestamp.fromDate(now) },
+    batch.set(ref, { appliedAt: Timestamp.fromDate(now) },
       { merge: true });
   }
   await batch.commit();
@@ -1407,7 +1468,7 @@ async function mineHypothesesForUser(db, uid, now) {
       .slice(0, 3)
       .map((e) => ({
         entryId: String(e.entry_id),
-        entryCreatedAt: admin.firestore.Timestamp.fromDate(
+        entryCreatedAt: Timestamp.fromDate(
           createdAtById[e.entry_id] || now),
         quote: String(e.quote),
       }));
@@ -1592,7 +1653,7 @@ async function mineHypothesesForUser(db, uid, now) {
     const timesSeen = allTime.size;
 
     const firstSeenAt = (pd && pd.firstSeenAt)
-      ? pd.firstSeenAt : admin.firestore.Timestamp.fromDate(now);
+      ? pd.firstSeenAt : Timestamp.fromDate(now);
 
     // Lifecycle is now an actual state machine. user_confirmed outranks
     // everything; a claim the audit weakened is honestly labelled weakened.
@@ -1612,7 +1673,7 @@ async function mineHypothesesForUser(db, uid, now) {
       salienceScore: c.salience,
       // Preserve the user's feedback — corrections outrank inference (PI-010).
       status: (pd && pd.status) ? pd.status : "pending",
-      createdAt: (pd && pd.createdAt) ? pd.createdAt : admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: (pd && pd.createdAt) ? pd.createdAt : FieldValue.serverTimestamp(),
       patternType: c.patternType,
       userFacingTitle: c.title.slice(0, 80),
       coreHypothesis: c.core,
@@ -1635,7 +1696,7 @@ async function mineHypothesesForUser(db, uid, now) {
       // Audit trail — so the client can honestly say "tested against N entries
       // it hadn't seen" instead of implying certainty it never earned.
       disconfirmation: c.ceRan ? {
-        ranAt: admin.firestore.Timestamp.fromDate(now),
+        ranAt: Timestamp.fromDate(now),
         verdict: c.ceVerdict,
         reason: c.ceReason,
         independentSupport: (c.independentSupportIds || []).length,
@@ -1643,7 +1704,7 @@ async function mineHypothesesForUser(db, uid, now) {
         entriesRead: num(c.ceEntriesRead, 0),
         promptVersion: CE_PROMPT_VERSION,
       } : (pd && pd.disconfirmation) || null,
-      lastEvidenceAt: admin.firestore.Timestamp.fromDate(now),
+      lastEvidenceAt: Timestamp.fromDate(now),
       promptVersion: MINE_PROMPT_VERSION,
     };
 
@@ -1777,7 +1838,7 @@ async function updateSelfModel(db, uid, entryCount, now) {
       userStatus: h.userStatus || p.userStatus || "unrated",
       evidenceEntryIds: (h.evidence || []).map((e) => e.entryId).filter(Boolean),
       counterEvidenceEntryIds: h.counterEvidenceEntryIds || [],
-      lastSeenAt: h.lastEvidenceAt || admin.firestore.Timestamp.fromDate(now),
+      lastSeenAt: h.lastEvidenceAt || Timestamp.fromDate(now),
       decayAfterDays: DECAY_DAYS,
       timesSeen: num(h.timesSeen, 1),
       // Accumulate instead of resetting to 0 every night.
@@ -1873,7 +1934,7 @@ async function updateSelfModel(db, uid, entryCount, now) {
   const sm = {
     userId: uid,
     version: prior ? num(prior.version, 0) + 1 : 1,
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
     profileMaturity: maturity,
     coreRules,
     protectiveStrategies,
@@ -2274,7 +2335,7 @@ async function writeMirrorCardFor(uid, hypothesis, recentAnalyses, maturity, now
   const draft = {
     id: hypothesis.id,
     userId: uid,
-    localDate: admin.firestore.Timestamp.fromDate(now),
+    localDate: Timestamp.fromDate(now),
     // Legacy DailyRead-family fields — MirrorCard.init?(from:) still requires
     // readText/replyPrompt/tone, and a pre-Phase-3 client build renders
     // headline/mirrorSentence, not `line`. Kept for one release so that
@@ -2295,7 +2356,7 @@ async function writeMirrorCardFor(uid, hypothesis, recentAnalyses, maturity, now
     modelProvider: "google",
     modelName: MODEL,
     promptVersion: MIRROR_WRITE_PROMPT_VERSION,
-    createdAt: admin.firestore.Timestamp.fromDate(now),
+    createdAt: Timestamp.fromDate(now),
     headline: hypothesis.userFacingTitle,
     mirrorSentence: line,
     whyThisCameUp: "",
@@ -2456,7 +2517,7 @@ async function generateMirrorDeck(db, uid, now) {
   const lookback = new Date(now.getTime() - MIRROR_SHOWN_LOOKBACK_DAYS * 86400000);
   const shownSnap = await db.collection("users").doc(uid)
     .collection("mirrorShown")
-    .where("shownAt", ">=", admin.firestore.Timestamp.fromDate(lookback))
+    .where("shownAt", ">=", Timestamp.fromDate(lookback))
     .get();
   const recentEvidenceUnion = new Set();
   shownSnap.docs.forEach((d) => {
@@ -2610,7 +2671,7 @@ async function buildWeeklyLetterFor(db, uid, now) {
   const weekAgo = new Date(now.getTime() - 7 * 86400000);
   const analysesSnap = await db.collection("users").doc(uid)
     .collection("entryAnalyses")
-    .where("createdAt", ">=", admin.firestore.Timestamp.fromDate(weekAgo))
+    .where("createdAt", ">=", Timestamp.fromDate(weekAgo))
     .orderBy("createdAt", "asc")
     .get();
   const weekAnalyses = analysesSnap.docs.map((d) => d.data());
@@ -2683,7 +2744,7 @@ async function buildWeeklyLetterFor(db, uid, now) {
     quote: gen.quote ? String(gen.quote) : null,
     question: gen.question ? sentenceCased(String(gen.question)) : null,
     observationId: observation ? observation.id : null,
-    generatedAt: admin.firestore.Timestamp.fromDate(now),
+    generatedAt: Timestamp.fromDate(now),
     promptVersion: MIRROR_LETTER_PROMPT_VERSION,
     openedAt: null,
   }, { merge: true });
@@ -2699,10 +2760,17 @@ async function buildWeeklyLetterFor(db, uid, now) {
  *  written. Never puts letter content in the payload — a title/body pair
  *  only, matching the curiosity-gap convention the old daily-read push used. */
 async function sendPushToUser(db, uid, { title, body, data }) {
+  const out = { tokens: 0, sent: 0, failed: [], pruned: 0 };
   try {
     const tokensSnap = await db.collection("users").doc(uid).collection("pushTokens").get();
     const tokens = tokensSnap.docs.map((d) => d.id);
-    if (tokens.length === 0) return;
+    out.tokens = tokens.length;
+    if (tokens.length === 0) {
+      // Logged, not silent: "no tokens" was invisible for weeks and looked
+      // exactly like "pushes are being sent and nobody opens them".
+      console.log("sendPushToUser: no push tokens", { uid });
+      return out;
+    }
 
     const resp = await admin.messaging().sendEachForMulticast({
       tokens,
@@ -2711,18 +2779,28 @@ async function sendPushToUser(db, uid, { title, body, data }) {
     });
     const dead = [];
     resp.responses.forEach((r, i) => {
-      const code = r.error && r.error.code;
-      if (!r.success && /registration-token-not-registered|invalid-argument/i.test(String(code))) {
+      if (r.success) { out.sent += 1; return; }
+      const code = String((r.error && r.error.code) || "unknown");
+      out.failed.push({ tokenSuffix: tokens[i].slice(-8), code });
+      if (/registration-token-not-registered|invalid-argument/i.test(code)) {
         dead.push(tokens[i]);
       }
     });
+    if (out.failed.length) {
+      // `messaging/third-party-auth-error` here means the APNs auth key is
+      // missing or wrong in Firebase → Project settings → Cloud Messaging.
+      console.error("sendPushToUser: some sends failed", { uid, failed: out.failed });
+    }
     if (dead.length) {
       await Promise.all(dead.map((t) =>
         db.collection("users").doc(uid).collection("pushTokens").doc(t).delete()));
+      out.pruned = dead.length;
     }
   } catch (e) {
     console.error("sendPushToUser failed", { uid, error: String(e) });
+    out.error = String(e);
   }
+  return out;
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -2830,7 +2908,7 @@ async function dedupHypothesesForUser(db, uid, now) {
           h.embedding = {
             v, model: EMBED_MODEL, dim: EMBED_DIM,
             textHash: h._embedHash,
-            computedAt: admin.firestore.Timestamp.fromDate(now),
+            computedAt: Timestamp.fromDate(now),
           };
           batch.set(col.doc(h.id), { embedding: h.embedding }, { merge: true });
         });
@@ -2847,7 +2925,7 @@ async function dedupHypothesesForUser(db, uid, now) {
 
   if (merges.length === 0) {
     await userRef.set({
-      lastDedupAt: admin.firestore.Timestamp.fromDate(now),
+      lastDedupAt: Timestamp.fromDate(now),
     }, { merge: true });
     return { merged: 0, clusters: 0 };
   }
@@ -2874,9 +2952,9 @@ async function dedupHypothesesForUser(db, uid, now) {
   let loserCount = 0;
   for (const m of merges) {
     const patch = { ...m.patch };
-    if (patch.firstSeenAt) patch.firstSeenAt = admin.firestore.Timestamp.fromMillis(patch.firstSeenAt);
+    if (patch.firstSeenAt) patch.firstSeenAt = Timestamp.fromMillis(patch.firstSeenAt);
     else delete patch.firstSeenAt;
-    if (patch.lastEvidenceAt) patch.lastEvidenceAt = admin.firestore.Timestamp.fromMillis(patch.lastEvidenceAt);
+    if (patch.lastEvidenceAt) patch.lastEvidenceAt = Timestamp.fromMillis(patch.lastEvidenceAt);
     else delete patch.lastEvidenceAt;
     // Re-derive the label fields from the merged count, so a cluster that
     // crosses the recurrence threshold says so immediately.
@@ -2894,7 +2972,7 @@ async function dedupHypothesesForUser(db, uid, now) {
         stability: "retired",
         lifecycle: "retired",
         salienceScore: 0,
-        mergedAt: admin.firestore.Timestamp.fromDate(now),
+        mergedAt: Timestamp.fromDate(now),
       }, { merge: true });
       // The loser's card is now unreachable and would otherwise sit in the
       // deck competing for a slot it can never legitimately win.
@@ -2903,7 +2981,7 @@ async function dedupHypothesesForUser(db, uid, now) {
     }
   }
   batch.set(userRef, {
-    lastDedupAt: admin.firestore.Timestamp.fromDate(now),
+    lastDedupAt: Timestamp.fromDate(now),
   }, { merge: true });
   await batch.commit();
 
@@ -3024,7 +3102,7 @@ async function computeFactsForUser(db, uid, now) {
   const userRef = db.collection("users").doc(uid);
   const userSnap = await userRef.get();
   const tz = (userSnap.exists && userSnap.data().timezone) || "UTC";
-  const since = admin.firestore.Timestamp.fromDate(
+  const since = Timestamp.fromDate(
     new Date(now.getTime() - DERIVED_LOOKBACK_DAYS * 86400000));
 
   const [entriesSnap, analysesSnap, entriesTotal, priorFactsSnap] = await Promise.all([
@@ -3081,7 +3159,7 @@ async function computeFactsForUser(db, uid, now) {
   const prior = priorFactsSnap.exists ? priorFactsSnap.data() : null;
   facts.firstSeen = mergeFirstSeen(firstSeenFromDoc(prior), facts.firstSeen);
   facts.userId = uid;
-  facts.computedAt = admin.firestore.Timestamp.fromDate(now);
+  facts.computedAt = Timestamp.fromDate(now);
 
   // `firstSeen` is a map keyed by TERM in memory, which is the right shape for
   // every reader. It cannot be persisted that way: terms include the person's
@@ -3131,7 +3209,7 @@ async function computeObservationsForUser(db, uid, now, facts, analyses, tz) {
   // field, and a missing field must read as MAXIMUM novelty, never zero —
   // treating "unknown" as "identical to everything" would silence them.
   const shownSnap = await userRef.collection("mirrorShown")
-    .where("shownAt", ">=", admin.firestore.Timestamp.fromDate(
+    .where("shownAt", ">=", Timestamp.fromDate(
       new Date(now.getTime() - 30 * 86400000)))
     .get();
   const shownHistory = shownSnap.docs.map((d) => {
@@ -3159,9 +3237,9 @@ async function computeObservationsForUser(db, uid, now, facts, analyses, tz) {
     batch.set(userRef.collection("observations").doc(o.id), {
       ...o,
       userId: uid,
-      computedAt: admin.firestore.Timestamp.fromDate(now),
+      computedAt: Timestamp.fromDate(now),
       // Preserve everything the USER owns across a recompute.
-      firstComputedAt: p.firstComputedAt || admin.firestore.Timestamp.fromDate(now),
+      firstComputedAt: p.firstComputedAt || Timestamp.fromDate(now),
       shownAt: p.shownAt || null,
       userStatus: p.userStatus || "unrated",
       notQuiteCount: num(p.notQuiteCount, 0),
@@ -3335,7 +3413,7 @@ async function buildThreadsFor(db, uid, now, facts, observations) {
   const doc = {
     schemaVersion: 1,
     userId: uid,
-    computedAt: admin.firestore.Timestamp.fromDate(now),
+    computedAt: Timestamp.fromDate(now),
     count: threads.length,
     threads,
     emptyReason: threads.length === 0
@@ -3430,7 +3508,7 @@ async function selectTodayFor(db, uid, now, facts, observations, tz, opts = {}) 
       shownAt: null,
       userStatus: "unrated",
       followUp: null,
-      computedAt: admin.firestore.Timestamp.fromDate(now),
+      computedAt: Timestamp.fromDate(now),
     };
     await userRef.collection("readings").doc(todayKey).set(doc, { merge: true });
     console.log("readingSelect", { uid, step: 5, silence: true, reason });
@@ -3498,7 +3576,7 @@ async function selectTodayFor(db, uid, now, facts, observations, tz, opts = {}) 
     shownAt: null,
     userStatus: "unrated",
     followUp: null,
-    computedAt: admin.firestore.Timestamp.fromDate(now),
+    computedAt: Timestamp.fromDate(now),
   };
   await userRef.collection("readings").doc(todayKey).set(doc, { merge: true });
   console.log("readingSelect", {
@@ -3683,14 +3761,30 @@ function buildCandidatesBlockForFormulation({ becauseCands, sayDoCands, splits, 
 
 /** Prompt F's CURRENT MODEL block, and mirrorAsk's — existing items with the
  *  user's own confirmations/corrections, so both prompts see what already
- *  exists and outrank their own inference where it conflicts. */
-function buildCurrentModelBlockForFormulation(items) {
+ *  exists and outrank their own inference where it conflicts.
+ *
+ *  `exclusions` (from loadCorrections) were previously read by the v2 miner
+ *  ONLY — Prompt F never saw a user's free-text correction at all, so
+ *  ProfileCorrections filed against the Person Model (including the ones
+ *  Daily Chat now writes on a "not_me" — see AIService+Chat.extractModelOps)
+ *  had no way back into the next formulation beyond the direct personModel
+ *  `userStatus` write already covering that ONE item. This is what lets a
+ *  correction's own wording — which may be more specific than the item's
+ *  displayTitle — keep the model from re-proposing the same idea differently
+ *  worded. Same block, same wording, as buildMinePrompt's exclusionBlock. */
+function buildCurrentModelBlockForFormulation(items, exclusions) {
   const rendered = (items || []).slice(0, 40).map((it) => ({
     id: it.id, kind: it.kind, text: displayTitleFor(it),
     confidence: confidenceBandFor(it), userStatus: it.userStatus || "unrated",
     timesSeen: it.timesSeen || 0,
   }));
-  return JSON.stringify(rendered, null, 2);
+  const exclusionBlock = (exclusions || []).length ? `
+
+ALREADY REJECTED BY THIS PERSON — they read these and told us we were wrong.
+Do not restate them, do not rephrase them, do not argue with them. If your best
+item is one of these, return fewer items instead.
+${exclusions.map((e) => `- ${e}`).join("\n")}` : "";
+  return JSON.stringify(rendered, null, 2) + exclusionBlock;
 }
 
 /**
@@ -3726,14 +3820,14 @@ async function writeFormulationOutput(db, uid, now, output, existingById) {
       userStatus: prior.userStatus || "unrated",
       status: (prior.userStatus === "not_me" && prior.status === "retired") ? "retired" : "active",
       disconfirmationVerdict: prior.disconfirmationVerdict || null,
-      firstSeenAt: prior.firstSeenAt || admin.firestore.Timestamp.fromDate(now),
-      lastEvidenceAt: admin.firestore.Timestamp.fromDate(now),
+      firstSeenAt: prior.firstSeenAt || Timestamp.fromDate(now),
+      lastEvidenceAt: Timestamp.fromDate(now),
       lastTestedAt: prior.lastTestedAt || null,
       testQuestion: testQuestion || prior.testQuestion || null,
       promptVersion: FORMULATE_PROMPT_VERSION,
       derivedFrom: {
         entryIds: (evidenceEntryIds || []).slice(0, 20),
-        computedAt: admin.firestore.Timestamp.fromDate(now),
+        computedAt: Timestamp.fromDate(now),
       },
     };
     // Stored, not left for a client-side reimplementation of the same three
@@ -3793,7 +3887,7 @@ async function writeFormulationOutput(db, uid, now, output, existingById) {
     userId: uid,
     needs: output.needs || null,
     openHypotheses,
-    computedAt: admin.firestore.Timestamp.fromDate(now),
+    computedAt: Timestamp.fromDate(now),
     promptVersion: FORMULATE_PROMPT_VERSION,
   }, { merge: true });
 
@@ -3808,7 +3902,7 @@ async function writeFormulationOutput(db, uid, now, output, existingById) {
  * model call, over the same corpus Prompt A already extracted — hard, not a
  * hedge, matching PatternSafety.corpusHasCrisisSignal on the client.
  */
-async function formulatePersonModelForUser(db, uid, now, facts, analyses, lifeContext, stylePrefs) {
+async function formulatePersonModelForUser(db, uid, now, facts, analyses, lifeContext, stylePrefs, exclusions) {
   const userRef = db.collection("users").doc(uid);
 
   if ((analyses || []).length < MIN_ANALYSES) {
@@ -3857,7 +3951,7 @@ async function formulatePersonModelForUser(db, uid, now, facts, analyses, lifeCo
     lifeContext: lifeContext || "", styleRules: styleRulesBlock(stylePrefs),
     signalsBlock: buildSignalsBlockForFormulation(analyses, facts.entryDates, FORMULATE_ANALYSIS_LOOKBACK),
     candidatesBlock: buildCandidatesBlockForFormulation({ becauseCands, sayDoCands, splits, exceptions }),
-    currentModelBlock: buildCurrentModelBlockForFormulation(existingItems),
+    currentModelBlock: buildCurrentModelBlockForFormulation(existingItems, exclusions),
   });
 
   let output;
@@ -3869,7 +3963,7 @@ async function formulatePersonModelForUser(db, uid, now, facts, analyses, lifeCo
   }
 
   const result = await writeFormulationOutput(db, uid, now, output || {}, existingById);
-  await userRef.set({ lastFormulateRunAt: admin.firestore.Timestamp.fromDate(now) }, { merge: true });
+  await userRef.set({ lastFormulateRunAt: Timestamp.fromDate(now) }, { merge: true });
   console.log("formulatePersonModel", { uid, ...result });
   return { skipped: false, ...result };
 }
@@ -3987,7 +4081,7 @@ async function selectAndWriteMirrorLineForUser(db, uid, now, tz, facts, observat
   const pool = buildGatePoolForToday(signatures, becauseCands, sayDoCands, exceptionObs);
 
   const shownSnap = await userRef.collection("mirrorShown")
-    .where("shownAt", ">=", admin.firestore.Timestamp.fromDate(
+    .where("shownAt", ">=", Timestamp.fromDate(
       new Date(now.getTime() - 30 * 86400000)))
     .get();
   const shownHistory = shownSnap.docs.map((d) => {
@@ -4037,7 +4131,7 @@ async function selectAndWriteMirrorLineForUser(db, uid, now, tz, facts, observat
   const grounded = !receiptQuote || quotes.some((q) => hasVerbatimOverlap(q.text, receiptQuote, 3));
   const lint = grounded
     ? lintMirrorM(
-      { line, shape: winner.shape, question, would_be_false_if: output.would_be_false_if },
+      { line, shape: winner.shape, question },
       { receiptQuote, vocabTop200: facts.vocabTop200 })
     : { ok: false, rule: 2, reason: "receipt_not_grounded" };
 
@@ -4063,7 +4157,6 @@ async function selectAndWriteMirrorLineForUser(db, uid, now, tz, facts, observat
     line,
     shape: winner.shape,
     question: (question && question.endsWith("?")) ? question : null,
-    wouldBeFalseIf: output.would_be_false_if || null,
     receipt,
     // `type` (not `shape`) so the client's existing `Reading.sourceType`
     // decode (`source["type"]`) picks it up without a new field — a v3.0
@@ -4074,7 +4167,7 @@ async function selectAndWriteMirrorLineForUser(db, uid, now, tz, facts, observat
     lintReason: null,
     silence: false,
     promptVersion: MIRROR_LINE_V31_PROMPT_VERSION,
-    computedAt: admin.firestore.Timestamp.fromDate(now),
+    computedAt: Timestamp.fromDate(now),
   }, { merge: true });
 
   console.log("mirrorLineV31", { uid, picked: true, shape: winner.shape, score: winner.score });
@@ -4133,7 +4226,7 @@ async function writeNextQuestionForUser(db, uid, now) {
 
   const nextAsked = [
     ...(agg.askedHypotheses || []),
-    { hypothesisId, askedAt: admin.firestore.Timestamp.fromDate(now) },
+    { hypothesisId, askedAt: Timestamp.fromDate(now) },
   ].slice(-ASKED_HYPOTHESES_KEEP);
 
   await userRef.collection("derived").doc("personModel").set({
@@ -4141,7 +4234,7 @@ async function writeNextQuestionForUser(db, uid, now) {
       question, hypothesisId,
       scoring: output.scoring || null,
       seedLabel: output.seed_label || null,
-      createdAt: admin.firestore.Timestamp.fromDate(now),
+      createdAt: Timestamp.fromDate(now),
     },
     askedHypotheses: nextAsked,
     questionPromptVersion: QUESTION_PROMPT_VERSION,
@@ -4173,10 +4266,16 @@ async function writeNextQuestionForUser(db, uid, now) {
  */
 async function runPersonModelForUser(db, uid, now) {
   const userRef = db.collection("users").doc(uid);
-  const [factsSnap, lifeCtxSnap, styleSnap] = await Promise.all([
+  const [factsSnap, lifeCtxSnap, styleSnap, corrections] = await Promise.all([
     userRef.collection("derived").doc("facts").get(),
     userRef.collection("lifeContext").doc("current").get(),
     userRef.collection("stylePreferences").doc("current").get(),
+    // Read-only here — `markCorrectionsConsumed` stays the v2 miner's job
+    // alone (mineUserInsights), so this pass never races it over `appliedAt`.
+    // `exclusions` themselves aren't gated on `appliedAt` (loadCorrections
+    // includes them regardless — a correction is a permanent exclusion, not
+    // a one-shot), so reading the same collection twice a night is safe.
+    loadCorrections(db, uid),
   ]);
   if (!factsSnap.exists) return { skipped: true, reason: "no_facts" };
 
@@ -4205,7 +4304,7 @@ async function runPersonModelForUser(db, uid, now) {
   const observations = observationsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
   const formulated = await formulatePersonModelForUser(
-    db, uid, now, facts, analyses, lifeContextStr, stylePrefsObj);
+    db, uid, now, facts, analyses, lifeContextStr, stylePrefsObj, corrections.exclusions);
 
   // M and Q run whether or not F did. F is "nightly, when >= 3 new analyses";
   // M is "daily, one" — gating the line on the formulation having run is what
@@ -4267,9 +4366,11 @@ exports.mirrorAsk = onRequest(
       return;
     }
     let uid;
+    let isOwner = false;
     try {
       const decoded = await admin.auth().verifyIdToken(match[1]);
       uid = decoded.uid;
+      isOwner = isOwnerToken(decoded);
       if (decoded.firebase.sign_in_provider === "anonymous") {
         res.status(403).json({ error: "Account required for AI features" });
         return;
@@ -4295,6 +4396,13 @@ exports.mirrorAsk = onRequest(
         answer: "That's a heavier question than I can answer from the entries alone.",
         citations: [],
       });
+      return;
+    }
+
+    // Spilr Pro gate — before the daily-cap claim, so a blocked call doesn't
+    // also burn one of today's Asks.
+    if (!isOwner && !(await serverAIAllowed(db, uid))) {
+      res.status(402).json({ error: "AI requires Spilr Pro", reason: "preview_ended" });
       return;
     }
 
@@ -4378,7 +4486,7 @@ async function buildFirstSevenFor(db, uid, now, facts, threads, observations) {
   const doc = {
     schemaVersion: 1,
     userId: uid,
-    generatedAt: admin.firestore.Timestamp.fromDate(now),
+    generatedAt: Timestamp.fromDate(now),
     entriesAtUnlock: facts.entriesTotal,
     cards: cards.slice(0, 3),
     thread: thread ? { title: thread.title, n: thread.n, sinceDate: thread.sinceDate } : null,
@@ -4442,6 +4550,12 @@ exports.computeUserDerived = onTaskDispatched(
     // Tail-chain into the (model-using) mining worker. Separate tasks so a
     // mine failure can never take the facts down with it, and so the facts are
     // already written when the mine's own cadence gate skips the user.
+    // Free users past their preview get the facts (arithmetic, no model cost)
+    // but no mine — interpretation is what Spilr Pro sells.
+    if (!(await serverAIAllowed(db, uid))) {
+      console.log("computeUserDerived: mine skipped, no AI access", { uid });
+      return;
+    }
     try {
       await enqueueForUsers("mineUserInsights", [uid],
         (u) => ({ uid: u, runDate: req.data.runDate }), req.data.runDate || "");
@@ -4470,6 +4584,25 @@ exports.generateWeeklyLetters = onSchedule(
   }
 );
 
+exports.generateDailyReadingPush = onSchedule(
+  {
+    // Hourly, not a fixed UTC cron — dispatchUserWork's dailyReading branch
+    // filters to each user's own local morning hour via localWeekdayAndHour,
+    // so the dispatcher needs to run every hour to catch every timezone's
+    // window exactly once.
+    schedule: "0 * * * *",
+    timeZone: "Etc/UTC",
+    region: REGION,
+    timeoutSeconds: 120,
+    memory: "256MiB",
+    maxInstances: 1,
+  },
+  async () => {
+    await enqueueNextPage("dailyReading", null, new Date().toISOString());
+    console.log("generateDailyReadingPush kicked off");
+  }
+);
+
 /** Sends `facts.unlock.next.hint` as a push, at most once every
  *  UNLOCK_NUDGE_DAYS. Never throws — a push failure must not fail the job. */
 async function maybeSendUnlockNudge(db, uid, now) {
@@ -4495,7 +4628,7 @@ async function maybeSendUnlockNudge(db, uid, now) {
       title: "Spilr", body: hint, data: { type: "unlock_hint" },
     });
     await userRef.set({
-      lastUnlockNudgeAt: admin.firestore.Timestamp.fromDate(now),
+      lastUnlockNudgeAt: Timestamp.fromDate(now),
     }, { merge: true });
     console.log("unlockNudge", { uid, hint });
   } catch (e) {
@@ -4518,6 +4651,10 @@ exports.buildUserWeeklyLetter = onTaskDispatched(
     if (!uid) return;
     const now = req.data.runDate ? new Date(req.data.runDate) : new Date();
     const db = admin.firestore();
+    if (!(await serverAIAllowed(db, uid))) {
+      console.log("buildUserWeeklyLetter skipped, no AI access", { uid });
+      return;
+    }
     try {
       const r = await buildWeeklyLetterFor(db, uid, now);
       if (r.written) {
@@ -4537,6 +4674,65 @@ exports.buildUserWeeklyLetter = onTaskDispatched(
     } catch (e) {
       console.error("buildUserWeeklyLetter error", { uid, error: String(e) });
       throw e;
+    }
+  }
+);
+
+/** The per-user worker for the daily reading push. One user, one invocation.
+ *  Fires at the user's local morning hour — well after the nightly worker
+ *  (04:00 UTC) has usually already written today's `readings/{date}` doc via
+ *  computeUserDerived/runDerivedForUser. Only recomputes it on demand as a
+ *  fallback for timezones where local morning falls before that run reaches
+ *  today's date. Never puts the read's line in the push payload — the
+ *  curiosity gap is the whole point (see sendPushToUser). */
+exports.sendDailyReadingPush = onTaskDispatched(
+  {
+    region: REGION,
+    // NO GEMINI_KEY — this only ever falls back to the deterministic
+    // (allowModel:false) selection, same as computeUserDerived. Any model
+    // line is a bonus the nightly mine may have already added to the doc;
+    // this worker never asks for one itself.
+    timeoutSeconds: 120,
+    // Matches computeUserDerived's budget (index.js's `runDerivedForUser`
+    // caller), not the 256MiB other lightweight dispatch-only workers use —
+    // the fallback path here runs that exact same full derived pipeline
+    // (facts -> observations -> decay -> threads -> select -> firstSeven) for
+    // a user whose local morning falls before the nightly run reaches today's
+    // date. Under-provisioning it risked an OOM that maxAttempts:3 would then
+    // retry three times over.
+    memory: "512MiB",
+    retryConfig: { maxAttempts: 3, minBackoffSeconds: 30, maxDoublings: 2 },
+    rateLimits: { maxConcurrentDispatches: 20, maxDispatchesPerSecond: 10 },
+  },
+  async (req) => {
+    const uid = req.data && req.data.uid;
+    if (!uid) return;
+    const now = req.data.runDate ? new Date(req.data.runDate) : new Date();
+    const db = admin.firestore();
+    try {
+      const userSnap = await db.collection("users").doc(uid).get();
+      const tz = (userSnap.exists && userSnap.data().timezone) || "UTC";
+      const todayKey = localDateParts(now, tz).dateKey;
+      const existing = await db.collection("users").doc(uid)
+        .collection("readings").doc(todayKey).get();
+      const reading = existing.exists ? existing.data()
+        : (await runDerivedForUser(db, uid, now)).reading;
+
+      if (!reading || reading.silence || !reading.line) {
+        console.log("dailyReadingPush skipped", {
+          uid, reason: reading ? reading.reason : "no_reading",
+        });
+        return;
+      }
+      await sendPushToUser(db, uid, {
+        title: "Spilr",
+        body: "Today's read is ready.",
+        data: { type: "daily_reading", localDate: reading.date },
+      });
+      console.log("dailyReadingPush sent", { uid, date: reading.date });
+    } catch (e) {
+      console.error("sendDailyReadingPush error", { uid, error: String(e) });
+      throw e; // let Cloud Tasks retry with backoff
     }
   }
 );
@@ -4591,6 +4787,12 @@ exports.mineUserInsights = onTaskDispatched(
     if (!uid) return;
     const now = req.data.runDate ? new Date(req.data.runDate) : new Date();
     const db = admin.firestore();
+    // Spilr Pro gate (defence in depth — computeUserDerived already skips the
+    // enqueue for users without AI access).
+    if (!(await serverAIAllowed(db, uid))) {
+      console.log("mineUserInsights skipped, no AI access", { uid });
+      return;
+    }
     try {
       // Cadence gate — mine only when there's enough new material OR enough time
       // has passed. A daily journaler was re-mining their whole corpus on one new
@@ -4666,7 +4868,7 @@ exports.mineUserInsights = onTaskDispatched(
       // MINE_MAX_STALENESS_HOURS would never fire for a quiet journaler.
       if (!belowMineCadence && !(r.skipped && r.reason === "immature")) {
         await db.collection("users").doc(uid).update({
-          lastMineRunAt: admin.firestore.Timestamp.fromDate(now),
+          lastMineRunAt: Timestamp.fromDate(now),
         });
       }
 
@@ -4783,7 +4985,7 @@ async function claimMirrorBootstrap(db, uid) {
       return false;
     }
     tx.set(ref, {
-      mirrorBootstrapClaimedAt: admin.firestore.FieldValue.serverTimestamp(),
+      mirrorBootstrapClaimedAt: FieldValue.serverTimestamp(),
     }, { merge: true });
     return true;
   });
@@ -4816,9 +5018,11 @@ exports.bootstrapMirror = onRequest(
       return;
     }
     let uid;
+    let isOwner = false;
     try {
       const decoded = await admin.auth().verifyIdToken(match[1]);
       uid = decoded.uid;
+      isOwner = isOwnerToken(decoded);
       if (decoded.firebase.sign_in_provider === "anonymous") {
         res.status(403).json({ error: "Account required for AI features" });
         return;
@@ -4829,6 +5033,13 @@ exports.bootstrapMirror = onRequest(
     }
 
     const db = admin.firestore();
+    // Spilr Pro gate. Checked BEFORE the one-time claim: a blocked bootstrap
+    // must not spend the user's only bootstrap, so it can still run once
+    // they start the trial.
+    if (!isOwner && !(await serverAIAllowed(db, uid))) {
+      res.status(402).json({ error: "AI requires Spilr Pro", reason: "preview_ended" });
+      return;
+    }
     const claimed = await claimMirrorBootstrap(db, uid);
     if (!claimed) {
       res.status(200).json({ ran: false, reason: "already_mined_or_in_progress" });
@@ -4843,7 +5054,7 @@ exports.bootstrapMirror = onRequest(
       // one-shot bootstrap on an attempt that never reached the corpus.
       if (!(r.skipped && r.reason === "immature")) {
         await db.collection("users").doc(uid).update({
-          lastMineRunAt: admin.firestore.Timestamp.fromDate(now),
+          lastMineRunAt: Timestamp.fromDate(now),
         });
       }
 
@@ -4941,7 +5152,7 @@ async function claimDerivedRefresh(db, uid) {
       return false;
     }
     tx.set(ref, {
-      derivedRefreshedAt: admin.firestore.FieldValue.serverTimestamp(),
+      derivedRefreshedAt: FieldValue.serverTimestamp(),
     }, { merge: true });
     return true;
   });
@@ -5002,6 +5213,122 @@ exports.refreshDerived = onRequest(
 );
 
 /* ──────────────────────────────────────────────────────────────────────────
+ *  deleteAccount — erase everything this app holds about a user.
+ *
+ *  This runs server-side rather than on the phone for four reasons, all of
+ *  which bit the old client-side implementation:
+ *
+ *   1. No recent-login requirement. A client `user.delete()` throws
+ *      `requiresRecentLogin` once the sign-in is more than a few minutes old,
+ *      which is almost always — so deletion silently never worked. The Admin
+ *      SDK's `deleteUser` has no such rule; the caller's ID token (auto-
+ *      refreshed, valid for an hour) is proof enough of who they are.
+ *   2. It finishes. The client erase ran as a chain of awaited batches; the
+ *      user backgrounding the app partway through left a half-erased account
+ *      with no way to resume.
+ *   3. `recursiveDelete` walks the real tree. The client had to iterate a
+ *      hand-maintained list of subcollection names, which had already drifted
+ *      from what the services write (see AuthService.eraseFirestoreData's
+ *      comment) and left four collections behind.
+ *   4. Security rules don't apply to Admin, so the erase doesn't have to be
+ *      sequenced around still being signed in.
+ *
+ *  Apple token revocation stays on the client: Firebase's
+ *  `revokeToken(withAuthorizationCode:)` already holds the Apple OAuth config,
+ *  whereas doing it here would mean provisioning an Apple private key and
+ *  minting client-secret JWTs for no behavioural gain.
+ *
+ *  The Auth user is deleted LAST, on purpose. If the data erase fails the
+ *  account is still there and the user can retry; the reverse order would
+ *  strand orphaned documents nobody can ever reach or remove.
+ *
+ *  Anonymous callers are allowed — a guest's data is still their data, and
+ *  the Delete account button is offered to them. This is the one authenticated
+ *  endpoint here that does NOT reject `sign_in_provider === "anonymous"`.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+// Top-level documents keyed by uid that live outside `users/{uid}` and would
+// otherwise survive the recursive delete.
+const USER_ROOT_DOCS = ["aiUsage", "entitlements"];
+
+exports.deleteAccount = onRequest(
+  {
+    region: REGION,
+    // NO GEMINI_KEY — this function must never be able to spend model budget.
+    // A large account is a lot of documents; recursiveDelete parallelises but
+    // still needs real headroom.
+    timeoutSeconds: 540,
+    memory: "512MiB",
+    maxInstances: 10,
+    invoker: "public",
+  },
+  async (req, res) => {
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method not allowed" });
+      return;
+    }
+
+    const authHeader = req.headers.authorization || "";
+    const match = authHeader.match(/^Bearer (.+)$/);
+    if (!match) {
+      res.status(401).json({ error: "Missing Authorization bearer token" });
+      return;
+    }
+    let uid;
+    try {
+      const decoded = await admin.auth().verifyIdToken(match[1]);
+      uid = decoded.uid;
+    } catch (e) {
+      res.status(401).json({ error: "Invalid or expired token" });
+      return;
+    }
+
+    const db = admin.firestore();
+    try {
+      // 1. Everything under users/{uid} — the root doc and every subcollection
+      //    beneath it, however deep, without naming any of them.
+      await db.recursiveDelete(db.collection("users").doc(uid));
+
+      // 2. The uid-keyed docs that sit outside that tree.
+      await Promise.all(
+        USER_ROOT_DOCS.map((name) => db.collection(name).doc(uid).delete())
+      );
+
+      // 3. Entry photos in Storage. `deleteFiles` pages internally, so one
+      //    call covers an arbitrarily large folder.
+      //
+      //    Best-effort on purpose. Firestore is already erased by this point,
+      //    so throwing here would leave the user with no data, a live account,
+      //    and a retry that fails at the same step every time. Orphaned photos
+      //    in a bucket nobody holds a reference to are the lesser problem —
+      //    they're logged so they can be swept.
+      try {
+        await admin.storage().bucket().deleteFiles({
+          prefix: `users/${uid}/`,
+          force: true,
+        });
+      } catch (e) {
+        console.error("deleteAccount storage sweep failed", { uid, error: String(e) });
+      }
+
+      // 4. The Auth user itself. Already-gone is success, not an error — a
+      //    retried request after a dropped response must not report failure.
+      try {
+        await admin.auth().deleteUser(uid);
+      } catch (e) {
+        if (e.code !== "auth/user-not-found") throw e;
+      }
+
+      console.log("deleteAccount", { uid });
+      res.status(200).json({ deleted: true });
+    } catch (e) {
+      console.error("deleteAccount error", { uid, error: String(e), stack: e.stack });
+      res.status(500).json({ error: "Deletion failed" });
+    }
+  }
+);
+
+/* ──────────────────────────────────────────────────────────────────────────
  *  revenueCatWebhook — the entitlement source of truth (ai-cost-audit-2026-09-06.md
  *  Phase 5).
  *
@@ -5030,20 +5357,9 @@ exports.refreshDerived = onRequest(
 
 const REVENUECAT_WEBHOOK_SECRET = defineSecret("REVENUECAT_WEBHOOK_SECRET");
 
-// Event types that grant paid access. UNCANCELLATION covers a user turning
-// auto-renew back on before their period lapses; PRODUCT_CHANGE covers a plan
-// switch. Deliberately excludes CANCELLATION — that fires when auto-renew is
-// turned OFF, not when access ends, so the user should keep paid access until
-// their period actually lapses (EXPIRATION).
-const REVENUECAT_PAID_EVENTS = new Set([
-  "INITIAL_PURCHASE", "RENEWAL", "UNCANCELLATION", "PRODUCT_CHANGE", "TRANSFER",
-]);
-// Only EXPIRATION actually ends access. BILLING_ISSUE is a grace-period signal,
-// not a revocation — RevenueCat keeps the subscription active during the
-// retry window, so this file leaves entitlement untouched on that event
-// rather than guessing at a grace-period policy that belongs in product, not
-// in a cost-control webhook.
-const REVENUECAT_EXPIRED_EVENTS = new Set(["EXPIRATION"]);
+// Which events grant / refresh / end access is decided in
+// lib/entitlement.js (`entitlementUpdateFromEvent`, unit-tested) — including
+// NON_RENEWING_PURCHASE for the lifetime product, which was missing before.
 
 exports.revenueCatWebhook = onRequest(
   {
@@ -5069,16 +5385,27 @@ exports.revenueCatWebhook = onRequest(
     }
 
     const event = req.body && req.body.event;
-    const uid = event && event.app_user_id;
     const eventType = event && event.type;
+    if (eventType === "TEST") {
+      // The dashboard's "Send test event" button — acknowledge, write nothing.
+      res.status(200).json({ ok: true, test: true });
+      return;
+    }
+    // A purchase made before Purchases.logIn(uid) arrives under an anonymous
+    // RevenueCat id; the Firebase uid is then in aliases / transferred_to.
+    const uid = resolveAppUserId(event);
     if (!uid || !eventType) {
-      res.status(400).json({ error: "Missing event.app_user_id or event.type" });
+      console.warn("revenueCatWebhook: no Firebase uid on event", {
+        eventType, appUserId: event && event.app_user_id,
+      });
+      // 200, not 400: RevenueCat retries non-2xx, and retrying can't conjure a uid.
+      res.status(200).json({ ok: false, error: "No non-anonymous app_user_id" });
       return;
     }
 
     try {
       const db = admin.firestore();
-      const now = admin.firestore.Timestamp.now();
+      const now = Timestamp.now();
 
       // The full record, for support/debugging — never read by geminiProxy.
       await db.collection("entitlements").doc(uid).set({
@@ -5091,22 +5418,31 @@ exports.revenueCatWebhook = onRequest(
         store: event.store || null,
       }, { merge: true });
 
-      // The hot-path mirror. Only write when this event actually changes the
-      // tri-state — an unrecognised event type (there are more RevenueCat
-      // event types than the two sets above) leaves entitlement untouched
-      // rather than guessing.
-      let newEntitlement = null;
-      if (REVENUECAT_PAID_EVENTS.has(eventType)) newEntitlement = "paid";
-      else if (REVENUECAT_EXPIRED_EVENTS.has(eventType)) newEntitlement = "expired";
-
-      if (newEntitlement) {
-        await db.collection("aiUsage").doc(uid).set({
-          entitlement: newEntitlement,
-          entitlementUpdatedAt: now,
-        }, { merge: true });
+      // The hot-path mirror geminiProxy reads. An unrecognised event type
+      // leaves it untouched rather than guessing.
+      const update = entitlementUpdateFromEvent(event);
+      let applied = false;
+      if (update) {
+        // RevenueCat does not guarantee delivery order. Without this, a late
+        // EXPIRATION from last month could land after this month's RENEWAL
+        // and switch a paying user off.
+        const eventMs = typeof event.event_timestamp_ms === "number"
+          ? event.event_timestamp_ms : Date.now();
+        const ref = db.collection("aiUsage").doc(uid);
+        applied = await db.runTransaction(async (tx) => {
+          const snap = await tx.get(ref);
+          const lastMs = snap.exists ? (snap.data().entitlementEventMs || 0) : 0;
+          if (eventMs < lastMs) return false;
+          const patch = { entitlementEventMs: eventMs, entitlementUpdatedAt: now };
+          if (update.entitlement) patch.entitlement = update.entitlement;
+          if ("expiresAtMs" in update) patch.expiresAtMs = update.expiresAtMs;
+          if (update.periodType) patch.periodType = update.periodType;
+          tx.set(ref, patch, { merge: true });
+          return true;
+        });
       }
 
-      console.log("revenueCatWebhook", { uid, eventType, newEntitlement });
+      console.log("revenueCatWebhook", { uid, eventType, update, applied });
       res.status(200).json({ ok: true });
     } catch (e) {
       console.error("revenueCatWebhook error", { uid, eventType, error: String(e) });
@@ -5114,6 +5450,55 @@ exports.revenueCatWebhook = onRequest(
       // not be silently dropped.
       res.status(500).json({ error: "Internal error" });
     }
+  }
+);
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  sendTestPush — OWNERS ONLY. Sends a push to the caller's own devices and
+ *  returns what FCM said for each token, so "is push working?" is one tap in
+ *  Profile → Developer instead of waiting for 8am and reading logs.
+ *
+ *  POST, Bearer <Firebase ID token>. 403 for anyone not in OWNER_EMAILS /
+ *  OWNER_UIDS (lib/entitlement.js), so it can't be used to spam.
+ *  Response: { tokens, sent, failed: [{ tokenSuffix, code }], pruned }
+ * ────────────────────────────────────────────────────────────────────────── */
+exports.sendTestPush = onRequest(
+  {
+    region: REGION,
+    cors: true,
+    timeoutSeconds: 30,
+    memory: "256MiB",
+    maxInstances: 2,
+    invoker: "public",
+  },
+  async (req, res) => {
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "POST only" });
+      return;
+    }
+    const match = String(req.headers.authorization || "").match(/^Bearer (.+)$/);
+    if (!match) {
+      res.status(401).json({ error: "Missing Authorization bearer token" });
+      return;
+    }
+    let decoded;
+    try {
+      decoded = await admin.auth().verifyIdToken(match[1]);
+    } catch (e) {
+      res.status(401).json({ error: "Invalid or expired token" });
+      return;
+    }
+    if (!isOwnerToken(decoded)) {
+      res.status(403).json({ error: "Owners only" });
+      return;
+    }
+    const result = await sendPushToUser(admin.firestore(), decoded.uid, {
+      title: "Spilr",
+      body: "Test push — if you can read this, push works.",
+      data: { type: "test" },
+    });
+    console.log("sendTestPush", { uid: decoded.uid, ...result });
+    res.status(200).json(result);
   }
 );
 
@@ -5325,6 +5710,162 @@ exports.runNightlyForUser = onRequest(
     } catch (e) {
       console.error("runNightlyForUser error", { uid, error: String(e), stack: e.stack });
       res.status(500).json({ error: String(e), ran: out.ran });
+    }
+  }
+);
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  sendAuthEmail — branded verify / reset-password emails.
+ *
+ *  Firebase locks email-template editing on new projects, so its built-in
+ *  emails go out with a raw URL, a "noreply" sender and stock copy, and land
+ *  in spam. This generates the same action links with the Admin SDK and sends
+ *  lib/authEmail.js's template over SMTP instead.
+ *
+ *  SMTP, not a provider SDK, so the transport is one secret: a Gmail app
+ *  password today (smtps://you%40gmail.com:APP_PASSWORD@smtp.gmail.com:465),
+ *  Resend / Postmark / SES once there's a domain — no code change.
+ *
+ *    firebase functions:secrets:set SMTP_URL
+ *
+ *  Optional `EMAIL_FROM` in functions/.env (e.g. `Spilr <hello@spilr.app>`);
+ *  without it mail goes out as "Spilr" from the SMTP account's own address,
+ *  which is what Gmail requires anyway.
+ *
+ *  Dormant until configured: an SMTP_URL that isn't an smtp(s):// URL (set it
+ *  to `unset` so deploys don't prompt) returns 503 `not_configured`, and the
+ *  app falls back to Firebase's own send (AuthService.sendAuthEmail).
+ *
+ *  POST { kind: "verifyEmail" }                  Bearer ID token required;
+ *                                                sends to the token's address.
+ *  POST { kind: "resetPassword", email }         No auth (the user is signed
+ *                                                out). Always 200 for unknown
+ *                                                addresses — no enumeration.
+ *
+ *  Throttled per address+kind: 60s apart, 10 a day (429 `throttled`).
+ * ────────────────────────────────────────────────────────────────────────── */
+
+const SMTP_URL = defineSecret("SMTP_URL");
+const AUTH_EMAIL_MIN_GAP_MS = 60 * 1000;
+const AUTH_EMAIL_DAILY_MAX = 10;
+// Same continue URL the app sets (AuthService.verificationLinkSettings).
+const AUTH_EMAIL_CONTINUE = { url: "https://spilr-100f7.web.app/", handleCodeInApp: false };
+
+let smtpTransport = null;
+let smtpTransportUrl = null;
+function authMailer(url) {
+  if (smtpTransport && smtpTransportUrl === url) return smtpTransport;
+  smtpTransport = require("nodemailer").createTransport(url);
+  smtpTransportUrl = url;
+  return smtpTransport;
+}
+
+/** Returns true if this send is allowed (and records it), false if throttled. */
+async function takeAuthEmailSlot(kind, email) {
+  const key = require("crypto").createHash("sha256").update(`${kind}:${email}`).digest("hex");
+  const ref = admin.firestore().collection("authEmailThrottle").doc(key);
+  const now = Date.now();
+  const day = new Date(now).toISOString().slice(0, 10);
+  return admin.firestore().runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const d = snap.exists ? snap.data() : {};
+    const count = d.day === day ? (d.count || 0) : 0;
+    if (d.lastSentAt && now - d.lastSentAt < AUTH_EMAIL_MIN_GAP_MS) return false;
+    if (count >= AUTH_EMAIL_DAILY_MAX) return false;
+    tx.set(ref, { lastSentAt: now, day, count: count + 1 });
+    return true;
+  });
+}
+
+exports.sendAuthEmail = onRequest(
+  {
+    region: REGION,
+    secrets: [SMTP_URL],
+    timeoutSeconds: 30,
+    memory: "256MiB",
+    maxInstances: 10,
+    invoker: "public",
+  },
+  async (req, res) => {
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method not allowed" });
+      return;
+    }
+    const smtpUrl = (SMTP_URL.value() || "").trim();
+    if (!/^smtps?:\/\//.test(smtpUrl)) {
+      res.status(503).json({ error: "not_configured" });
+      return;
+    }
+
+    const kind = req.body && req.body.kind;
+    let email;
+    let displayName;
+    let link;
+    try {
+      if (kind === "verifyEmail") {
+        const match = (req.headers.authorization || "").match(/^Bearer (.+)$/);
+        if (!match) {
+          res.status(401).json({ error: "Missing Authorization bearer token" });
+          return;
+        }
+        let uid;
+        try {
+          uid = (await admin.auth().verifyIdToken(match[1])).uid;
+        } catch (e) {
+          res.status(401).json({ error: "Invalid or expired token" });
+          return;
+        }
+        // getUser, not the token's claims: the display name is set just after
+        // createUser, so the token the app holds at sign-up predates it.
+        const user = await admin.auth().getUser(uid);
+        if (!user.email) {
+          res.status(400).json({ error: "No email on this account" });
+          return;
+        }
+        email = user.email;
+        displayName = user.displayName;
+        if (!(await takeAuthEmailSlot(kind, email))) {
+          res.status(429).json({ error: "throttled" });
+          return;
+        }
+        link = rewriteVerifyLink(await admin.auth().generateEmailVerificationLink(email, AUTH_EMAIL_CONTINUE));
+      } else if (kind === "resetPassword") {
+        email = String((req.body && req.body.email) || "").trim().toLowerCase();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+          res.status(400).json({ error: "Invalid email" });
+          return;
+        }
+        if (!(await takeAuthEmailSlot(kind, email))) {
+          res.status(429).json({ error: "throttled" });
+          return;
+        }
+        let user;
+        try {
+          user = await admin.auth().getUserByEmail(email);
+        } catch (e) {
+          if (e.code === "auth/user-not-found") {
+            res.status(200).json({ sent: true });
+            return;
+          }
+          throw e;
+        }
+        displayName = user.displayName;
+        link = await admin.auth().generatePasswordResetLink(email, AUTH_EMAIL_CONTINUE);
+      } else {
+        res.status(400).json({ error: "Unknown kind" });
+        return;
+      }
+
+      const { subject, html, text } = buildAuthEmail(kind, { link, displayName });
+      const mailer = authMailer(smtpUrl);
+      const from = process.env.EMAIL_FROM || { name: "Spilr", address: mailer.options.auth && mailer.options.auth.user };
+      await mailer.sendMail({ from, to: email, subject, html, text });
+      console.log("sendAuthEmail sent", { kind });
+      res.status(200).json({ sent: true });
+    } catch (e) {
+      // Addresses stay out of logs; the error is enough to debug SMTP auth.
+      console.error("sendAuthEmail error", { kind, error: String(e) });
+      res.status(500).json({ error: "send_failed" });
     }
   }
 );

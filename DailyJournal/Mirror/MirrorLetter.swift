@@ -53,6 +53,21 @@ final class MirrorLetterService: ObservableObject {
         latest = MirrorLetter(from: doc.data(), id: doc.documentID)
     }
 
+    /// Server-first refresh, for the push deep link only. The push means a
+    /// letter was written moments ago — `loadLatest`'s cache-first read would
+    /// still hand back last week's until its own detached refresh lands. Silently
+    /// leaves `latest` alone when offline; the banner keeps whatever it already has.
+    func refreshFromServer(for userId: String) async {
+        guard let snapshot = try? await Firestore.firestore()
+            .collection("users").document(userId)
+            .collection("mirrorLetters")
+            .order(by: "generatedAt", descending: true)
+            .limit(to: 1)
+            .getDocuments(source: .server),
+            let doc = snapshot.documents.first else { return }
+        latest = MirrorLetter(from: doc.data(), id: doc.documentID)
+    }
+
     func markOpened(userId: String) {
         guard let letter = latest, letter.openedAt == nil else { return }
         latest?.openedAt = Date()

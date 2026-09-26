@@ -230,12 +230,19 @@ AnalyticsManager.shared.trackAIConsentGranted()
 
 ### **Chat Features**
 
+Thought Journal (`.cbt`) is the default chat mode from Home; Casual Vent (`.normal`)
+is opt-in via the in-chat pill (and is pinned for onboarding's first-ever session).
+`daily_chat_started`/`_completed` fire on every chat open/save regardless of mode,
+carrying a `mode` parameter (`"normal"` or `"cbt"`); `cbt_mode_started`/`_completed`
+additionally fire only for Thought Journal, kept as their own event for continuity
+with data from before the default flip.
+
 | Event | When | Parameters | Why |
 |-------|------|-----------|-----|
-| `daily_chat_started` | User opens Daily Chat | - | Feature adoption |
-| `daily_chat_completed` | Chat woven into entry | - | Completion rate |
-| `cbt_mode_started` | User opens CBT reframing | - | Feature adoption |
-| `cbt_mode_completed` | CBT reframe finished | - | Completion rate |
+| `daily_chat_started` | User opens Daily Chat, any mode | `mode` | Feature adoption |
+| `daily_chat_completed` | Chat woven into entry, any mode | `mode` | Completion rate |
+| `cbt_mode_started` | User opens/switches to Thought Journal | - | Feature adoption (legacy series) |
+| `cbt_mode_completed` | Thought Journal snapshot saved | - | Completion rate (legacy series) |
 
 **Questions:**
 - % of entries created via chat?

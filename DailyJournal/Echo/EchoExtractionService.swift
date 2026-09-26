@@ -62,11 +62,12 @@ final class EchoExtractionService {
         // 3. Confidence gate — belt-and-suspenders on top of the prompt instruction
         guard result.confidence >= 0.8 else { return }
 
-        // 4. Persist — always attach a Spilr-voice line (model's, or a local fallback
-        //    so an echo never resurfaces as a bare quote).
-        let line = result.line ?? SpilrVoice.localEchoLine(
-            type: result.type, quote: result.quote, daysAgo: 0
-        )
+        // 4. Spilr's framing line is the whole point of an Echo (see `Echo.line`) —
+        //    without it the card is just the user's own words replayed back at them.
+        //    The local template that used to fill this in shipped the same four
+        //    canned sentences to everyone, so a missing line now drops the Echo
+        //    instead. See CLAUDE.md, "No local text in Spilr's voice".
+        guard let line = result.line, !line.isEmpty else { return }
         let echo = Echo(
             userId:               userId,
             sourceEntryId:        entryId,

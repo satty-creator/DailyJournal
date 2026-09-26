@@ -13,10 +13,11 @@ import SwiftUI
 struct EchoAnsweredView: View {
 
     let echo: Echo
-    // No onClose callback needed — the parent sheet's onDismiss handles
-    // the Firestore write and pendingEcho clearance via vm.answerEcho().
+    // Bound rather than local @State: the parent sheet's onDismiss performs the
+    // Firestore write, and it cannot see state owned by this view — which is
+    // why what the user typed here used to be discarded on close.
+    @Binding var response: String
 
-    @State private var response: String = ""
     @FocusState private var isResponseFocused: Bool
     @Environment(\.dismiss) private var dismiss
 
@@ -218,7 +219,8 @@ struct EchoAnsweredView: View {
     private var closeButton: some View {
         Button {
             dismiss()
-            // vm.answerEcho() is invoked by the parent sheet's onDismiss — no call needed here.
+            // The parent sheet's onDismiss writes the answer, including whatever
+            // is bound to `response` — so swipe-to-dismiss saves it too.
         } label: {
             Text("Close echo")
                 .font(.system(size: 14, weight: .medium))

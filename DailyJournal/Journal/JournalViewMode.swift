@@ -7,7 +7,7 @@
 //  a theme switch — `RootView` re-identifies the whole tab tree with
 //  `.id(themeManager.themeID)` on every theme change, which would otherwise
 //  reset any @State-held mode back to its default. Same persistence idiom as
-//  `ChatMode.lastUsed` (Chat/ChatMode.swift).
+//  `ThoughtJournalEducation.hasSeen` (Chat/DailyChatView.swift).
 //
 
 import Foundation

@@ -88,7 +88,16 @@ final class AuthViewModel: ObservableObject {
                         // Gate email/password accounts behind verification.
                         // Google/Apple return isEmailVerified == true so they pass through,
                         // as does the App Review demo account — see reviewDemoEmail.
-                        self?.authState = Self.passesVerificationGate(user) ? .authenticated : .unverified
+                        //
+                        // `isEmailVerified` on the cached user stays false until a
+                        // reload, so someone who verified in a browser and then
+                        // relaunched was stuck on "Check your inbox". Reload first
+                        // (bounded, so an offline launch doesn't hang on Splash).
+                        var passes = Self.passesVerificationGate(user)
+                        if !passes, let self {
+                            passes = await self.reloadEmailVerified(timeout: 3) ?? user.isEmailVerified
+                        }
+                        self?.authState = passes ? .authenticated : .unverified
                         // Restores RevenueCat's identification on relaunch — see
                         // AuthService.reidentifyRevenueCat's doc comment.
                         await self?.authService.reidentifyRevenueCat(uid: user.uid)
@@ -122,12 +131,47 @@ final class AuthViewModel: ObservableObject {
             // email has been sent by AuthService). That send counts against the
             // throttle, so the cooldown starts here rather than on first tap.
             startResendCooldown()
+        } catch AuthError.emailAlreadyInUse {
+            await resumeUnverifiedSignUp(email: email, password: password)
         } catch {
             errorMessage = error.localizedDescription
             AnalyticsManager.shared.trackError(error, context: "signup_failed")
         }
 
         isLoading = false
+    }
+
+    /// Firebase creates the account the moment `createUser` succeeds —
+    /// verification is a separate, later step. So someone whose first sign-up
+    /// never got them a working email (it went to spam, the link expired, they
+    /// tapped "Use a different account") comes back to Sign Up and hits
+    /// "email already in use" for an account they believe doesn't exist.
+    ///
+    /// If the password matches, that's their own half-finished sign-up: sign
+    /// them in and send a fresh link, which lands them back on
+    /// `VerificationView`. A verified account just signs in. A wrong password
+    /// means it's someone else's (or a forgotten) account — point them to Log in.
+    private func resumeUnverifiedSignUp(email: String, password: String) async {
+        do {
+            let user = try await authService.signIn(email: email, password: password)
+            currentUser = user
+            AnalyticsManager.shared.setUserId(user.id)
+            print("AuthViewModel: sign-up hit existing account, password matched — resuming uid=\(user.id)")
+        } catch {
+            // signIn can succeed at Firebase Auth and still throw on the
+            // Firestore profile fetch (a first sign-up that died before
+            // saving it). The session is what matters here.
+            guard Auth.auth().currentUser?.email?.lowercased() == email.lowercased() else {
+                print("AuthViewModel: sign-up hit existing account, sign-in failed — \(error.localizedDescription)")
+                errorMessage = "An account with this email already exists. Log in instead, or reset your password."
+                AnalyticsManager.shared.trackError(error, context: "signup_existing_account")
+                return
+            }
+        }
+
+        if Auth.auth().currentUser?.isEmailVerified == false {
+            await resendVerificationEmail()
+        }
     }
 
     // MARK: - Email verification
@@ -188,6 +232,76 @@ final class AuthViewModel: ObservableObject {
         }
     }
 
+    /// Reloads the user from the server, giving up after `timeout` seconds.
+    /// Returns nil on timeout or failure so the caller can fall back to the
+    /// cached value.
+    ///
+    /// Not a task group: a group awaits every child before returning, so a
+    /// reload that ignores cancellation would defeat the timeout. Both tasks
+    /// inherit the main actor, so `resumed` needs no further locking.
+    private func reloadEmailVerified(timeout: Double) async -> Bool? {
+        final class Once { var resumed = false }
+        let once = Once()
+        return await withCheckedContinuation { (continuation: CheckedContinuation<Bool?, Never>) in
+            Task {
+                let verified = try? await authService.reloadEmailVerified()
+                guard !once.resumed else { return }
+                once.resumed = true
+                continuation.resume(returning: verified)
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                guard !once.resumed else { return }
+                once.resumed = true
+                continuation.resume(returning: nil)
+            }
+        }
+    }
+
+    /// Handles a verification link opened from the inbox. Returns false when
+    /// the URL isn't a verification link, so the caller can pass it elsewhere.
+    @discardableResult
+    func handleVerificationLink(_ url: URL) -> Bool {
+        // The action link itself (custom action URL on returnHost) carries the
+        // code — apply it. Must come before the host check below, which would
+        // otherwise swallow it as a plain "continue" link.
+        guard let code = AuthService.verificationCode(in: url) else {
+            // Firebase's "Continue" button after verifying on the web.
+            if url.host == AuthService.returnHost {
+                Task { await recheckVerificationSilently() }
+                return true
+            }
+            return false
+        }
+        Task {
+            verificationMessage = nil
+            do {
+                if try await authService.applyVerificationLink(code: code) {
+                    authState = .authenticated
+                }
+            } catch {
+                // A stale code (an older email, after a resend) fails here but the
+                // address may already be verified — check before showing an error.
+                if (try? await authService.reloadEmailVerified()) == true {
+                    authState = .authenticated
+                } else {
+                    verificationMessage = "That link has expired — tap Resend for a fresh one."
+                }
+            }
+        }
+        return true
+    }
+
+    /// Silent re-check when the app returns to the foreground on the
+    /// verification screen — covers a link opened in a browser instead of the
+    /// app. Unlike `refreshVerificationStatus` it never shows "not verified yet".
+    func recheckVerificationSilently() async {
+        guard authState == .unverified else { return }
+        if (try? await authService.reloadEmailVerified()) == true {
+            authState = .authenticated
+        }
+    }
+
     /// Resends the verification email. No-ops while the cooldown is running.
     func resendVerificationEmail() async {
         guard resendCooldown == 0 else { return }
@@ -245,18 +359,6 @@ final class AuthViewModel: ObservableObject {
             AnalyticsManager.shared.trackError(error, context: "signin_failed")
         }
 
-        isLoading = false
-    }
-
-    // MARK: - Guest / Anonymous Sign In
-    func continueAsGuest() async {
-        isLoading = true
-        errorMessage = nil
-        do {
-            currentUser = try await authService.signInAnonymously()
-        } catch {
-            errorMessage = error.localizedDescription
-        }
         isLoading = false
     }
 

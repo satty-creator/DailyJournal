@@ -257,6 +257,7 @@ struct FutureSelfSheet: View {
         let settings = await center.notificationSettings()
         if settings.authorizationStatus == .notDetermined {
             guard (try? await center.requestAuthorization(options: [.alert, .badge, .sound])) == true else {
+                AnalyticsManager.shared.trackError(FutureSelfSheetError.notificationPermissionDenied, context: "future_self_permission_denied")
                 return
             }
         }
@@ -278,6 +279,14 @@ struct FutureSelfSheet: View {
         let trigger = UNCalendarNotificationTrigger(dateMatching: components, repeats: false)
         let request = UNNotificationRequest(identifier: "letter-\(entryId)", content: content, trigger: trigger)
 
-        try? await center.add(request)
+        do {
+            try await center.add(request)
+        } catch {
+            AnalyticsManager.shared.trackError(error, context: "future_self_schedule_failed")
+        }
     }
+}
+
+private enum FutureSelfSheetError: Error {
+    case notificationPermissionDenied
 }

@@ -40,6 +40,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         PushNotificationManager.shared.configure()
+        // Refresh the APNs token every launch when permission already exists.
+        PushNotificationManager.shared.registerIfAuthorized()
         return true
     }
 
@@ -55,8 +57,11 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFailToRegisterForRemoteNotificationsWithError error: Error
     ) {
-        // Registration failure is non-fatal: the user simply won't get pushes.
-        // The in-app sealed card still works. Fail silently.
+        // Registration failure is non-fatal: the user simply won't get pushes,
+        // and the in-app sealed card still works. But it must not disappear
+        // without a trace — this is exactly the failure mode that made a past
+        // push outage invisible until a user reported it.
+        AnalyticsManager.shared.trackError(error, context: "apns_registration_failed")
     }
 }
 
@@ -79,6 +84,13 @@ struct DailyJournalApp: App {
         // Purchases.shared.logIn(uid) right after sign-in. That later logIn call
         // is what makes revenueCatWebhook's app_user_id match the Firebase uid
         // geminiProxy budgets against — see the note in AuthService.swift.
+        #if DEBUG
+        // Surfaces the underlying StoreKit/offerings error behind a bare
+        // "Error 23: configuration" alert — otherwise invisible, since
+        // EntitlementService/AuthService both swallow RevenueCat errors with
+        // `try?`. Must be set before configure().
+        Purchases.logLevel = .debug
+        #endif
         Purchases.configure(withAPIKey: "appl_cEAPPXndXigFKNIjpttRQWIDEkE")
 
         // Explicitly enable the modern persistent on-disk cache. Setting only the
@@ -91,6 +103,10 @@ struct DailyJournalApp: App {
         )
         Firestore.firestore().settings = settings
 
+        // UI tests only (DEBUG builds): emulator suite, reset state, etc.
+        // Must run before anything reads Firestore — see TestLaunchConfig.
+        TestLaunchConfig.applyBeforeFirstUse()
+
         // Initialize analytics session tracking
         sessionManager.recordSignupDate()
     }
@@ -102,6 +118,8 @@ struct DailyJournalApp: App {
                 .environmentObject(themeManager)
                 .environmentObject(sessionManager)
                 .onOpenURL { url in
+                    // Email verification link (universal link from the inbox).
+                    if authViewModel.handleVerificationLink(url) { return }
                     // Completes the Google Sign-In redirect — required for the
                     // GIDSignIn flow started in AuthService to ever return.
                     GIDSignIn.sharedInstance.handle(url)

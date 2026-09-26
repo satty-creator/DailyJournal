@@ -20,8 +20,27 @@
 		AA0005012FC4646E00D4E7CB /* FirebaseAnalytics in Frameworks */ = {isa = PBXBuildFile; productRef = AA0005002FC4646E00D4E7CB /* FirebaseAnalytics */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		D1A7E570000000000000000D /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 564DED1D2FC4646E00D4E7CB /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 564DED242FC4646E00D4E7CB;
+			remoteInfo = DailyJournal;
+		};
+		D1A7E570000000000000000E /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 564DED1D2FC4646E00D4E7CB /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 564DED242FC4646E00D4E7CB;
+			remoteInfo = DailyJournal;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		564DED252FC4646E00D4E7CB /* DailyJournal.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DailyJournal.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		D1A7E5700000000000000001 /* DailyJournalTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DailyJournalTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		D1A7E5700000000000000002 /* DailyJournalUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DailyJournalUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -41,6 +60,16 @@
 				564DEF062FC4A56C00D4E7CB /* Exceptions for "DailyJournal" folder in "DailyJournal" target */,
 			);
 			path = DailyJournal;
+			sourceTree = "<group>";
+		};
+		D1A7E5700000000000000003 /* DailyJournalTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = DailyJournalTests;
+			sourceTree = "<group>";
+		};
+		D1A7E5700000000000000004 /* DailyJournalUITests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = DailyJournalUITests;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -64,6 +93,20 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		D1A7E5700000000000000006 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D1A7E5700000000000000009 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -71,6 +114,8 @@
 			isa = PBXGroup;
 			children = (
 				564DED272FC4646E00D4E7CB /* DailyJournal */,
+				D1A7E5700000000000000003 /* DailyJournalTests */,
+				D1A7E5700000000000000004 /* DailyJournalUITests */,
 				564DED262FC4646E00D4E7CB /* Products */,
 			);
 			sourceTree = "<group>";
@@ -79,6 +124,8 @@
 			isa = PBXGroup;
 			children = (
 				564DED252FC4646E00D4E7CB /* DailyJournal.app */,
+				D1A7E5700000000000000001 /* DailyJournalTests.xctest */,
+				D1A7E5700000000000000002 /* DailyJournalUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -120,6 +167,52 @@
 			productReference = 564DED252FC4646E00D4E7CB /* DailyJournal.app */;
 			productType = "com.apple.product-type.application";
 		};
+		D1A7E570000000000000000B /* DailyJournalTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D1A7E5700000000000000011 /* Build configuration list for PBXNativeTarget "DailyJournalTests" */;
+			buildPhases = (
+				D1A7E5700000000000000005 /* Sources */,
+				D1A7E5700000000000000006 /* Frameworks */,
+				D1A7E5700000000000000007 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				D1A7E570000000000000000F /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				D1A7E5700000000000000003 /* DailyJournalTests */,
+			);
+			name = DailyJournalTests;
+			packageProductDependencies = (
+			);
+			productName = DailyJournalTests;
+			productReference = D1A7E5700000000000000001 /* DailyJournalTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		D1A7E570000000000000000C /* DailyJournalUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D1A7E5700000000000000012 /* Build configuration list for PBXNativeTarget "DailyJournalUITests" */;
+			buildPhases = (
+				D1A7E5700000000000000008 /* Sources */,
+				D1A7E5700000000000000009 /* Frameworks */,
+				D1A7E570000000000000000A /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				D1A7E5700000000000000010 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				D1A7E5700000000000000004 /* DailyJournalUITests */,
+			);
+			name = DailyJournalUITests;
+			packageProductDependencies = (
+			);
+			productName = DailyJournalUITests;
+			productReference = D1A7E5700000000000000002 /* DailyJournalUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -132,6 +225,14 @@
 				TargetAttributes = {
 					564DED242FC4646E00D4E7CB = {
 						CreatedOnToolsVersion = 26.5;
+					};
+					D1A7E570000000000000000B = {
+						CreatedOnToolsVersion = 26.5;
+						TestTargetID = 564DED242FC4646E00D4E7CB;
+					};
+					D1A7E570000000000000000C = {
+						CreatedOnToolsVersion = 26.5;
+						TestTargetID = 564DED242FC4646E00D4E7CB;
 					};
 				};
 			};
@@ -155,12 +256,28 @@
 			projectRoot = "";
 			targets = (
 				564DED242FC4646E00D4E7CB /* DailyJournal */,
+				D1A7E570000000000000000B /* DailyJournalTests */,
+				D1A7E570000000000000000C /* DailyJournalUITests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		564DED232FC4646E00D4E7CB /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D1A7E5700000000000000007 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D1A7E570000000000000000A /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -198,7 +315,34 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		D1A7E5700000000000000005 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D1A7E5700000000000000008 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		D1A7E570000000000000000F /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 564DED242FC4646E00D4E7CB /* DailyJournal */;
+			targetProxy = D1A7E570000000000000000D /* PBXContainerItemProxy */;
+		};
+		D1A7E5700000000000000010 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 564DED242FC4646E00D4E7CB /* DailyJournal */;
+			targetProxy = D1A7E570000000000000000E /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		564DED2E2FC4647000D4E7CB /* Debug */ = {
@@ -323,7 +467,7 @@
 				CODE_SIGN_ENTITLEMENTS = DailyJournal/DailyJournal.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 8JL4YNAW67;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -341,7 +485,7 @@
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
-				MARKETING_VERSION = 1.7;
+				MARKETING_VERSION = 1.8;
 				PRODUCT_BUNDLE_IDENTIFIER = com.satakshi.DailyJournal;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -362,7 +506,7 @@
 				CODE_SIGN_ENTITLEMENTS = DailyJournal/DailyJournal.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 8JL4YNAW67;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -380,7 +524,7 @@
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
-				MARKETING_VERSION = 1.7;
+				MARKETING_VERSION = 1.8;
 				PRODUCT_BUNDLE_IDENTIFIER = com.satakshi.DailyJournal;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -390,6 +534,84 @@
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		D1A7E5700000000000000013 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 8JL4YNAW67;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.satakshi.DailyJournalTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/DailyJournal.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/DailyJournal";
+			};
+			name = Debug;
+		};
+		D1A7E5700000000000000014 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 8JL4YNAW67;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.satakshi.DailyJournalTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/DailyJournal.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/DailyJournal";
+			};
+			name = Release;
+		};
+		D1A7E5700000000000000015 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 8JL4YNAW67;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.satakshi.DailyJournalUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = DailyJournal;
+			};
+			name = Debug;
+		};
+		D1A7E5700000000000000016 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 8JL4YNAW67;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.satakshi.DailyJournalUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = DailyJournal;
 			};
 			name = Release;
 		};
@@ -410,6 +632,24 @@
 			buildConfigurations = (
 				564DED312FC4647000D4E7CB /* Debug */,
 				564DED322FC4647000D4E7CB /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		D1A7E5700000000000000011 /* Build configuration list for PBXNativeTarget "DailyJournalTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D1A7E5700000000000000013 /* Debug */,
+				D1A7E5700000000000000014 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		D1A7E5700000000000000012 /* Build configuration list for PBXNativeTarget "DailyJournalUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D1A7E5700000000000000015 /* Debug */,
+				D1A7E5700000000000000016 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

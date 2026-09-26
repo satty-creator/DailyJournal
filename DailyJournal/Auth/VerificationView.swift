@@ -11,10 +11,21 @@ import SwiftUI
 
 struct VerificationView: View {
     @EnvironmentObject var authViewModel: AuthViewModel
+    @Environment(\.scenePhase) private var scenePhase
     @State private var isChecking = false
     @State private var isResending = false
 
     private var email: String { authViewModel.currentUser?.email ?? "your email" }
+
+    /// Resend is throttled by Firebase per IP and per address, so the button
+    /// states its own wait rather than letting the user discover the limit.
+    private var canResend: Bool { !isResending && authViewModel.resendCooldown == 0 }
+
+    private var resendTitle: String {
+        if isResending { return "Sending…" }
+        let remaining = authViewModel.resendCooldown
+        return remaining > 0 ? "Resend email in \(remaining)s" : "Resend email"
+    }
 
     var body: some View {
         ZStack {
@@ -46,6 +57,12 @@ struct VerificationView: View {
                         .foregroundStyle(AppTheme.inkSoft)
                         .multilineTextAlignment(.center)
                         .padding(.top, 4)
+
+                    // Firebase's shared sender often lands in Gmail's Spam,
+                    // which also disables the link until it's moved out.
+                    Text("Not there? Check your Spam folder.")
+                        .font(AppTheme.mono(size: 11))
+                        .foregroundStyle(AppTheme.inkSoft)
                 }
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 32)
@@ -79,11 +96,12 @@ struct VerificationView: View {
                             isResending = false
                         }
                     } label: {
-                        Text(isResending ? "Sending…" : "Resend email")
+                        Text(resendTitle)
                             .font(.system(size: 14, weight: .medium))
-                            .foregroundStyle(AppTheme.terracotta)
+                            .foregroundStyle(canResend ? AppTheme.terracotta : AppTheme.inkSoft)
                     }
-                    .disabled(isResending)
+                    .disabled(!canResend)
+                    .animation(.easeInOut(duration: 0.2), value: canResend)
                 }
                 .padding(.horizontal, 24)
                 .padding(.top, 8)
@@ -100,6 +118,16 @@ struct VerificationView: View {
                 .padding(.bottom, 32)
             }
             .animation(.easeInOut(duration: 0.25), value: authViewModel.verificationMessage)
+        }
+        // Cold launch starts already `.active`, so the onChange below never
+        // fires then — check once on appear too.
+        .task { await authViewModel.recheckVerificationSilently() }
+        // Back from the inbox/browser — pick up a verification that happened
+        // outside the app without making the user tap "continue".
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                Task { await authViewModel.recheckVerificationSilently() }
+            }
         }
     }
 }

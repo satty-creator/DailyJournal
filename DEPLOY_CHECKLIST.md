@@ -41,6 +41,13 @@ firebase functions:secrets:set GEMINI_KEY --project spilr-100f7
 ```
 - [ ] Verify: `firebase functions:secrets:access GEMINI_KEY --project spilr-100f7` prints the key.
 
+- [ ] Also set `REVENUECAT_WEBHOOK_SECRET` (a self-chosen long random string, not issued by
+  RevenueCat — see `REVENUECAT_SETUP.md` §4). Without it, `revenueCatWebhook` 401s every event,
+  and paying users stay on the trial AI budget with no visible error.
+  ```bash
+  firebase functions:secrets:set REVENUECAT_WEBHOOK_SECRET --project spilr-100f7
+  ```
+
 ---
 
 ## 3 · Deploy rules + indexes
@@ -59,12 +66,24 @@ firebase deploy --only firestore:rules,firestore:indexes,storage --project spilr
 cd functions && npm install && cd ..
 firebase deploy --only functions --project spilr-100f7
 ```
-Expect **three** functions to deploy:
+Expect **fifteen** functions to deploy (the "three" this checklist used to name are long gone — `generateDailyReads` was retired and replaced by the hourly-dispatch pair below):
 - [ ] `geminiProxy` (on-request proxy the app calls)
-- [ ] `generateDailyReads` (hourly; sends the read at each user's local morning hour)
+- [ ] `dispatchUserWork` (the resumable per-page dispatcher every hourly/nightly job fans out through)
+- [ ] `mirrorAsk`
+- [ ] `computeUserDerived`
+- [ ] `generateWeeklyLetters` (hourly dispatch; `dispatchUserWork`'s `weeklyLetter` branch fires `buildUserWeeklyLetter` at each user's local Sunday 18:00)
+- [ ] `buildUserWeeklyLetter`
+- [ ] `generateDailyReadingPush` (hourly dispatch; fires `sendDailyReadingPush` at each user's local 8am)
+- [ ] `sendDailyReadingPush`
 - [ ] `generateNightlyInsights` (04:00 UTC; mines hypotheses + Self-Model)
+- [ ] `mineUserInsights`
+- [ ] `bootstrapMirror`
+- [ ] `refreshDerived`
+- [ ] `revenueCatWebhook`
+- [ ] `deleteAccount` (Settings → Delete account calls this; the app cannot delete an account without it)
+- [ ] `runNightlyForUser` (dev-only manual trigger, gated behind `DEV_ADMIN_UIDS`)
 
-If prompted about scheduler/pub-sub or Cloud Run permissions, accept. First deploy can take a few minutes.
+If prompted about scheduler/pub-sub or Cloud Run permissions, accept. `generateWeeklyLetters` and `generateDailyReadingPush` each provision a new Cloud Scheduler job, and `buildUserWeeklyLetter`/`sendDailyReadingPush` each provision a new Cloud Tasks queue on first deploy — expect that prompt too. First deploy can take a few minutes.
 
 ---
 
@@ -75,16 +94,18 @@ If prompted about scheduler/pub-sub or Cloud Run permissions, accept. First depl
   ```bash
   firebase functions:log --only geminiProxy --project spilr-100f7
   ```
-- [ ] **Daily read:** wait for the top of the next hour, or trigger a run for testing (Console → Functions → `generateDailyReads` → run, or via Cloud Scheduler "Force run"). Confirm a doc at `users/{uid}/dailyReads/{yyyy-MM-dd}` and check logs for `generateDailyReads done`.
+- [ ] **Daily reading push:** wait for the top of the next hour, or force-run `generateDailyReadingPush` from the Cloud Scheduler console. Confirm a doc at `users/{uid}/readings/{yyyy-MM-dd}` and check logs for `dispatch dailyReading page` → `dailyReadingPush sent` (or `dailyReadingPush skipped` with a reason, if today's reading is silent or missing).
+- [ ] **Weekly letter:** force-run `generateWeeklyLetters`, or wait for a user's local Sunday 18:00. Confirm a doc at `users/{uid}/mirrorLetters/{yyyy-MM-dd}` and logs for `dispatch weeklyLetter page` → `buildUserWeeklyLetter`. In the app, the Mirror tab should show the unread-letter banner above the Today card.
 - [ ] **Nightly insights:** after it runs (04:00 UTC, or force-run), confirm `users/{uid}/patternHypotheses/*` and `users/{uid}/selfModel/current` populate for a user with ≥3 `entryAnalyses`. Log line: `generateNightlyInsights done`.
+- [ ] **Account deletion:** on a throwaway account, Settings → Delete account. The app should return to the sign-in screen, `users/{uid}` should be gone from the Firestore console along with `aiUsage/{uid}` and `entitlements/{uid}`, and the uid should no longer appear in Authentication. Log line: `deleteAccount`. Signing back in with the same email creates a brand-new uid.
 
 ---
 
 ## 6 · First-run notes
 
-- A user needs a few entries before the read/insights have anything to ground on (read needs ≥1 substantial entry; nightly mining needs ≥3 `entryAnalyses`).
-- `timezone` is written to the user doc on sign-in — existing users must open the app once so `generateDailyReads` sends at their correct local hour (until then it defaults to America/New_York).
-- To backfill immediately for testing, force-run both scheduled functions from the Cloud Scheduler console.
+- A user needs a few entries before the read/insights have anything to ground on (read needs ≥1 substantial entry; nightly mining needs ≥3 `entryAnalyses`; the weekly letter needs ≥3 entries in the current week or it silently skips — that's `below_threshold`, not a bug).
+- `timezone` is written to the user doc on sign-in — existing users must open the app once so `generateDailyReadingPush` and `generateWeeklyLetters` fire at their correct local hour (until then both default to **UTC**, not a US timezone).
+- To backfill immediately for testing, force-run the scheduled functions from the Cloud Scheduler console, or (for the weekly letter specifically) POST to the dev-only `runNightlyForUser` HTTP function with a Firebase ID token and body `{"stages":["facts","observations","letter"]}` — gated behind `DEV_ADMIN_UIDS`, see `functions/index.js`'s `runNightlyForUser`. The response's `out.letter` says whether it wrote or why not (e.g. `below_threshold`, `lint_rejected`).
 
 ---
 
@@ -95,6 +116,9 @@ If prompted about scheduler/pub-sub or Cloud Run permissions, accept. First depl
 | "Missing or insufficient permissions" | Rules not deployed / wrong project | Step 3; confirm `firebase use spilr-100f7`. |
 | App writes still fail | `(default)` DB not created | Step 1. |
 | AI falls back to local everywhere | `GEMINI_KEY` secret missing in project | Step 2, then redeploy functions. |
-| Read lands at wrong local hour | user has no `timezone` field yet | user opens app once (writes `timezone`). |
+| Daily read / weekly letter lands at wrong local hour (or UTC) | user has no `timezone` field yet | user opens app once (writes `timezone`). |
 | `generateNightlyInsights` skips everyone | no user has ≥3 `entryAnalyses` yet | write more entries; `analyzeEntry` runs on save. |
+| No weekly-letter banner in the Mirror tab | fewer than 3 entries this week (`below_threshold`), or the letter is already read/stale | check `buildUserWeeklyLetter` logs for the `reason`; `users/{uid}/mirrorLetters/{yyyy-MM-dd}.openedAt` non-null means already read. |
+| Weekly-letter / daily-reading push never arrives on device | `aps-environment` is `development` on the build, or no APNs `.p8` key uploaded | confirm the build's provisioning matches the entitlement; Firebase Console → Project Settings → Cloud Messaging → upload the APNs Auth Key. |
 | Journal entry photos never appear | `storage` rules not deployed to this project | Step 3 (`firebase deploy --only storage --project spilr-100f7`); confirm the live ruleset in Console → Storage → Rules matches `storage.rules`. |
+| Paying user still budgeted as trial (or "Get Spilr Pro" throws RevenueCat error 23) | `REVENUECAT_WEBHOOK_SECRET` unset (webhook 401s every event), or RevenueCat's `app_user_id` diverged from the Firebase uid | Step 2 above; check `revenueCatWebhook` logs for 401s; see `REVENUECAT_SETUP.md` for the App Store Connect / dashboard checklist error 23 usually points at. |

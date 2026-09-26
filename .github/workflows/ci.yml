@@ -1,0 +1,97 @@
+# CI — runs on every push and pull request. A red check blocks the merge
+# (turn on branch protection for `main` → "Require status checks").
+#
+#   server   Cloud Functions unit tests (incl. the Spilr Pro access policy),
+#            Firestore security-rules tests on the emulator, schema guard.
+#   ios      Swift unit tests (DailyJournalTests) on a simulator.
+#   e2e      Full UI flows (DailyJournalUITests) against the emulator suite.
+#            Slower, so it runs on main, nightly, and on PRs labelled `e2e`.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  schedule:
+    - cron: "0 20 * * *"   # nightly, 03:00 Bangkok
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: functions/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Functions unit tests
+        working-directory: functions
+        run: |
+          npm ci
+          npm test
+
+      - name: Firestore rules tests (emulator)
+        working-directory: tests/rules
+        run: |
+          npm install --no-audit --no-fund
+          npm test
+
+      - name: Firestore schema guard
+        run: ./scripts/check-firestore-schema.sh
+
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests
+        run: |
+          xcodebuild test \
+            -project DailyJournal.xcodeproj \
+            -scheme DailyJournal \
+            -destination "platform=iOS Simulator,name=iPhone 16" \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO
+
+  e2e:
+    if: github.ref == 'refs/heads/main' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'e2e')
+    needs: [server, ios]
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Install functions deps
+        working-directory: functions
+        run: npm ci
+      - name: UI tests against the emulator suite
+        env:
+          SIMULATOR: iPhone 16
+        run: ./scripts/run-e2e.sh
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results
+          path: |
+            build/*.xcresult
+            .e2e-emulators.log

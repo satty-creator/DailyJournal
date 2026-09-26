@@ -2,8 +2,8 @@
 //  OnboardingView.swift
 //  DailyJournal
 //
-//  Three-tap onboarding shown to new users after sign-in (Spilr Redesign 2a
-//  — "goals-first, 3 taps"):
+//  Onboarding shown to new users after sign-in (Spilr Redesign 2a —
+//  "goals-first, 3 taps"):
 //    Step 1 — "What brings you here, really?": multi-select goals
 //    Step 2 — "When Spilr speaks back…": a tone (Gentle / Curious / Direct)
 //    Step 3 — "Then let's start where it's loudest.": a real opening
@@ -37,6 +37,9 @@
 //
 
 import SwiftUI
+// For `ListenerRegistration` — `EntryInsightsObserver` below holds a live
+// snapshot listener on the just-written entry.
+import FirebaseFirestore
 
 // MARK: - UserDefaults keys (shared with RootView, AIService)
 extension UserDefaults {
@@ -57,6 +60,16 @@ extension UserDefaults {
             if let v = newValue { set(v, forKey: Self.aiConsentKey) }
             else { removeObject(forKey: Self.aiConsentKey) }
         }
+    }
+
+    /// True once the user has seen the calendar step (new users) or the
+    /// retro-prompt sheet (existing users) — see `RetroCalendarConnectSheet`
+    /// in RootView.swift. Whether they connected is tracked separately by
+    /// `CalendarService.isConnected`; this just prevents re-asking.
+    static let calendarConsentAskedKey = "spilr.calendarConsentAsked"
+    var calendarConsentAsked: Bool {
+        get { bool(forKey: Self.calendarConsentAskedKey) }
+        set { set(newValue, forKey: Self.calendarConsentAskedKey) }
     }
 }
 
@@ -86,6 +99,12 @@ struct OnboardingView: View {
                 switch step {
                 case 0: goalsStep
                 case 1: toneStep
+                // `calendarConnectStep` (case 2) is temporarily out of the flow —
+                // Google Calendar connect doesn't work for real users yet (OAuth
+                // app is unverified, capped at test users). Kept below, unused,
+                // to re-enable once verification clears: restore `case 2:
+                // calendarConnectStep`, bump progressDots back to 0..<4, and
+                // restore the step transitions this diff reverted.
                 default: firstQuestionStep
                 }
             }
@@ -106,10 +125,17 @@ struct OnboardingView: View {
         // weaving and saving an entry does (`onSave` → `finishOnboarding`),
         // so backing out just returns to "Answer it" rather than skipping
         // the one thing onboarding exists to get the user to.
+        //
+        // `isOnboarding: true` keeps the lower 2-turn save floor for a first entry
+        // and avoids stacking the one-time Thought Journal education sheet over
+        // this cover. The opener shown on the step-3 card (`firstQuestion` below)
+        // is the same `AIService.chatOpener` this session opens on, so the two
+        // stay in sync automatically.
         .fullScreenCover(isPresented: $showingChat) {
             DailyChatView(
                 userId: authViewModel.currentUser?.id ?? "",
                 startWithDictation: chatStartsWithDictation,
+                isOnboarding: true,
                 onSave: { finishOnboarding() }
             )
         }
@@ -200,6 +226,7 @@ struct OnboardingView: View {
             )
         }
         .buttonStyle(.plain)
+        .accessibilityIdentifier("onboarding.goal.\(goal.rawValue)")
     }
 
     // MARK: - Step 2: Tone
@@ -238,8 +265,95 @@ struct OnboardingView: View {
 
             stickyNext(title: "This one") {
                 OnboardingIntent.tone = selectedTone
+                // Would normally go to `calendarConnectStep` (step 2) — see the
+                // disabled-step note in `body` above. `step = 2` now falls
+                // through to `default: firstQuestionStep` while that's off.
                 withAnimation { step = 2 }
             }
+        }
+    }
+
+    // MARK: - Step 3: Connect Google Calendar (optional, skippable) — DISABLED
+    //
+    // Not currently reachable from `body`'s switch: the Google Calendar OAuth
+    // app is unverified, so connecting fails (or shows a scary warning screen)
+    // for every real user except the handful added as test users. Kept here,
+    // unused, to restore once verification clears — see the note in `body`.
+    private var calendarConnectStep: some View {
+        VStack(spacing: 0) {
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 22) {
+                    HStack(spacing: 12) {
+                        backButton { step = 1 }
+                        progressDots(current: 2)
+                    }
+                    .padding(.top, 60)
+
+                    Image(systemName: "calendar")
+                        .font(.system(size: 34))
+                        .foregroundStyle(AppTheme.terracotta)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("See your day\nalongside Spilr.")
+                            .font(AppTheme.editorialDisplay(size: 32))
+                            .foregroundStyle(AppTheme.ink)
+                            .lineSpacing(2)
+                        Text("Connect Google Calendar to view your events right inside Spilr. Read-only \u{2014} we never edit or create anything. Totally optional, and you can connect later from Settings.")
+                            .font(AppTheme.editorialBody(size: 15))
+                            .foregroundStyle(AppTheme.inkSoft)
+                            .lineSpacing(3)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    Spacer(minLength: 120)
+                }
+                .padding(.horizontal, 24)
+            }
+
+            VStack(spacing: 0) {
+                Button {
+                    Task {
+                        await CalendarService.shared.connect()
+                        UserDefaults.standard.calendarConsentAsked = true
+                        withAnimation { step = 3 }
+                    }
+                } label: {
+                    Text("Connect Google Calendar")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(AppTheme.cream)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 17)
+                        .background(
+                            LinearGradient(colors: [AppTheme.terracotta, AppTheme.terracottaDeep],
+                                           startPoint: .leading, endPoint: .trailing)
+                        )
+                        .clipShape(Capsule())
+                        .shadow(color: AppTheme.terracotta.opacity(0.35), radius: 14, x: 0, y: 7)
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 24)
+
+                // Connecting is entirely optional — declining here (or in the
+                // Google consent screen itself) never blocks onboarding, same
+                // shape as the "I'll do this later" escape hatch on step 4.
+                Button {
+                    UserDefaults.standard.calendarConsentAsked = true
+                    withAnimation { step = 3 }
+                } label: {
+                    Text("Skip for now")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(AppTheme.inkSoft)
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 14)
+            }
+            .padding(.bottom, 34)
+            .padding(.top, 12)
+            .background(
+                AppTheme.paper
+                    .ignoresSafeArea(edges: .bottom)
+                    .mask(LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom))
+            )
         }
     }
 
@@ -352,6 +466,7 @@ struct OnboardingView: View {
                         showingChat = true
                     } label: {
                         Text("Answer it")
+                            .accessibilityIdentifier("onboarding.answer")
                             .font(.system(size: 17, weight: .semibold))
                             .foregroundStyle(AppTheme.cream)
                             .frame(maxWidth: .infinity)
@@ -396,6 +511,7 @@ struct OnboardingView: View {
                         .foregroundStyle(AppTheme.inkSoft)
                 }
                 .buttonStyle(.plain)
+                .accessibilityIdentifier("onboarding.later")
                 .padding(.top, 14)
             }
             .padding(.bottom, 34)
@@ -416,14 +532,15 @@ struct OnboardingView: View {
         return "\(goalPart) · \(selectedTone.title)".uppercased()
     }
 
-    /// A real, grounded opener — the same one `HomeView`'s "Begin" and the
-    /// chat's own cold-open use (`AIService.chatOpener`), not onboarding-only
-    /// copy, so the promise "answer this and you're already inside your
-    /// first entry" is actually true: it's the exact question `DailyChatView`
-    /// opens on below.
-    private var firstQuestion: String { AIService.chatOpener(for: .normal) }
+    /// A real, grounded opener — not onboarding-only copy — so the promise "answer
+    /// this and you're already inside your first entry" is actually true: it's the
+    /// exact question `DailyChatView` opens on below.
+    private var firstQuestion: String { AIService.chatOpener }
 
     private func finishOnboarding(wroteEntry: Bool = true) {
+        // Spilr Pro: the paywall is shown once, right as the user lands in the
+        // app — MainTabView consumes this flag (see PaywallPresenter).
+        PaywallPresenter.hasPendingOnboardingPaywall = true
         UserDefaults.standard.onboardingCompleted = true
         AnalyticsManager.shared.trackOnboardingCompleted(
             totalSteps: 3,
@@ -491,19 +608,95 @@ struct OnboardingView: View {
                     )
                 )
         )
+        .accessibilityIdentifier("onboarding.next")
+    }
+}
+
+// MARK: - Live insights for the celebration sheet
+//
+// The sheet is opened from a snapshot `HomeView.checkFirstEntryFast` reads out of
+// Firestore's local cache milliseconds after the entry is written, while
+// `EntryEnrichment`'s Gemini call is still in flight — so `aiSummaryBullets` is
+// empty on the copy the sheet receives, and a plain value type would never learn
+// otherwise. This watches the entry document and republishes when
+// `updateEntryInsights` patches it in.
+//
+// Deliberately shows nothing rather than a local template: a canned observation
+// on the user's very first entry is the one place it is most likely to be read as
+// Spilr's real judgement of what they wrote.
+@MainActor
+final class EntryInsightsObserver: ObservableObject {
+
+    /// Nil until Gemini's insights land. `waiting` drives the placeholder.
+    @Published private(set) var bullets: [String] = []
+    @Published private(set) var question: String?
+    @Published private(set) var isWaiting = true
+
+    private var listener: ListenerRegistration?
+    private var timeoutTask: Task<Void, Never>?
+
+    /// How long to keep the placeholder up before giving up. Generous — the call
+    /// is a Cloud Function hop plus a Gemini round trip, and a cold start can add
+    /// several seconds on top. On timeout the section simply disappears.
+    private static let timeout: Duration = .seconds(20)
+
+    func start(entry: JournalEntry, service: JournalService) {
+        // Composers no longer seed `aiSummaryBullets` at save time, so a non-empty
+        // value means Gemini genuinely answered — either already, or while we watch.
+        if !entry.aiSummaryBullets.isEmpty {
+            apply(entry)
+            return
+        }
+        guard listener == nil else { return }
+
+        listener = service.observeEntry(entryId: entry.id, userId: entry.userId) { [weak self] updated in
+            Task { @MainActor in self?.apply(updated) }
+        }
+
+        timeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.timeout)
+            guard !Task.isCancelled else { return }
+            self?.isWaiting = false
+            self?.stop()
+        }
+    }
+
+    func stop() {
+        listener?.remove()
+        listener = nil
+        timeoutTask?.cancel()
+        timeoutTask = nil
+    }
+
+    private func apply(_ entry: JournalEntry) {
+        // A snapshot listener fires immediately with the cached document, which at
+        // this point is still un-enriched — ignore it and keep waiting.
+        guard !entry.aiSummaryBullets.isEmpty else { return }
+        bullets   = entry.aiSummaryBullets
+        question  = entry.aiQuestion
+        isWaiting = false
+        stop()
+    }
+
+    deinit {
+        listener?.remove()
+        timeoutTask?.cancel()
     }
 }
 
 // MARK: - First entry congratulations sheet
 //
 // Shown as a sheet when the user saves their FIRST ever entry. Surfaces a
-// congratulations message and displays the AI insight inline if already available
-// — otherwise a local fallback observation while Gemini runs in the background.
+// congratulations message and the AI insight — which almost always arrives after
+// the sheet is already on screen, so it fades in via `EntryInsightsObserver`.
 
 struct FirstEntryCelebrationSheet: View {
 
     let entry: JournalEntry
     let onDone: () -> Void
+
+    @StateObject private var insights = EntryInsightsObserver()
+    private let service = JournalService()
 
     var body: some View {
         ZStack {
@@ -524,11 +717,8 @@ struct FirstEntryCelebrationSheet: View {
                             .lineSpacing(2)
                     }
 
-                    // Instant topical insight — one plain sentence about what
-                    // this entry is about, available immediately (no AI wait).
-                    topicInsightCard
-
-                    // Deep reflection card — uses AI bullets if ready, else local fallback
+                    // Reflection — Gemini's bullets, which almost always land
+                    // after this sheet is already up (see EntryInsightsObserver).
                     insightCard
 
                     // 7-day promise
@@ -575,80 +765,33 @@ struct FirstEntryCelebrationSheet: View {
                 )
             }
         }
+        .onAppear { insights.start(entry: entry, service: service) }
+        .onDisappear { insights.stop() }
     }
 
-    // MARK: - Instant topical insight
-    // Builds a plain "This entry seems related to…" sentence from the entry's
-    // tags + detected sentiment. Always available immediately — no API wait.
-    private var topicInsightCard: some View {
-        let topics = topicSentence
-        return VStack(alignment: .leading, spacing: 10) {
-            Text("SPILR NOTICED")
-                .font(AppTheme.mono(size: 10))
-                .foregroundStyle(AppTheme.terracotta)
-                .tracking(2)
-
-            Text(topics)
-                .font(AppTheme.editorialDisplay(size: 20))
-                .foregroundStyle(AppTheme.ink)
-                .lineSpacing(3)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(16)
-        .background(
-            LinearGradient(
-                colors: [AppTheme.rose2.opacity(0.6), AppTheme.lav.opacity(0.3)],
-                startPoint: .topLeading, endPoint: .bottomTrailing
-            )
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-    }
-
-    /// Constructs the topical sentence from tags and/or sentiment.
-    private var topicSentence: String {
-        let sentiment = entry.sentimentLabel ?? LocalAI.detectSentiment(from: entry.content)
-        let tags = entry.tags.prefix(3)
-
-        if tags.isEmpty {
-            // Warm, encouraging fallback for a first entry — tags arrive with
-            // AI enrichment, so this is very common on entry #1.
-            return "Something real is in here. Patterns start surfacing as you keep writing."
-        }
-
-        let tagList: String
-        switch tags.count {
-        case 1:
-            tagList = tags[0]
-        case 2:
-            tagList = "\(tags[0]) and \(tags[1])"
-        default:
-            let all = Array(tags)
-            tagList = "\(all.dropLast().joined(separator: ", ")), and \(all.last!)"
-        }
-
-        return "This entry seems related to \(tagList)."
-    }
-
-    // MARK: - Deep reflection (AI bullets or local fallback)
+    // MARK: - Deep reflection (Gemini only)
+    //
+    // Three states, in the order a first-time user actually hits them:
+    //   waiting  — the enrichment call is still in flight; show the placeholder
+    //   bullets  — Gemini answered; fade the real observations in
+    //   neither  — the call failed or timed out; render nothing at all
+    //
+    // There is deliberately no local fallback here. This is the first thing Spilr
+    // ever says about something the user wrote, so a canned line is the most
+    // expensive place in the app to be caught bluffing.
+    @ViewBuilder
     private var insightCard: some View {
-        let sentiment = entry.sentimentLabel ?? LocalAI.detectSentiment(from: entry.content)
-        let bullets = entry.aiSummaryBullets.isEmpty
-            ? SpilrVoice.localReflection(from: entry.content, sentiment: sentiment).observations
-            : entry.aiSummaryBullets
-
-        return VStack(alignment: .leading, spacing: 12) {
-            // Only render the "SPILR HEARD" section when there's something to show.
-            // Both AI bullets and local fallback can return empty (very short entry,
-            // or a first-run race between save and enrichment).
-            if !bullets.isEmpty {
+        if insights.isWaiting {
+            insightPlaceholder
+        } else if !insights.bullets.isEmpty {
+            VStack(alignment: .leading, spacing: 12) {
                 Text("SPILR HEARD")
                     .font(AppTheme.mono(size: 10))
                     .foregroundStyle(AppTheme.terracotta)
                     .tracking(2)
 
                 VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(bullets.enumerated()), id: \.offset) { _, bullet in
+                    ForEach(Array(insights.bullets.enumerated()), id: \.offset) { _, bullet in
                         HStack(alignment: .top, spacing: 8) {
                             Text("—")
                                 .font(AppTheme.mono(size: 12))
@@ -664,7 +807,7 @@ struct FirstEntryCelebrationSheet: View {
                 .background(AppTheme.paperWarm)
                 .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
 
-                if let question = entry.aiQuestion {
+                if let question = insights.question, !question.isEmpty {
                     HStack(alignment: .top, spacing: 8) {
                         Image(systemName: "quote.bubble")
                             .font(.system(size: 12))
@@ -679,7 +822,45 @@ struct FirstEntryCelebrationSheet: View {
                     .padding(.top, 4)
                 }
             }
+            .transition(.opacity.combined(with: .move(edge: .top)))
+            .animation(.easeOut(duration: 0.35), value: insights.bullets)
         }
+    }
+
+    /// Honest waiting state — says what is actually happening rather than filling
+    /// the space with a guess. Two bars sized like the two bullets that replace them,
+    /// so the card doesn't jump when they arrive.
+    private var insightPlaceholder: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Text("SPILR HEARD")
+                    .font(AppTheme.mono(size: 10))
+                    .foregroundStyle(AppTheme.terracotta.opacity(0.6))
+                    .tracking(2)
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(AppTheme.terracotta.opacity(0.6))
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Reading what you wrote…")
+                    .font(AppTheme.editorialBody(size: 15))
+                    .foregroundStyle(AppTheme.inkSoft.opacity(0.7))
+                    .italic()
+
+                ForEach([0.92, 0.64], id: \.self) { width in
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(AppTheme.inkSoft.opacity(0.08))
+                        .frame(height: 13)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .scaleEffect(x: width, y: 1, anchor: .leading)
+                }
+            }
+            .padding(14)
+            .background(AppTheme.paperWarm)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+        .transition(.opacity)
     }
 
     // MARK: - 7-day promise

@@ -10,14 +10,18 @@ import FirebaseAnalytics
 
 // MARK: - Analytics Events
 
+/// Screen names sent as `firebase_screen` on the reserved `screen_view`
+/// event. Deliberately unprefixed: GA4 already shows these under the
+/// `screen_view` event, so a `screen_` prefix rendered every row as
+/// "screen_view / screen_home_today".
 enum AnalyticsScreen: String {
-    case home = "screen_home_today"
-    case journal = "screen_journal_list"
-    case mirror = "screen_mirror"
-    case authLogin = "screen_auth_login"
-    case authSignup = "screen_auth_signup"
-    case onboarding = "screen_onboarding"
-    case entryEditor = "screen_entry_editor"
+    case home = "home_today"
+    case journal = "journal_list"
+    case mirror = "mirror"
+    case authLogin = "auth_login"
+    case authSignup = "auth_signup"
+    case onboarding = "onboarding"
+    case entryEditor = "entry_editor"
 }
 
 enum AnalyticsEvent: String {
@@ -54,6 +58,11 @@ enum AnalyticsEvent: String {
     case aiInsightsFailed = "ai_insights_failed"
     case aiInsightsViewed = "ai_insights_viewed"
 
+    // Google Calendar (view-only, Phase 1 — see Calendar/CalendarService.swift)
+    case calendarConnected = "calendar_connected"
+    case calendarDisconnected = "calendar_disconnected"
+    case calendarConsentDeclined = "calendar_consent_declined"
+
     // Echo system
     case echoSurfaced = "echo_surfaced"
     case echoAnswered = "echo_answered"
@@ -82,6 +91,7 @@ enum AnalyticsEvent: String {
     case mirrorReadingFeedback = "mirror_reading_feedback"
     case mirrorAskUsed = "mirror_ask_used"
     case mirrorOpenHypothesisTapped = "mirror_open_hypothesis_tapped"
+    case weeklyLetterOpened = "weekly_letter_opened"
 
     // Chat
     case dailyChatStarted = "daily_chat_started"
@@ -97,16 +107,34 @@ enum AnalyticsEvent: String {
     // Theme & Appearance
     case themeChanged = "theme_changed"
 
+    // Spilr Pro paywall
+    case paywallShown = "paywall_shown"
+    case paywallPurchased = "paywall_purchased"
+    case paywallDismissed = "paywall_dismissed"
+
     // Settings
     case settingsOpened = "settings_opened"
     case privacyPolicyViewed = "privacy_policy_viewed"
     case feedbackSent = "feedback_sent"
 
     // Session events
-    case sessionStarted = "session_started"
+    //
+    // There is deliberately NO custom "session started" event. GA4 already
+    // emits `session_start`, and a custom `session_started` one character away
+    // from it gave the same report two contradictory session counts (387 vs 44
+    // over the same 28 days) with no way to tell which to believe. Tenure is a
+    // user property now — `setDaysSinceSignup` — so every event a person sends
+    // is already segmented by how long they have been here, which is strictly
+    // more useful than the same number on one event.
+    //
+    // `app_foregrounded` / `app_backgrounded` went the same way: GA4 derives
+    // both, and `app_backgrounded` was bound to `willResignActive`, so pulling
+    // down Control Centre or receiving a system alert counted as leaving the
+    // app (165 of those against 112 real backgroundings).
+    //
+    // `session_ended` stays, because it carries the one thing GA4 cannot
+    // derive: how many entries were written during the session.
     case sessionEnded = "session_ended"
-    case appBackgrounded = "app_backgrounded"
-    case appForegrounded = "app_foregrounded"
 
     // Error tracking
     //
@@ -118,6 +146,7 @@ enum AnalyticsEvent: String {
     // a photo upload) diagnosable — itself silently do nothing, for every error this
     // app has ever tracked.
     case firebaseError = "app_error"
+    case verificationEmailSent = "verification_email_sent"
     case networkError = "network_error"
     case aiServiceError = "ai_service_error"
 }
@@ -132,12 +161,23 @@ final class AnalyticsManager {
 
     // MARK: - Screen Tracking
 
-    /// Track screen view (auto-called by views via onAppear)
+    /// Track screen view (auto-called by views via onAppear).
+    ///
+    /// This MUST be the reserved `screen_view` event carrying the reserved
+    /// `firebase_screen` / `firebase_screen_class` parameters — GA4's Screens
+    /// report, Path exploration and every screen-to-screen funnel read those
+    /// keys and nothing else. It previously logged `AnalyticsEvent
+    /// .sessionStarted` with a custom `screen_name` param, which meant the app
+    /// emitted no screen events at all: the Screens report showed only the
+    /// UIKit controllers Firebase auto-collects (`PlatformAlertController`,
+    /// `PUPickerUnavailable`), and ~275 of the 387 "session_started" events in
+    /// a 28-day window were actually screen views wearing a session's name.
     func trackScreenView(_ screen: AnalyticsScreen, parameters: [String: Any]? = nil) {
         var params = parameters ?? [:]
-        params["screen_name"] = screen.rawValue
+        params[AnalyticsParameterScreenName] = screen.rawValue
+        params[AnalyticsParameterScreenClass] = screen.rawValue
 
-        Analytics.logEvent(AnalyticsEvent.sessionStarted.rawValue, parameters: params)
+        Analytics.logEvent(AnalyticsEventScreenView, parameters: params)
 
         #if DEBUG
         print("📊 Screen: \(screen.rawValue)")
@@ -146,10 +186,15 @@ final class AnalyticsManager {
 
     // MARK: - Event Tracking
 
-    /// Log a custom event with optional parameters
+    /// Log a custom event with optional parameters.
+    ///
+    /// No `timestamp` parameter is attached here. GA4 stamps `event_timestamp`
+    /// on every event at microsecond precision; the ISO-8601 string this used
+    /// to add spent one of the 25 parameter slots available per event (and one
+    /// of the 50 registerable custom dimensions, had it ever been registered)
+    /// to restate it, and allocated a fresh `ISO8601DateFormatter` each time.
     func logEvent(_ event: AnalyticsEvent, parameters: [String: Any]? = nil) {
-        var params = parameters ?? [:]
-        params["timestamp"] = ISO8601DateFormatter().string(from: Date())
+        let params = parameters ?? [:]
 
         Analytics.logEvent(event.rawValue, parameters: params)
 
@@ -169,6 +214,13 @@ final class AnalyticsManager {
     func setUserProperty(_ value: String, forName name: String) {
         Analytics.setUserProperty(value, forName: name)
     }
+
+    // MARK: - Parameter helpers
+
+    /// GA4 stores a Swift `Bool` as 1/0, which can only be registered as a
+    /// custom *metric* and reads as "1" / "0" in every breakdown. A flag we
+    /// want to slice by is a dimension, not a measurement, so it goes as text.
+    private func flag(_ value: Bool) -> String { value ? "true" : "false" }
 
     // MARK: - Pre-built Event Shortcuts
 
@@ -207,24 +259,52 @@ final class AnalyticsManager {
         logEvent(.entryCompositionStarted, parameters: ["session_type": sessionType])
     }
 
+    /// The activation event — "this person wrote something".
+    ///
+    /// Called from exactly one place: `EntryEnrichment.run`, the shared
+    /// post-save tail every composer already runs. When each surface owned its
+    /// own call, two of the four never made it — `TimedSessionViewModel`
+    /// (the spill flow, via `SpillWriteView`) and `DailyChatView` both saved
+    /// the entry and logged nothing — so the app's single most important event
+    /// undercounted by an unknown margin and no two surfaces were comparable.
+    /// One call site on the path every composer must take is the only version
+    /// of this a fifth composer cannot forget.
+    ///
+    /// `has_ai_insights` is gone. At save time no composer knows whether AI
+    /// enrichment will return anything: the Gemini call is detached and starts
+    /// *after* this fires. `ai_available` replaces it with something true at
+    /// the moment of the event — whether this person has AI enabled at all —
+    /// which is the cohort split that was actually wanted.
     func trackEntryCreated(
         sessionType: String,
         wordCount: Int,
         hasMood: Bool,
         hasPhoto: Bool,
-        hasAI: Bool,
-        duration: TimeInterval
+        aiAvailable: Bool,
+        compositionSeconds: Int? = nil
     ) {
-        logEvent(.entryCreated, parameters: [
+        var params: [String: Any] = [
             "session_type": sessionType,
             "word_count": wordCount,
-            "has_mood": hasMood,
-            "has_photo": hasPhoto,
-            "has_ai_insights": hasAI,
-            "composition_time_seconds": Int(duration)
-        ])
+            "has_mood": flag(hasMood),
+            "has_photo": flag(hasPhoto),
+            "ai_available": flag(aiAvailable)
+        ]
+        // Sent only by composers that actually know when composition began.
+        // The freeWrite editor used to pass `Date().timeIntervalSince(entry
+        // .createdAt)`, which is always ~0 — `createdAt` is stamped when the
+        // entry is constructed, milliseconds before the save — so every
+        // composition time this app has ever reported was zero.
+        if let compositionSeconds {
+            params["composition_time_seconds"] = compositionSeconds
+        }
+
+        logEvent(.entryCreated, parameters: params)
     }
 
+    /// The counterpart to `trackEntryCreated`: someone composed and threw it
+    /// away. Same `session_type` dimension, so the two can be compared surface
+    /// by surface.
     func trackEntryDiscarded(sessionType: String, wordCount: Int) {
         logEvent(.entryDiscarded, parameters: [
             "session_type": sessionType,
@@ -274,8 +354,8 @@ final class AnalyticsManager {
         ])
     }
 
-    func trackEchoAnswered() {
-        logEvent(.echoAnswered)
+    func trackEchoAnswered(hasResponse: Bool) {
+        logEvent(.echoAnswered, parameters: ["has_response": hasResponse])
     }
 
     func trackEchoDismissed() {
@@ -315,6 +395,13 @@ final class AnalyticsManager {
         logEvent(.mirrorOpenHypothesisTapped)
     }
 
+    /// `source` is "banner" (in-app, tapped from the Mirror tab) or "push"
+    /// (opened via the notification tap) — separates in-app discovery from
+    /// push delivery for the weekly-letter open-rate metric (PRD §10).
+    func trackWeeklyLetterOpened(source: String) {
+        logEvent(.weeklyLetterOpened, parameters: ["source": source])
+    }
+
     // Journal interactions
     //
     // Deliberately logs the query's LENGTH, never its text — entry content and
@@ -341,8 +428,15 @@ final class AnalyticsManager {
     }
 
     // Session
-    func trackSessionStarted(daysAfterSignup: Int) {
-        logEvent(.sessionStarted, parameters: ["days_after_signup": daysAfterSignup])
+
+    /// Tenure as a user property rather than a parameter on one event, so
+    /// *every* event this person sends can be split by how long they have been
+    /// here — retention, activation and feature use all at once — instead of
+    /// only the session event that happened to carry it. Refreshed whenever a
+    /// session begins. See the `sessionEnded` note in `AnalyticsEvent` for why
+    /// the custom session-start event it replaced is gone.
+    func setDaysSinceSignup(_ days: Int) {
+        setUserProperty(String(days), forName: "days_since_signup")
     }
 
     func trackSessionEnded(duration: TimeInterval, entriesWritten: Int) {
@@ -364,5 +458,25 @@ final class AnalyticsManager {
             "error_domain": (error as NSError).domain,
             "context": context
         ])
+    }
+}
+
+// MARK: - Composer names
+
+extension SessionType {
+    /// The name this composer reports to analytics.
+    ///
+    /// Deliberately not `rawValue`: `.timed`'s raw value is "ninetySecond",
+    /// kept for Firestore back-compat, and a dimension value nobody can read is
+    /// a dimension nobody uses. `.timed` reports as "spill" because that is the
+    /// surface people actually meet it through (`SpillWriteView`).
+    var analyticsName: String {
+        switch self {
+        case .timed:      return "spill"
+        case .freeWrite:  return "free_write"
+        case .dailyChat:  return "daily_chat"
+        case .cbtReframe: return "cbt_reframe"
+        case .template:   return "template"
+        }
     }
 }

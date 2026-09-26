@@ -198,14 +198,6 @@ WORDS — every one of these is a lint rule:
  No compliment, no reassurance ("neither is wrong"), no advice.
  End on the exception or the question — never on the cost.
 
-Then run two checks on your own line before returning it:
- SWAP TEST         Would this sentence be true of a different person
-                   with different entries? If yes, return null and let
-                   the fallback ship.
- CONTRADICTION     Name the entry that would have made this line false.
-                   If you cannot name one, it is not a claim — return
-                   null.
-
 THE ITEM (shape: ${shape}):
 ${itemBlock}
 
@@ -219,8 +211,7 @@ ${testQuestion || "(none supplied — write one)"}
 Return ONLY valid JSON:
 { "line": "", "shape": "${shape}",
   "receipt": {"quote": "", "date": ""},
-  "question": "",
-  "would_be_false_if": "" }
+  "question": "" }
 
 BAD:  "When the future goes blank, you build something — a project makes
        an uncertain thing feel worked-on."

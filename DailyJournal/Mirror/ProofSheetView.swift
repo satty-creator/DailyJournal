@@ -299,10 +299,8 @@ struct ProofSheetView: View {
 
 /// "more…" for a Mirror v3.1 line — one built on a signature, a because, a
 /// say/do gap, or an exception rather than a v3.0 observation, so there is no
-/// numeric `ReadingProof` to show. The receipt and `wouldBeFalseIf` ARE the
-/// proof here: what the line is grounded in, and what would have made it
-/// false — collaborative empiricism means showing the test, not just the
-/// claim.
+/// numeric `ReadingProof` to show. The receipt IS the proof here: what the
+/// line is grounded in.
 struct PersonModelReadingDetailView: View {
 
     let reading: Reading
@@ -342,20 +340,6 @@ struct PersonModelReadingDetailView: View {
                                     .font(AppTheme.mono(size: 10))
                                     .foregroundStyle(AppTheme.inkSoft)
                             }
-                        }
-                    }
-
-                    if let wbf = reading.wouldBeFalseIf, !wbf.isEmpty {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("would be false if")
-                                .font(AppTheme.mono(size: 10))
-                                .foregroundStyle(AppTheme.inkSoft)
-                                .tracking(1)
-                                .textCase(.uppercase)
-                            Text(wbf)
-                                .font(AppTheme.editorialBody(size: 14))
-                                .foregroundStyle(AppTheme.ink)
-                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
 

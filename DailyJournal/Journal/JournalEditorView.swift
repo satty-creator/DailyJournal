@@ -73,7 +73,14 @@ struct JournalEditorView: View {
                         // already handles the new-entry upload path correctly; this
                         // was purely the view withholding the affordance.
                         photoSection
-                        if !viewModel.aiSummaryBullets.isEmpty && viewModel.isEditing {
+                        // Gated on `isEditing` only, NOT on having insights. The
+                        // share button lives in here and is the app's only entry
+                        // point to the share card, which degrades to an excerpt of
+                        // the entry on its own (see `InsightShareCard.headline`) —
+                        // gating the whole section on non-empty bullets made
+                        // un-enriched entries unshareable. The section renders its
+                        // own empty state instead.
+                        if viewModel.isEditing {
                             aiSummarySection
                         }
                         tagSection
@@ -393,11 +400,13 @@ struct JournalEditorView: View {
 
     // MARK: - AI summary (shown when editing an existing entry)
     private var aiSummarySection: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let hasInsights = !viewModel.aiSummaryBullets.isEmpty
+
+        return VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text("SPILR HEARD")
                     .font(AppTheme.mono(size: 10))
-                    .foregroundStyle(AppTheme.terracotta)
+                    .foregroundStyle(AppTheme.terracotta.opacity(hasInsights ? 1 : 0.5))
                     .tracking(2)
                 Spacer()
                 if let entry = viewModel.shareableEntry {
@@ -406,18 +415,28 @@ struct JournalEditorView: View {
             }
 
             VStack(alignment: .leading, spacing: 8) {
-                ForEach(Array(viewModel.aiSummaryBullets.enumerated()), id: \.offset) { _, bullet in
-                    HStack(alignment: .top, spacing: 8) {
-                        Text("—")
-                            .font(AppTheme.mono(size: 12))
-                            .foregroundStyle(AppTheme.terracotta)
-                        Text(bullet)
-                            .font(AppTheme.editorialBody(size: 14))
-                            .foregroundStyle(AppTheme.inkSoft)
-                            .lineSpacing(2)
+                if hasInsights {
+                    ForEach(Array(viewModel.aiSummaryBullets.enumerated()), id: \.offset) { _, bullet in
+                        HStack(alignment: .top, spacing: 8) {
+                            Text("—")
+                                .font(AppTheme.mono(size: 12))
+                                .foregroundStyle(AppTheme.terracotta)
+                            Text(bullet)
+                                .font(AppTheme.editorialBody(size: 14))
+                                .foregroundStyle(AppTheme.inkSoft)
+                                .lineSpacing(2)
+                        }
                     }
+                } else {
+                    // Gemini hasn't read this one — offline when it was written, or
+                    // the call failed. Say so plainly rather than inventing a line.
+                    Text("Spilr hasn't read this one yet.")
+                        .font(AppTheme.editorialBody(size: 14))
+                        .foregroundStyle(AppTheme.inkSoft.opacity(0.6))
+                        .italic()
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(14)
             .background(AppTheme.paperWarm)
             .clipShape(RoundedRectangle(cornerRadius: 12))
@@ -442,7 +461,12 @@ struct JournalEditorView: View {
                 .padding(.vertical, 16)
         }
         .onAppear {
-            AnalyticsManager.shared.logEvent(.aiInsightsViewed)
+            // Only count this as insights being *viewed* when there were any —
+            // the section now also renders for un-enriched entries, and logging
+            // those would quietly inflate the metric.
+            if hasInsights {
+                AnalyticsManager.shared.logEvent(.aiInsightsViewed)
+            }
         }
     }
 

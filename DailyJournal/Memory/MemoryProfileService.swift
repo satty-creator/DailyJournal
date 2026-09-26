@@ -29,16 +29,31 @@ final class MemoryProfileService {
     // MARK: - Build
 
     /// Fetches entries + recent events, composes the profile, caches it, returns it.
+    ///
+    /// Debounced because `load()` on the Today tab fires this on appear, on
+    /// pull-to-refresh and after every entry save — often within seconds of each
+    /// other — and each run reads the entire entry corpus (`fetchAllEntries` is
+    /// unbounded, kept that way for this service). A profile up to a minute stale
+    /// is harmless to all six of its consumers; re-reading every entry three
+    /// times in ten seconds is not free.
     @discardableResult
-    func build(for userId: String) async -> MemoryProfile {
+    func build(for userId: String, force: Bool = false) async -> MemoryProfile {
+        if !force,
+           let cached = cachedProfile(for: userId),
+           Date().timeIntervalSince(cached.generatedAt) < Self.minRebuildInterval {
+            return cached
+        }
         async let entriesTask = (try? await journal.fetchAllEntries(for: userId)) ?? []
         async let eventsTask = EventService.shared.fetchRecent(for: userId, limit: 20)
         let entries = await entriesTask
         let events  = await eventsTask
         let profile = Self.compose(entries: entries, events: events)
+            .removing(suppressedKeys(for: userId))
         cache(profile, for: userId)
         return profile
     }
+
+    private static let minRebuildInterval: TimeInterval = 60
 
     // MARK: - Compose (pure)
 
@@ -60,14 +75,16 @@ final class MemoryProfileService {
         let first = entries.map(\.createdAt).min()
         let last  = entries.map(\.createdAt).max()
 
-        // ── Recurring themes (word frequency, stop-words removed) ──────────
+        // ── Recurring themes (entries mentioning a word, stop-words removed) ──
+        // Counted once per entry: the number is rendered into every AI prompt as
+        // "work (in 12 entries)", and a reader — human or model — takes that to
+        // mean twelve occasions, not one long entry that said "work" twelve times.
         var wordCounts: [String: Int] = [:]
         for entry in entries {
-            let words = entry.content.lowercased()
+            let words = Set(entry.content.lowercased()
                 .components(separatedBy: CharacterSet.alphanumerics.inverted)
-            for w in words where w.count > 3 && !stopWords.contains(w) {
-                wordCounts[w, default: 0] += 1
-            }
+                .filter { $0.count > 3 && !stopWords.contains($0) })
+            for w in words { wordCounts[w, default: 0] += 1 }
         }
         let themes = wordCounts
             .filter { $0.value >= 3 }
@@ -98,31 +115,50 @@ final class MemoryProfileService {
         }
         var moods = moodCount(entries.filter { $0.createdAt >= cutoff30 })
         if moods.isEmpty { moods = moodCount(entries) }
-        let topMood = moods.max { $0.value < $1.value }?.key
+        // "Mood lately tends toward…" off a single logged mood is not a tendency,
+        // and the prompt has no way to tell one reading from thirty.
+        let topMood = moods.values.reduce(0, +) >= 3
+            ? moods.max { $0.value < $1.value }?.key
+            : nil
 
         // ── Emotional vocabulary ─────────────────────────────────────────────
-        // Words the person uses for emotions that aren't in the standard sentiment
-        // label set. We scan for words within a 5-word window of emotion anchors
-        // ("feel", "felt", "feeling", "i'm", "so") and collect non-standard ones
-        // that appear at least twice.
+        // The word the person reaches for straight after an emotion anchor.
+        // "so " and "been " used to be anchors: neither is first-person nor
+        // emotional, so "been reading" and "also tired" both qualified — and the
+        // result is injected into every prompt as the vocabulary to mirror back.
         let standardEmotions = Set(LocalAI.sentimentLabels.map { $0.lowercased() }
             + ["okay", "fine", "good", "bad", "weird", "strange", "better", "worse"])
-        let emotionAnchors = ["feel ", "felt ", "feeling ", "i'm ", "i am ", "so ", "been "]
+        let emotionAnchors = ["feel ", "felt ", "feeling ", "i'm ", "i am "]
+        // Present participles that follow "i'm" far more often than a feeling does.
+        let notFeelings: Set<String> = ["going", "doing", "getting", "trying", "looking",
+                                        "working", "thinking", "talking", "making", "taking",
+                                        "coming", "having", "writing", "reading", "sitting",
+                                        "waiting", "supposed", "meeting", "starting"]
         var emoWordCounts: [String: Int] = [:]
         for entry in entries {
             let lower = entry.content.lowercased()
             for anchor in emotionAnchors {
                 var searchRange = lower.startIndex..<lower.endIndex
                 while let anchorRange = lower.range(of: anchor, range: searchRange) {
-                    let afterAnchor = anchorRange.upperBound..<lower.endIndex
-                    // Grab up to 5 chars (word boundary)
-                    let slice = lower[afterAnchor].prefix(20)
-                    if let word = slice.components(separatedBy: CharacterSet.alphanumerics.inverted)
-                        .first, word.count >= 4,
-                       !standardEmotions.contains(word), !stopWords.contains(word) {
-                        emoWordCounts[word, default: 0] += 1
-                    }
                     searchRange = anchorRange.upperBound..<lower.endIndex
+
+                    // The anchor has to start its own word — unanchored matching
+                    // found "so " inside "also " and "i am " inside "hi ambition".
+                    let startsWord = anchorRange.lowerBound == lower.startIndex
+                        || !lower[lower.index(before: anchorRange.lowerBound)].isLetter
+                    guard startsWord else { continue }
+
+                    // "I don't feel numb" is not evidence for "numb".
+                    guard !isNegated(String(lower[..<anchorRange.lowerBound].suffix(24))) else { continue }
+
+                    guard let word = lower[anchorRange.upperBound...].prefix(20)
+                            .components(separatedBy: CharacterSet.alphanumerics.inverted).first,
+                          word.count >= 4,
+                          !standardEmotions.contains(word),
+                          !stopWords.contains(word),
+                          !notFeelings.contains(word)
+                    else { continue }
+                    emoWordCounts[word, default: 0] += 1
                 }
             }
         }
@@ -130,59 +166,70 @@ final class MemoryProfileService {
             .filter { $0.value >= 2 }
             .sorted { $0.value > $1.value }
             .prefix(8)
-            .map { $0.key }
+            .map { MemoryProfile.Theme(word: $0.key, count: $0.value) }
 
         // ── Coping patterns ──────────────────────────────────────────────────
-        // Sentences containing "[X] help(s)/helped" or "[X] make(s) it worse/better"
-        // or "[X] always/never helps" patterns. We extract the subject noun phrase.
-        var copingSignals: [String] = []
-        var seenCoping = Set<String>()
-        let copingPatterns_help = ["help", "helps", "helped", "calms", "calmed", "eases", "eased"]
-        let copingPatterns_hurt = ["makes it worse", "made it worse", "doesn't help", "never helps",
-                                   "makes things worse", "makes me worse"]
+        // "[X] helps" / "[X] makes it worse", tallied across entries. This is the
+        // weakest inference in the profile and it used to be the least guarded:
+        // an unanchored "help" matched inside "helpless", negation was invisible,
+        // one sentence ever was enough, and the negative branch threw away the
+        // phrase and asserted "makes it worse" — so "therapy doesn't help" was
+        // stored as a stronger claim than the person made. Four rules now:
+        // hurt phrases are tested first (every one contains a help word),
+        // matching is word-boundary, a negated or wishful clause is skipped
+        // rather than guessed at, and the person's own phrase is what is kept.
+        var copingTallies: [String: (phrase: String, count: Int)] = [:]
+        let helpVerbs = ["help", "helps", "helped", "calms", "calmed", "eases", "eased"]
+        let hurtPhrases = ["makes it worse", "made it worse", "makes things worse",
+                           "makes me worse", "doesn't help", "does not help",
+                           "didn't help", "did not help", "never helps", "never helped"]
         for entry in entries {
-            let sentences = entry.content.components(separatedBy: CharacterSet(charactersIn: ".!?\n"))
-            for sentence in sentences {
-                let lower = sentence.lowercased().trimmingCharacters(in: .whitespaces)
-                // Positive coping
-                for pattern in copingPatterns_help {
-                    if lower.contains(pattern) {
-                        // Take the part before the verb as the subject (up to 4 words)
-                        if let range = lower.range(of: pattern) {
-                            let subject = String(lower[..<range.lowerBound])
-                                .components(separatedBy: CharacterSet.alphanumerics.inverted)
-                                .filter { !$0.isEmpty && !stopWords.contains($0) }
-                                .suffix(3).joined(separator: " ")
-                            if subject.count >= 3 {
-                                let signal = "\(subject) \(pattern)"
-                                if !seenCoping.contains(subject) {
-                                    seenCoping.insert(subject)
-                                    copingSignals.append(signal)
-                                }
+            for sentence in entry.content.components(separatedBy: CharacterSet(charactersIn: ".!?\n")) {
+                for clause in Self.clauses(of: sentence) {
+                    let lower = clause.lowercased().trimmingCharacters(in: .whitespaces)
+                    guard !lower.isEmpty else { continue }
+
+                    var hit: (phrase: String, range: Range<String.Index>, negative: Bool)?
+                    for phrase in hurtPhrases {
+                        if let r = Self.rangeOfWord(phrase, in: lower) {
+                            hit = (phrase, r, true); break
+                        }
+                    }
+                    if hit == nil {
+                        for verb in helpVerbs {
+                            if let r = Self.rangeOfWord(verb, in: lower) {
+                                hit = (verb, r, false); break
                             }
                         }
                     }
-                }
-                // Negative coping
-                for pattern in copingPatterns_hurt {
-                    if lower.contains(pattern) {
-                        if let range = lower.range(of: pattern) {
-                            let subject = String(lower[..<range.lowerBound])
-                                .components(separatedBy: CharacterSet.alphanumerics.inverted)
-                                .filter { !$0.isEmpty && !stopWords.contains($0) }
-                                .suffix(3).joined(separator: " ")
-                            if subject.count >= 3 {
-                                let signal = "\(subject) makes it worse"
-                                if !seenCoping.contains(subject + "_neg") {
-                                    seenCoping.insert(subject + "_neg")
-                                    copingSignals.append(signal)
-                                }
-                            }
-                        }
+                    guard let found = hit else { continue }
+
+                    let before = String(lower[..<found.range.lowerBound])
+                    // "walking never helped", "I wish walking helped" — neither is
+                    // evidence that walking helps. Silence beats a wrong claim.
+                    if !found.negative && Self.isNegated(before) { continue }
+
+                    let subject = before
+                        .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                        .filter { !$0.isEmpty && !stopWords.contains($0) }
+                        .suffix(3).joined(separator: " ")
+                    guard subject.count >= 3 else { continue }
+
+                    let key = subject + (found.negative ? "_neg" : "")
+                    if copingTallies[key] != nil {
+                        copingTallies[key]!.count += 1
+                    } else {
+                        copingTallies[key] = ("\(subject) \(found.phrase)", 1)
                     }
                 }
             }
         }
+        // Two occasions minimum, matching the vocabulary threshold. One sentence,
+        // once, is not something to carry into every prompt for months.
+        let copingSignals = copingTallies.values
+            .filter { $0.count >= 2 }
+            .sorted { $0.count > $1.count }
+            .map { MemoryProfile.Signal(text: $0.phrase, count: $0.count) }
 
         // ── Notable moments (from JournalEvent, not from entries) ──────────
         // Top 3 by salience — a concrete outcome and a named need beat a bare
@@ -222,6 +269,7 @@ final class MemoryProfileService {
 
     private func profileKey(_ uid: String) -> String { "memoryProfile-\(uid)" }
     private func ctxKey(_ uid: String) -> String { "memoryPromptCtx-\(uid)" }
+    private func suppressedKey(_ uid: String) -> String { "memorySuppressed-\(uid)" }
 
     private func cache(_ profile: MemoryProfile, for userId: String) {
         if let data = try? JSONEncoder().encode(profile) {
@@ -235,6 +283,38 @@ final class MemoryProfileService {
               let profile = try? JSONDecoder().decode(MemoryProfile.self, from: data)
         else { return nil }
         return profile
+    }
+
+    // MARK: - Forgetting
+
+    /// `MemoryProfile.Item.id`s the person has removed. Kept separately from the
+    /// cached profile so it survives the rebuild that immediately follows.
+    func suppressedKeys(for userId: String) -> Set<String> {
+        Set(defaults.stringArray(forKey: suppressedKey(userId)) ?? [])
+    }
+
+    /// Removes one item and rewrites the cache straight away, so the next prompt
+    /// built — which reads the cache synchronously — is already without it.
+    func forget(_ item: MemoryProfile.Item, for userId: String) {
+        var keys = suppressedKeys(for: userId)
+        keys.insert(item.id)
+        defaults.set(Array(keys), forKey: suppressedKey(userId))
+        if let profile = cachedProfile(for: userId) {
+            cache(profile.removing(keys), for: userId)
+        }
+    }
+
+    func restoreForgotten(for userId: String) {
+        defaults.removeObject(forKey: suppressedKey(userId))
+    }
+
+    /// Sign-out and account deletion both left the profile and its rendered
+    /// prompt block on the device — a digest of someone's journal outliving the
+    /// session it belongs to.
+    func clearCache(for userId: String) {
+        KeychainHelper.delete(forKey: profileKey(userId))
+        defaults.removeObject(forKey: ctxKey(userId))
+        defaults.removeObject(forKey: suppressedKey(userId))
     }
 
     /// The cached prompt-context block for the signed-in user (or ""), with
@@ -260,6 +340,52 @@ final class MemoryProfileService {
         let themeWords = profile.recurringThemes.prefix(6).map { $0.word }
         let combined = Array((themeWords + profile.recurringEntities).prefix(8))
         return combined.joined(separator: ", ")
+    }
+
+    // MARK: - Text helpers
+
+    /// `range(of:)` with word boundaries on both ends. Plain `contains("help")`
+    /// is true of "helpless", "unhelpful" and "helpfully", which is how
+    /// "I felt helpless after the call" became a POSITIVE coping signal.
+    private static func rangeOfWord(_ phrase: String, in haystack: String) -> Range<String.Index>? {
+        var search = haystack.startIndex..<haystack.endIndex
+        while let r = haystack.range(of: phrase, range: search) {
+            let openBefore = r.lowerBound == haystack.startIndex
+                || !haystack[haystack.index(before: r.lowerBound)].isLetter
+            let openAfter = r.upperBound == haystack.endIndex
+                || !haystack[r.upperBound].isLetter
+            if openBefore && openAfter { return r }
+            guard r.upperBound < haystack.endIndex else { return nil }
+            search = r.upperBound..<haystack.endIndex
+        }
+        return nil
+    }
+
+    /// Apostrophes are stripped rather than split on, so "don't" is tested as
+    /// "dont" — splitting on non-alphanumerics turns it into "don" + "t", and
+    /// neither half is a negation marker.
+    private static func isNegated(_ text: String) -> Bool {
+        let squashed = text.replacingOccurrences(of: "'", with: "")
+            .replacingOccurrences(of: "\u{2019}", with: "")
+        return squashed.components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .contains { negationMarkers.contains($0) }
+    }
+
+    private static let negationMarkers: Set<String> = [
+        "not", "never", "no", "none", "hardly", "barely", "rarely", "seldom",
+        "wish", "wished", "wishing", "dont", "doesnt", "didnt", "wont", "wouldnt",
+        "cant", "cannot", "couldnt", "isnt", "wasnt", "arent", "werent", "nothing"
+    ]
+
+    /// A subject taken as "the last three words before the verb" walks straight
+    /// across a clause boundary: "I called mum and a long walk helped" gives
+    /// "mum long walk". Splitting first keeps the subject inside its own clause.
+    private static func clauses(of sentence: String) -> [String] {
+        sentence.components(separatedBy: CharacterSet(charactersIn: ",;:"))
+            .flatMap { $0.components(separatedBy: " and ") }
+            .flatMap { $0.components(separatedBy: " but ") }
+            .flatMap { $0.components(separatedBy: " so ") }
+            .flatMap { $0.components(separatedBy: " because ") }
     }
 
     // MARK: - Stop words (shared with the Patterns word cloud heuristic)

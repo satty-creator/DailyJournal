@@ -133,11 +133,6 @@ struct Reading {
     /// "personModel"`; nil for a v3.0 observation-only reading, which still
     /// renders exactly as before.
     let shape: String?
-    /// Prompt M's own falsifiability test — "name the entry that would have
-    /// made this line false." Shown, not just logged: collaborative
-    /// empiricism means the user gets to see what would change the model's
-    /// mind, not just that it has one.
-    let wouldBeFalseIf: String?
 
     init?(from data: [String: Any]) {
         guard let date = data["date"] as? String else { return nil }
@@ -160,7 +155,6 @@ struct Reading {
         self.userStatus = data["userStatus"] as? String ?? "unrated"
         self.computedAt = (data["computedAt"] as? Timestamp)?.dateValue() ?? Date()
         self.shape = data["shape"] as? String
-        self.wouldBeFalseIf = data["wouldBeFalseIf"] as? String
     }
 
     var isConfirmed: Bool { userStatus == "this_is_me" }

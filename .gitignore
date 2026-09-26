@@ -45,3 +45,14 @@ fastlane/test_output
 
 # Code Injection
 iOSInjectionProject/
+# E2E test artefacts
+/build/
+.e2e-emulators.log
+tests/rules/node_modules/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+.firebase/
+
+# Local scratch / marketing assets, not project source
+Claude outputs/

@@ -37,8 +37,7 @@ final class AIService {
     // The Gemini key lives server-side in the `geminiProxy` Cloud Function — never
     // in the app. We authenticate with the signed-in user's Firebase ID token.
     // Update this if you deploy to a different project/region (see functions/README).
-    static let proxyURLString =
-        "https://us-central1-spilr-100f7.cloudfunctions.net/geminiProxy"
+    static var proxyURLString: String { TestLaunchConfig.functionsBaseURL + "/geminiProxy" }
     // ^ Migrated to the Spilr project (spilr-100f7). This is the standard
     //   Firebase-managed alias for a 2nd-gen HTTPS function — verify it against
     //   the URL shown in Firebase console > Functions after the first deploy;
@@ -47,8 +46,7 @@ final class AIService {
     /// The server-side, one-time Mirror bootstrap — see `functions/index.js`
     /// `exports.bootstrapMirror` and `AIService+Mirror.swift`'s
     /// `bootstrapMirror(userId:)`. Same project/region as `proxyURLString`.
-    static let mirrorBootstrapURLString =
-        "https://us-central1-spilr-100f7.cloudfunctions.net/bootstrapMirror"
+    static var mirrorBootstrapURLString: String { TestLaunchConfig.functionsBaseURL + "/bootstrapMirror" }
 
     /// The on-demand derived-layer recompute for an account that already
     /// exists but has no `derived/facts` yet — see `functions/index.js`
@@ -56,8 +54,7 @@ final class AIService {
     /// `refreshDerived(userId:)`. Unlike `bootstrapMirror`, this is pure
     /// arithmetic — no `GEMINI_KEY`, no model cost — so it's safe to call
     /// any time the derived layer is stale or missing, not just once ever.
-    static let refreshDerivedURLString =
-        "https://us-central1-spilr-100f7.cloudfunctions.net/refreshDerived"
+    static var refreshDerivedURLString: String { TestLaunchConfig.functionsBaseURL + "/refreshDerived" }
 
     /// Prompt ASK, server-side (mirror-v3.1-person-model-2026-09-10.md §7) —
     /// see `functions/index.js` `exports.mirrorAsk`. Answers a question about
@@ -65,8 +62,22 @@ final class AIService {
     /// raw entries client-side. Replaces AskView's old on-device retrieval +
     /// client-built prompt (engineering-decisions §1: the client sends
     /// structured input, never a prompt).
-    static let mirrorAskURLString =
-        "https://us-central1-spilr-100f7.cloudfunctions.net/mirrorAsk"
+    static var mirrorAskURLString: String { TestLaunchConfig.functionsBaseURL + "/mirrorAsk" }
+
+    /// Account deletion — see `functions/index.js` `exports.deleteAccount` and
+    /// `AuthService.deleteAccount`. Nothing to do with AI; it lives here
+    /// because this is where every Cloud Function URL for the app is declared,
+    /// and splitting one out would make the set harder to keep in step with a
+    /// project or region change.
+    static var deleteAccountURLString: String { TestLaunchConfig.functionsBaseURL + "/deleteAccount" }
+
+    /// Branded verify / reset-password emails — see `functions/index.js`
+    /// `exports.sendAuthEmail` and `AuthService.sendAuthEmailViaServer`.
+    static var sendAuthEmailURLString: String { TestLaunchConfig.functionsBaseURL + "/sendAuthEmail" }
+
+    /// Owners-only push self-test — see `functions/index.js` `exports.sendTestPush`
+    /// and Profile → Developer.
+    static var sendTestPushURLString: String { TestLaunchConfig.functionsBaseURL + "/sendTestPush" }
 
     /// AI is available when the user is signed in AND has given consent for
     /// their journal text to be sent to Google Gemini (Guideline 5.1.2(i)).
@@ -202,16 +213,31 @@ final class AIService {
             // checkAIBudget in functions/index.js) — distinct from a generic HTTP
             // failure so callers can tell the user AI is paused rather than silently
             // swapping in a fallback that looks like a normal reply.
-            if http.statusCode == 402 { throw AIError.budgetExceeded }
+            if http.statusCode == 402 {
+                Self.handlePaymentRequired(data)
+                throw AIError.budgetExceeded
+            }
             throw AIError.httpError(http.statusCode, String(data: data, encoding: .utf8) ?? "")
         }
         return data
     }
 
+    /// A 402 from any Cloud Function means the Spilr Pro gate said no. The
+    /// body's `reason` says whether that's "free preview over" (show the
+    /// paywall) or "paying user hit today's cap" (don't) — see
+    /// `EntitlementService.noteAIBudgetExceeded`.
+    static func handlePaymentRequired(_ data: Data) {
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let reason = json?["reason"] as? String
+        Task { @MainActor in
+            EntitlementService.shared.noteAIBudgetExceeded(reason: reason)
+        }
+    }
+
     // MARK: - Generate insights
     func generateInsights(from text: String) async throws -> JournalInsights {
         guard isAIAvailable else { throw AIError.aiUnavailable }
-        guard text.count > 20 else { throw AIError.textTooShort }
+        guard text.count > 20, !LocalAI.isLowContent(text) else { throw AIError.textTooShort }
 
         let startTime = Date()
 
@@ -225,14 +251,20 @@ final class AIService {
           MOVE from the rule above (tension / underneath / absence / reframe / pattern).
           A bullet that restates a sentence from the entry is WRONG — rewrite it until
           it says something the user did not already write.
+        "anchors": array of EXACTLY 2 short strings, one per bullet in the same order,
+          each a phrase of 3-10 words COPIED VERBATIM from the journal entry below that
+          the matching bullet is grounded in. If you can't point to real words in the
+          entry that justify a bullet, rewrite the bullet until you can — an invented
+          or paraphrased anchor is worse than a plainer bullet.
         "question": ONE sharp, specific question grounded in this entry, with a little
           edge — not a soft generic prompt. Max ~120 chars.
         "sentiment": exactly one of: Anxious, Excited, Happy, Sad, Frustrated, Calm,
           Hopeful, Uncertain, Tired, Grateful, Lonely, Proud, Reflective.
           Use the single most fitting label. Do NOT invent labels outside this list.
 
-        Before you answer, silently test each bullet: "could I have written this just by
-        re-reading their entry?" If yes, replace it.
+        Before you answer, silently test each bullet: (1) "could I have written this
+        just by re-reading their entry?" — if yes, replace it. (2) "is my anchor an
+        exact quote from the entry, not a paraphrase?" — if no, fix the anchor or bullet.
         \(MemoryProfileService.shared.cachedPromptContext())
 
         Journal entry:
@@ -244,8 +276,8 @@ final class AIService {
         """
 
         do {
-            let data = try await generate(prompt: prompt, maxTokens: 300, temperature: 0.4, surface: "journal_insights")
-            let insights = try parseGeminiResponse(data)
+            let data = try await generate(prompt: prompt, maxTokens: 350, temperature: 0.4, surface: "journal_insights")
+            let insights = try parseGeminiResponse(data, sourceText: text)
 
             let latency = Date().timeIntervalSince(startTime)
             await AnalyticsManager.shared.trackAIInsightsGenerated(
@@ -263,7 +295,7 @@ final class AIService {
     }
 
     // MARK: - Response parsing
-    private func parseGeminiResponse(_ data: Data) throws -> JournalInsights {
+    private func parseGeminiResponse(_ data: Data, sourceText: String) throws -> JournalInsights {
         // Gemini wraps the JSON string inside candidates[0].content.parts[0].text
         let (text, _) = try Self.parseTextCandidate(data)
         guard
@@ -271,15 +303,41 @@ final class AIService {
             let json     = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
         else { throw AIError.parseError }
 
-        let bullets   = json["bullets"] as? [String] ?? []
-        let question  = json["question"] as? String ?? ""
+        let rawBullets = json["bullets"] as? [String] ?? []
+        let anchors    = json["anchors"] as? [String] ?? []
+        let question   = json["question"] as? String ?? ""
         // The model occasionally returns an off-list word (e.g. "Receptive").
         // Clamp it to the known vocabulary so cards show consistent labels.
-        let sentiment = LocalAI.normalizedSentiment(json["sentiment"] as? String) ?? "Reflective"
+        let sentiment  = LocalAI.normalizedSentiment(json["sentiment"] as? String) ?? "Reflective"
+
+        // Grounding check: the system prompt already forbids inventing facts, but
+        // nothing verified the model actually complied. Drop any bullet whose
+        // anchor isn't a real quote from the entry rather than trusting it blindly.
+        let normalizedSource = " \(Self.normalizeForContainment(sourceText)) "
+        let bullets: [String] = rawBullets.enumerated().compactMap { index, bullet in
+            guard index < anchors.count else { return nil }
+            let normalizedAnchor = " \(Self.normalizeForContainment(anchors[index])) "
+            guard normalizedSource.contains(normalizedAnchor) else { return nil }
+            return bullet
+        }
 
         guard !bullets.isEmpty, !question.isEmpty else { throw AIError.parseError }
 
         return JournalInsights(bullets: bullets, question: question, sentiment: sentiment)
+    }
+
+    /// Lowercases and collapses `text` to alphanumeric tokens separated by single
+    /// spaces, so an anchor phrase can be checked for containment in the source
+    /// entry without punctuation, casing, or whitespace differences causing a
+    /// false negative on a genuinely verbatim quote.
+    private static func normalizeForContainment(_ text: String) -> String {
+        let cleaned = text.lowercased().unicodeScalars.map { scalar -> Character in
+            CharacterSet.alphanumerics.contains(scalar) ? Character(scalar) : " "
+        }
+        return String(cleaned)
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
     }
 }
 

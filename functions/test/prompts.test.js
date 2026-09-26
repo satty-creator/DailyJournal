@@ -45,9 +45,7 @@ test("buildMirrorMPrompt carries the shape rules and the exact BAD/GOOD example"
   });
   assert.ok(p.includes("ITEM_MARKER") && p.includes("QUOTE_MARKER") && p.includes("Q_MARKER"));
   assert.ok(p.includes('"shape": "SIGNATURE"'));
-  assert.ok(p.includes("would_be_false_if"));
   assert.ok(p.includes("An empty day turns into a project"));
-  assert.ok(p.includes("SWAP TEST"));
 });
 
 test("buildAskPrompt quotes the user's question and cites the do-not-infer guard", () => {

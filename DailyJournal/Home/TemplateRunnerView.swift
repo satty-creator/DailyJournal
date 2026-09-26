@@ -7,11 +7,15 @@
 //  last step it weaves the answers (`TemplateRunnerViewModel.buildReview`)
 //  and presents `TemplateReviewView`.
 //
+//  Text steps can be dictated as well as typed — the same `SpeechManager` the
+//  Spill and Journal composers use. See `micButton`.
+//
 //  Presented as a `fullScreenCover` from `HomeView`, alongside Spill and
-//  Daily Chat — see `StartChoice.template` and `HomeView.handlePendingStart`.
+//  Daily Chat — see `HomeView`'s templates gallery sheet.
 //
 
 import SwiftUI
+import UIKit
 
 struct TemplateRunnerView: View {
 
@@ -21,18 +25,22 @@ struct TemplateRunnerView: View {
     /// Called (before `dismiss()`) on every way out of the runner that is
     /// NOT a completed save — the X button with no answers yet, "Save for
     /// later", "Discard answers", and the review screen's "Discard". The
-    /// gallery this template was picked from (`TemplateGalleryView`, pushed
-    /// on the start sheet's own `NavigationStack`) is already gone by the
-    /// time this view is on screen — see `HomeView.handlePendingStart` — so
-    /// without this callback every exit lands on Home instead of back where
-    /// the user was browsing. A completed save still goes to Home, same as
-    /// every other composer.
+    /// gallery this template was picked from (`TemplateGalleryView`, a sheet
+    /// off the invitation card) is already dismissed by the time this view is
+    /// on screen — so without this callback every exit lands on Home instead
+    /// of back where the user was browsing. A completed save still goes to
+    /// Home, same as every other composer.
     let onExitWithoutSaving: () -> Void
 
     @Environment(\.dismiss) private var dismiss
     @StateObject private var vm: TemplateRunnerViewModel
     @FocusState private var isFocused: Bool
     @State private var showExitConfirm = false
+    /// Voice dictation for `.text` steps. A `.choice` or `.scale` step has
+    /// nothing to dictate into, so the mic is only rendered on text steps and
+    /// the transcript mirror below bails on any other kind.
+    @StateObject private var speech = SpeechManager()
+    @State private var micError: String?
     /// Transient "Draft restored" note — mirrors `SpillWriteView`'s
     /// `showDraftRestored`, shown once when `vm.didRestoreDraft` is true.
     @State private var showDraftRestored = false
@@ -81,6 +89,17 @@ struct TemplateRunnerView: View {
                 }
             }
         }
+        // Mirror the live transcript into the current step's answer as the
+        // person speaks. Guard on isRecording so a stale `liveText` from a
+        // finished session can't overwrite text typed after the mic stopped —
+        // the same guard `SpillWriteView` uses.
+        .onChange(of: speech.liveText) { _, live in
+            guard speech.isRecording else { return }
+            guard case .text = vm.currentStep.kind else { return }
+            textBinding().wrappedValue = live
+        }
+        .onChange(of: speech.errorMessage) { _, message in micError = message }
+        .onDisappear { speech.stop() }
         .sheet(isPresented: $vm.showReview) {
             TemplateReviewView(
                 template: template,
@@ -116,6 +135,20 @@ struct TemplateRunnerView: View {
         } message: {
             Text("Pick up where you left off later, or clear your answers now.")
         }
+        .alert("Microphone unavailable", isPresented: Binding(
+            get: { micError != nil },
+            set: { if !$0 { micError = nil } }
+        )) {
+            Button("Open Settings") {
+                micError = nil
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
+                }
+            }
+            Button("OK", role: .cancel) { micError = nil }
+        } message: {
+            Text(micError ?? "")
+        }
     }
 
     private var draftRestoredBanner: some View {
@@ -137,6 +170,7 @@ struct TemplateRunnerView: View {
     private var header: some View {
         HStack {
             Button {
+                speech.stop()
                 isFocused = false
                 if vm.hasAnyAnswer {
                     showExitConfirm = true
@@ -282,6 +316,45 @@ struct TemplateRunnerView: View {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .stroke(AppTheme.inkSoft.opacity(0.12), lineWidth: 1)
         )
+        .overlay(alignment: .bottomTrailing) {
+            micButton.padding(10)
+        }
+    }
+
+    /// Voice → live transcription into the current text step. Sized down from
+    /// `SpillWriteView`'s floating-bar mic (46/58) because this one sits inside
+    /// the editor card rather than on a bar of its own, and mustn't compete
+    /// with the sticky footer's primary action.
+    private var micButton: some View {
+        Button {
+            // Snapshot BEFORE dismissing the keyboard — `isFocused = false` can
+            // trigger a pending autocorrect commit that would race the async
+            // task and corrupt the existingText snapshot (see SpillWriteView).
+            let snapshot = textBinding().wrappedValue
+            isFocused = false
+            Task { await speech.toggle(existingText: snapshot) }
+        } label: {
+            ZStack {
+                if speech.isRecording {
+                    Circle()
+                        .stroke(AppTheme.terracotta.opacity(0.4), lineWidth: 3)
+                        .frame(width: 52, height: 52)
+                        .scaleEffect(speech.isRecording ? 1.12 : 1.0)
+                        .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true),
+                                   value: speech.isRecording)
+                }
+                Circle()
+                    .fill(speech.isRecording ? AppTheme.terracotta : AppTheme.ink)
+                    .frame(width: 40, height: 40)
+                    .shadow(color: AppTheme.cardShadow, radius: 6, x: 0, y: 3)
+                Image(systemName: speech.isRecording ? "stop.fill" : "mic.fill")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(AppTheme.cream)
+            }
+            .frame(width: 52, height: 52)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(speech.isRecording ? "Stop recording" : "Answer by talking")
     }
 
     // MARK: - Choice control
@@ -386,6 +459,9 @@ struct TemplateRunnerView: View {
             HStack(spacing: 10) {
                 if vm.stepIndex > 0 {
                     Button {
+                        // The step's `.id(vm.stepIndex)` swaps the text field out
+                        // from under a live session — end it before moving.
+                        speech.stop()
                         isFocused = false
                         vm.back()
                     } label: {
@@ -402,6 +478,10 @@ struct TemplateRunnerView: View {
                 }
 
                 Button {
+                    // Also covers the last step, where advance() opens the
+                    // review sheet: its own SpeechManager can't share the audio
+                    // session with one that's still running here.
+                    speech.stop()
                     isFocused = false
                     vm.advance()
                 } label: {

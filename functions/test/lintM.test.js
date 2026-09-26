@@ -13,7 +13,7 @@ const assert = require("node:assert");
 
 const {
   lintMirrorLineText, lintMirrorM, findCategoryOrClinical, concretenessCheck,
-  figurativeHits, swapTestFails,
+  figurativeHits,
 } = require("../lib/lint");
 
 // A plausible top-200 vocabulary for the account §2/§3 are built from.
@@ -44,15 +44,6 @@ test("§2 shipped: 'An empty day turns into a project...' passes every rule", ()
 });
 
 /* ── the seven ways a line goes wrong (§2 table) ─────────────────────────── */
-
-test("category instead of action: 'you build something' fails the swap test", () => {
-  const r = lintMirrorLineText(
-    "On a day with nothing in it, you build something to fill it.",
-    { vocabTop200: VOCAB }
-  );
-  assert.equal(r.ok, false);
-  assert.equal(r.rule, 9, "true of thousands of other users once stripped — Barnum by construction");
-});
 
 test("findCategoryOrClinical: the category-noun and soft-clinical lists (rule 4's own check)", () => {
   assert.equal(findCategoryOrClinical("Keeps the nervous system revved up."), "nervous system");
@@ -144,40 +135,17 @@ test("rule 6: the label form fails, but plain second person does not", () => {
   assert.notEqual(plainSecondPerson.rule, 6, "second person itself is required, not banned");
 });
 
-test("rule 9: the swap test kills a line that is true of anyone once quotes/names/numbers are stripped", () => {
-  const barnum = lintMirrorLineText(
-    "Sometimes a day feels empty and you find something to fill it with.",
-    { vocabTop200: VOCAB }
-  );
-  assert.equal(barnum.ok, false);
-  assert.equal(barnum.rule, 9);
-});
-
 /* ── lintMirrorM: the full Prompt M output contract ──────────────────────── */
 
-test("lintMirrorM: the §2 shipped line with a real question and would_be_false_if passes whole", () => {
+test("lintMirrorM: the §2 shipped line with a real question passes whole", () => {
   const output = {
     line: "An empty day turns into a project. Six of six since the job ended — and not the two nights you wrote 'lucky and loved'.",
     shape: "SIGNATURE",
     receipt: { quote: "honestly just lucky and loved tonight", date: "2026-09-05" },
     question: "When Dan brings it up, do you reach for a feeling first, or a list?",
-    would_be_false_if: "an empty day that did not turn into a project, with no exception",
   };
   const r = lintMirrorM(output, { receiptQuote: output.receipt.quote, vocabTop200: VOCAB });
   assert.equal(r.ok, true, JSON.stringify(r));
-});
-
-test("lintMirrorM: a null would_be_false_if is a hard fail even if the line itself passes", () => {
-  const output = {
-    line: "An empty day turns into a project. Six of six since the job ended — and not the two nights you wrote 'lucky and loved'.",
-    shape: "SIGNATURE",
-    receipt: { quote: "honestly just lucky and loved tonight" },
-    question: "When Dan brings it up, do you reach for a feeling first, or a list?",
-    would_be_false_if: null,
-  };
-  const r = lintMirrorM(output, { receiptQuote: output.receipt.quote, vocabTop200: VOCAB });
-  assert.equal(r.ok, false);
-  assert.equal(r.reason, "no_would_be_false_if");
 });
 
 test("lintMirrorM: an EXCEPTION shape may end without a question", () => {
@@ -186,7 +154,6 @@ test("lintMirrorM: an EXCEPTION shape may end without a question", () => {
     shape: "EXCEPTION",
     receipt: { quote: "being held" },
     question: null,
-    would_be_false_if: "a heavy day with no project and no one present",
   };
   const r = lintMirrorM(output, { receiptQuote: output.receipt.quote, vocabTop200: VOCAB });
   assert.equal(r.ok, true, JSON.stringify(r));
@@ -198,7 +165,6 @@ test("lintMirrorM: a non-exception shape with no question fails — last clause 
     shape: "SIGNATURE",
     receipt: { quote: "an empty day" },
     question: null,
-    would_be_false_if: "an empty day that did not turn into a project",
   };
   const r = lintMirrorM(output, { receiptQuote: "empty day", vocabTop200: VOCAB });
   assert.equal(r.ok, false);

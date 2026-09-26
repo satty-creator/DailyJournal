@@ -163,6 +163,12 @@ enum FirestoreSchema {
     /// lives at `derived/personModel`, alongside `derived/facts`.
     static let personModel = "personModel"
 
+    /// The audit trail for Daily Chat's write-back into the Person Model /
+    /// LifeContext — one doc per applied op, with the verbatim quote that
+    /// licensed it, listed and undoable in "What changed" (SelfModelView).
+    /// Client-written (`SelfModelService.recordModelOp`). See ModelOp.swift.
+    static let modelOps = "modelOps"
+
     /// Every user subcollection this app has ever written to.
     ///
     /// Account deletion walks this list. Order is irrelevant. Retired collections
@@ -193,6 +199,7 @@ enum FirestoreSchema {
         observations,
         readings,
         personModel,
+        modelOps,
     ]
 
     // MARK: - Storage

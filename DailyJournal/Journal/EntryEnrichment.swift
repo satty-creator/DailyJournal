@@ -35,6 +35,17 @@ enum EntryEnrichment {
         // session counter either — both are gated on the same "is this
         // actually new" signal rather than two separate flags.
         extractEcho: Bool = true,
+        // What the entry was and what it carried, for the `entry_created`
+        // event logged below. Every composer knows all three at the point it
+        // calls this; none of them reliably logged the event when each owned
+        // its own call. Optional so an existing caller that passes no
+        // `sessionType` simply doesn't log — there is no such caller today.
+        sessionType: SessionType? = nil,
+        mood: Mood? = nil,
+        // When composition actually began, for composers that track it. Left
+        // nil rather than guessed: the parameter is omitted from the event
+        // instead of reporting a zero that looks like a real measurement.
+        composedFrom: Date? = nil,
         // Typed passthrough for a guided-template entry (Phase 5 — typed
         // template fields). Nil for every non-template composer.
         templateId: String? = nil,
@@ -43,6 +54,27 @@ enum EntryEnrichment {
     ) {
         if extractEcho {
             SessionManager.shared.recordEntryWritten()
+
+            // `entry_created` — the activation event, logged on the one code
+            // path every composer already takes. It used to be each composer's
+            // own responsibility and two of the four never did it:
+            // `TimedSessionViewModel` (the spill flow) and `DailyChatView`
+            // both saved the entry and logged nothing.
+            //
+            // `extractEcho` is already this function's "is this a genuinely
+            // new entry" signal, so re-saving an edit through the editor
+            // doesn't count as a new entry here either — same gate, one
+            // meaning.
+            if let sessionType {
+                AnalyticsManager.shared.trackEntryCreated(
+                    sessionType: sessionType.analyticsName,
+                    wordCount: text.split(separator: " ").count,
+                    hasMood: mood != nil,
+                    hasPhoto: photo != nil,
+                    aiAvailable: AIService.shared.isAIAvailable,
+                    compositionSeconds: composedFrom.map { Int(Date().timeIntervalSince($0)) }
+                )
+            }
         }
 
         Task.detached(priority: .utility) {

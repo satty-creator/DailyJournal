@@ -11,6 +11,12 @@
 //  document exists so the raw conversation survives being backgrounded, not so
 //  a server could ever read it.
 //
+//  Formerly carried a `mode` field (Casual Vent vs Thought Journal, retired).
+//  Deliberately NOT read back in `init?(from:)` below — a document written by an
+//  older build still carries `mode: "normal"` or `mode: "cbt"`, and requiring
+//  that field to decode would make every one of those documents unresumable.
+//  It's simply ignored.
+//
 
 import Foundation
 import FirebaseFirestore
@@ -19,7 +25,6 @@ struct ChatSession: Identifiable {
 
     let id: String
     let userId: String
-    let mode: ChatMode
     var messages: [ChatMessage]
     let startedAt: Date
     var updatedAt: Date
@@ -34,7 +39,6 @@ struct ChatSession: Identifiable {
     init(
         id: String = UUID().uuidString,
         userId: String,
-        mode: ChatMode,
         messages: [ChatMessage],
         startedAt: Date = Date(),
         updatedAt: Date = Date(),
@@ -42,7 +46,6 @@ struct ChatSession: Identifiable {
     ) {
         self.id = id
         self.userId = userId
-        self.mode = mode
         self.messages = messages
         self.startedAt = startedAt
         self.updatedAt = updatedAt
@@ -55,8 +58,6 @@ struct ChatSession: Identifiable {
         guard
             let id            = data["id"]        as? String,
             let userId        = data["userId"]    as? String,
-            let modeRaw       = data["mode"]      as? String,
-            let mode          = ChatMode(rawValue: modeRaw),
             let startedAt     = (data["startedAt"] as? Timestamp)?.dateValue(),
             let updatedAt     = (data["updatedAt"] as? Timestamp)?.dateValue(),
             let encryptedTranscript = data["transcript"] as? String,
@@ -67,7 +68,6 @@ struct ChatSession: Identifiable {
 
         self.id           = id
         self.userId       = userId
-        self.mode         = mode
         self.messages     = messages
         self.startedAt    = startedAt
         self.updatedAt    = updatedAt
@@ -94,7 +94,6 @@ struct ChatSession: Identifiable {
         var data: [String: Any] = [
             "id": id,
             "userId": userId,
-            "mode": mode.rawValue,
             "transcript": encryptedTranscript,
             "encrypted": true,
             "turnCount": turnCount,

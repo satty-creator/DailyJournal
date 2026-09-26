@@ -191,7 +191,7 @@ struct CollageTileView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             LinearGradient(
-                colors: [entry.accentColor, entry.accentColor.mix(with: AppTheme.cream, by: 0.45)],
+                colors: [entry.accentColor, entry.accentColor.blended(with: AppTheme.cream, amount: 0.45)],
                 startPoint: .topLeading, endPoint: .bottomTrailing
             )
         )

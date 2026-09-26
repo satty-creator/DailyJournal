@@ -9,10 +9,12 @@
 //
 //  "Your words stay primary" here means literally that: the woven prose is
 //  editable, and Save persists whatever's in the box, not the original AI
-//  output — see `TemplateRunnerViewModel.save(finalText:)`.
+//  output — see `TemplateRunnerViewModel.save(finalText:)`. It can be dictated
+//  as well as typed, same as the runner's text steps.
 //
 
 import SwiftUI
+import UIKit
 
 struct TemplateReviewView: View {
 
@@ -28,6 +30,12 @@ struct TemplateReviewView: View {
     /// so the button needs to go inert on the first tap, not just once
     /// `vm.save` returns (see A2).
     @State private var isSaving = false
+    /// This sheet has its own lifecycle, so it owns its own `SpeechManager`
+    /// rather than borrowing the runner's. `TemplateRunnerView` stops its
+    /// recorder in the footer action that opens this sheet, so only one is ever
+    /// holding the audio session.
+    @StateObject private var speech = SpeechManager()
+    @State private var micError: String?
 
     /// Bound straight to `vm.wovenPreview` (no local `@State` copy) so an
     /// edit survives going back to a question and returning — see A1.
@@ -48,6 +56,8 @@ struct TemplateReviewView: View {
                         proseEditor
                         answersSection
                         frameworkCard
+
+                        PhotoAttachCard(image: $vm.attachedPhoto)
 
                         saveButton
 
@@ -79,12 +89,35 @@ struct TemplateReviewView: View {
         }
         .alert("Discard this entry?", isPresented: $showDiscardConfirm) {
             Button("Discard", role: .destructive) {
+                speech.stop()
                 vm.discard()
                 onDiscard()
             }
             Button("Keep editing", role: .cancel) {}
         } message: {
             Text("This entry won't be saved.")
+        }
+        // Guarded on isRecording so a stale liveText can't overwrite an edit
+        // made after the mic stopped — same as the runner and SpillWriteView.
+        .onChange(of: speech.liveText) { _, live in
+            guard speech.isRecording else { return }
+            vm.wovenPreview = live
+        }
+        .onChange(of: speech.errorMessage) { _, message in micError = message }
+        .onDisappear { speech.stop() }
+        .alert("Microphone unavailable", isPresented: Binding(
+            get: { micError != nil },
+            set: { if !$0 { micError = nil } }
+        )) {
+            Button("Open Settings") {
+                micError = nil
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
+                }
+            }
+            Button("OK", role: .cancel) { micError = nil }
+        } message: {
+            Text(micError ?? "")
         }
     }
 
@@ -163,6 +196,39 @@ struct TemplateReviewView: View {
                 RoundedRectangle(cornerRadius: 20, style: .continuous)
                     .stroke(AppTheme.terracotta.opacity(0.25), lineWidth: 1.5)
             )
+            .overlay(alignment: .bottomTrailing) {
+                micButton.padding(10)
+            }
+    }
+
+    /// Voice → live transcription appended onto the woven prose. Same face and
+    /// sizing as `TemplateRunnerView.micButton`.
+    private var micButton: some View {
+        Button {
+            let snapshot = vm.wovenPreview
+            Task { await speech.toggle(existingText: snapshot) }
+        } label: {
+            ZStack {
+                if speech.isRecording {
+                    Circle()
+                        .stroke(AppTheme.terracotta.opacity(0.4), lineWidth: 3)
+                        .frame(width: 52, height: 52)
+                        .scaleEffect(speech.isRecording ? 1.12 : 1.0)
+                        .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true),
+                                   value: speech.isRecording)
+                }
+                Circle()
+                    .fill(speech.isRecording ? AppTheme.terracotta : AppTheme.ink)
+                    .frame(width: 40, height: 40)
+                    .shadow(color: AppTheme.cardShadow, radius: 6, x: 0, y: 3)
+                Image(systemName: speech.isRecording ? "stop.fill" : "mic.fill")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(AppTheme.cream)
+            }
+            .frame(width: 52, height: 52)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(speech.isRecording ? "Stop recording" : "Add to this by talking")
     }
 
     // MARK: - Your answers
@@ -205,11 +271,15 @@ struct TemplateReviewView: View {
             Text(template.evidence.pill)
                 .font(.system(size: 13, weight: .bold, design: .rounded))
                 .foregroundStyle(AppTheme.ink)
-            Text(template.evidence.blurb)
-                .font(AppTheme.editorialBody(size: 12.5))
-                .foregroundStyle(AppTheme.inkSoft)
-                .lineSpacing(2)
-            if !template.evidence.sources.isEmpty {
+            // Practice templates show the pill only — their blurb is a
+            // disclaimer, not a citation, and reads badly right before Save.
+            if template.evidence.kind == .clinical {
+                Text(template.evidence.blurb)
+                    .font(AppTheme.editorialBody(size: 12.5))
+                    .foregroundStyle(AppTheme.inkSoft)
+                    .lineSpacing(2)
+            }
+            if template.evidence.kind == .clinical, !template.evidence.sources.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(template.evidence.sources) { source in
                         Link(source.label, destination: source.url)
@@ -229,6 +299,9 @@ struct TemplateReviewView: View {
     private var saveButton: some View {
         Button {
             guard !isSaving else { return }
+            // Stop first: `trimmed` reads `vm.wovenPreview`, and a transcript
+            // landing mid-save would be a silent edit to what gets persisted.
+            speech.stop()
             isSaving = true
             vm.save(finalText: trimmed)
             UINotificationFeedbackGenerator().notificationOccurred(.success)

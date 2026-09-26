@@ -8,6 +8,10 @@
 	<array>
 		<string>Default</string>
 	</array>
+	<key>com.apple.developer.associated-domains</key>
+	<array>
+		<string>applinks:spilr-100f7.web.app</string>
+	</array>
 	<key>com.apple.developer.devicecheck.appattest-environment</key>
 	<string>development</string>
 </dict>

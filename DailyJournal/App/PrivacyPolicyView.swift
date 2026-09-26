@@ -34,7 +34,7 @@ struct PrivacyPolicyView: View {
 
     /// Update whenever the substance changes. Shown to the user so they can tell
     /// which version they read.
-    static let lastUpdated = "13 August 2026"
+    static let lastUpdated = "18 September 2026"
 
     var body: some View {
         ZStack {
@@ -85,7 +85,18 @@ struct PrivacyPolicyView: View {
                         Your account details. Email address, display name, sign-in method, time zone, \
                         and the notification token for your device.
 
-                        That is the whole list. We do not collect your contacts, your location, your \
+                        Your Google Calendar, if you connect it. This is entirely optional and off by \
+                        default. If you connect it, the app reads your primary calendar's event \
+                        titles, times, and locations, directly from Google, to show them to you in \
+                        Spilr's own Calendar view. We request read-only access and never create, edit, \
+                        or delete anything on your calendar. This data is not stored on our servers \
+                        and not sent to any AI — it's fetched live from Google each time you open the \
+                        Calendar view, and only stays in memory on your device. You can disconnect at \
+                        any time from Settings, or revoke access entirely from your Google Account's \
+                        permissions page.
+
+                        That is the whole list. We do not collect your contacts, your location \
+                        (beyond what you've chosen to put in a connected calendar event), your \
                         health data, or your activity in other apps.
                         """
                     )

@@ -76,11 +76,10 @@ final class TimedSessionViewModel: ObservableObject {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        // Step 1 – save with local heuristics immediately (no await)
+        // Step 1 – save immediately (no await). Sentiment and tags are derived
+        // data and stay local; reflection is AI-only and is left unset until
+        // step 2 patches it in. See CLAUDE.md, "No local text in Spilr's voice".
         let sentiment  = LocalAI.detectSentiment(from: trimmed)
-        let reflection = SpilrVoice.localReflection(from: trimmed, sentiment: sentiment)
-        let bullets    = reflection.observations
-        let question   = reflection.question
 
         if let mood {
             AnalyticsManager.shared.trackMoodLogged(mood: mood.rawValue)
@@ -99,8 +98,6 @@ final class TimedSessionViewModel: ObservableObject {
             mood: mood,
             tags: mergedTags,
             sessionType: .timed,
-            aiSummaryBullets: bullets,
-            aiQuestion: question,
             sentimentLabel: sentiment
         )
         savedEntry = entry
@@ -116,7 +113,9 @@ final class TimedSessionViewModel: ObservableObject {
             entryCreatedAt: entry.createdAt,
             text: trimmed,
             photo: photo,
-            service: service
+            service: service,
+            sessionType: .timed,
+            mood: mood
         )
     }
 }

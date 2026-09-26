@@ -75,6 +75,11 @@ service cloud.firestore {
       match /entryAnalyses/{docId}       { allow write: if isOwner(userId); }
       match /events/{docId}              { allow write: if isOwner(userId); }
       match /profileCorrections/{docId}  { allow write: if isOwner(userId); }
+      // The audit trail for Daily Chat's write-back into the model (see
+      // AIService+Chat.extractModelOps + SelfModelService.recordModelOp) —
+      // client-owned like profileCorrections, since it's the user's own
+      // record of what a conversation changed and each row is undoable.
+      match /modelOps/{docId}            { allow write: if isOwner(userId); }
       match /lifeContext/{docId}         { allow write: if isOwner(userId); }
       match /stylePreferences/{docId}    { allow write: if isOwner(userId); }
       match /mirrorShown/{docId}         { allow write: if isOwner(userId); }

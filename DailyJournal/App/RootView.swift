@@ -5,6 +5,7 @@
 
 import SwiftUI
 import AuthenticationServices
+import UserNotifications
 
 // MARK: - Root
 struct RootView: View {
@@ -20,6 +21,15 @@ struct RootView: View {
     /// was added (aiConsentGranted key is absent in their UserDefaults).
     @State private var showRetroConsentSheet = false
 
+    /// True when the returning-user calendar-connect sheet should be shown.
+    /// DISABLED for now — nothing sets this to true — because the Google
+    /// Calendar OAuth app is unverified and connecting doesn't actually work
+    /// for real users yet. To revive once verification clears: in `onAppear`
+    /// below, show it when `!UserDefaults.standard.calendarConsentAsked`
+    /// (chained after the AI consent sheet's `onDismiss`, as before, so only
+    /// one sheet shows per launch).
+    @State private var showRetroCalendarSheet = false
+
     var body: some View {
         Group {
             switch authViewModel.authState {
@@ -33,11 +43,18 @@ struct RootView: View {
                         .sheet(isPresented: $showRetroConsentSheet) {
                             RetroAIConsentSheet(isPresented: $showRetroConsentSheet)
                         }
+                        // Wiring kept, just never triggered below — see the
+                        // disabled-calendar-connect note on `showRetroCalendarSheet`.
+                        .sheet(isPresented: $showRetroCalendarSheet) {
+                            RetroCalendarConnectSheet(isPresented: $showRetroCalendarSheet)
+                        }
                         .onAppear {
                             // Show once for users who never saw the consent screen.
                             if UserDefaults.standard.aiConsentGranted == nil {
                                 showRetroConsentSheet = true
                             }
+                            // Calendar retro-prompt intentionally not triggered —
+                            // see the note on `showRetroCalendarSheet` above.
                         }
                 } else {
                     OnboardingView {
@@ -54,6 +71,8 @@ struct RootView: View {
         }
         .animation(.easeInOut(duration: 0.4), value: authViewModel.authState)
         .animation(.easeInOut(duration: 0.4), value: onboardingCompleted)
+        // UI tests only: `-UITestSignIn email:password` (no-op otherwise).
+        .task { await TestLaunchConfig.signInIfRequested() }
         // Re-identify the whole tree when the theme changes so every screen that
         // reads `AppTheme.*` rebuilds with the new palette. `AppTheme.active` is
         // already updated by ThemeManager before this runs.
@@ -87,7 +106,12 @@ struct RetroAIConsentSheet: View {
 
                     // Consent card — same design as onboarding step
                     VStack(alignment: .leading, spacing: 16) {
-                        Text("Spilr uses advanced AI models to analyze your mood patterns and give you personalized reflections. To do this, your text is securely processed by our third-party AI partners.")
+                        // Deliberately generic: naming the model vendor and the
+                        // hosting stack here read as alarming rather than
+                        // reassuring. The specifics (who processes the text, and
+                        // under what terms) live in the Privacy Policy, which is
+                        // where a user looking for them expects to find them.
+                        Text("Spilr uses AI to notice patterns in what you write and turn them into reflections. To do that, your entry text is sent securely for processing.")
                             .font(AppTheme.editorialBody(size: 15))
                             .foregroundStyle(AppTheme.inkSoft)
                             .lineSpacing(4)
@@ -97,7 +121,7 @@ struct RetroAIConsentSheet: View {
                             withAnimation(.easeInOut(duration: 0.25)) { showDetails.toggle() }
                         } label: {
                             HStack(spacing: 4) {
-                                Text("View AI Partners & Data Details")
+                                Text("What gets used, and how")
                                     .font(.system(size: 14, weight: .medium))
                                     .foregroundStyle(AppTheme.terracotta)
                                 Image(systemName: showDetails ? "chevron.up" : "chevron.down")
@@ -109,11 +133,11 @@ struct RetroAIConsentSheet: View {
 
                         if showDetails {
                             VStack(alignment: .leading, spacing: 12) {
-                                detailRow(label: "AI provider",         value: "Google Gemini (via Firebase)")
-                                detailRow(label: "Data sent",           value: "Your journal entry text")
-                                detailRow(label: "Purpose",             value: "Reflections, patterns, emotional summaries")
-                                detailRow(label: "Stored server-side?", value: "No — only structured results are saved")
-                                detailRow(label: "Used to train models?", value: "No")
+                                detailRow(label: "What's sent",         value: "The text of your entries")
+                                detailRow(label: "What for",            value: "Reflections, patterns, emotional summaries")
+                                detailRow(label: "Kept after?",         value: "No — only the results come back")
+                                detailRow(label: "Used to train AI?",   value: "No")
+                                detailRow(label: "Full details",        value: "In the Privacy Policy")
                             }
                             .padding(14)
                             .background(AppTheme.cream)
@@ -185,6 +209,86 @@ struct RetroAIConsentSheet: View {
     }
 }
 
+// MARK: - Retro calendar-connect sheet (returning users)
+//
+// Same one-time-ask shape as RetroAIConsentSheet, for users who completed
+// onboarding before the Google Calendar step existed. View-only, optional —
+// declining just dismisses, no AI features are gated on this.
+struct RetroCalendarConnectSheet: View {
+    @Binding var isPresented: Bool
+    @State private var isConnecting = false
+
+    var body: some View {
+        ZStack {
+            AppTheme.paper.ignoresSafeArea()
+            VStack(alignment: .leading, spacing: 28) {
+                Text("See your day\nalongside Spilr.")
+                    .font(AppTheme.editorialDisplay(size: 30))
+                    .foregroundStyle(AppTheme.ink)
+                    .padding(.top, 8)
+
+                VStack(alignment: .leading, spacing: 12) {
+                    Image(systemName: "calendar")
+                        .font(.system(size: 28))
+                        .foregroundStyle(AppTheme.terracotta)
+                    Text("Connect Google Calendar to view your events right inside Spilr. Read-only \u{2014} we never edit or create anything. You can connect or disconnect any time from Profile.")
+                        .font(AppTheme.editorialBody(size: 15))
+                        .foregroundStyle(AppTheme.inkSoft)
+                        .lineSpacing(4)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(18)
+                .background(AppTheme.cream.opacity(0.7))
+                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+
+                Spacer(minLength: 20)
+
+                VStack(spacing: 12) {
+                    Button {
+                        isConnecting = true
+                        Task {
+                            await CalendarService.shared.connect()
+                            UserDefaults.standard.calendarConsentAsked = true
+                            isConnecting = false
+                            isPresented = false
+                        }
+                    } label: {
+                        Text(isConnecting ? "Connecting\u{2026}" : "Connect Google Calendar")
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(AppTheme.cream)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 17)
+                            .background(LinearGradient(colors: [AppTheme.terracotta, AppTheme.terracottaDeep],
+                                                       startPoint: .leading, endPoint: .trailing))
+                            .clipShape(Capsule())
+                            .shadow(color: AppTheme.terracotta.opacity(0.35), radius: 14, x: 0, y: 7)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isConnecting)
+
+                    Button {
+                        UserDefaults.standard.calendarConsentAsked = true
+                        isPresented = false
+                    } label: {
+                        Text("Not now")
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(AppTheme.inkSoft)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 14)
+                            .background(AppTheme.cream.opacity(0.8))
+                            .clipShape(Capsule())
+                            .overlay(Capsule().stroke(AppTheme.inkSoft.opacity(0.2), lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isConnecting)
+                }
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 16)
+        }
+    }
+}
+
 // MARK: - Splash
 struct SplashView: View {
     @State private var opacity: Double = 0
@@ -217,9 +321,11 @@ struct MainTabView: View {
 
     @StateObject private var mirrorVM: MirrorViewModel
 
-    /// Owns tab selection so one tab can send the user to another. Created here
-    /// (the only place that hosts the TabView) and injected into the whole tree.
-    @StateObject private var router = AppRouter()
+    /// Owns tab selection so one tab can send the user to another. `.shared` so
+    /// `PushNotificationManager`'s notification-tap delegate — which fires outside
+    /// any view — can also reach it (see `AppRouter.shared`). Injected into the
+    /// whole tree from here, the only place that hosts the TabView.
+    @StateObject private var router = AppRouter.shared
 
     init() {
         _mirrorVM = StateObject(wrappedValue: MirrorViewModel(userId: ""))
@@ -257,6 +363,33 @@ struct MainTabView: View {
             mirrorVM.setUserId(uid)
             await mirrorVM.load(showSpinner: false)
         }
+        .task {
+            await presentOnboardingPaywallIfPending()
+        }
+    }
+
+    /// The Spilr Pro paywall, once, right after onboarding. Waits for the AI
+    /// consent sheet (shown to every new user on first landing) to be answered
+    /// first, so the two never stack. Push permission is asked after the
+    /// paywall closes, not over it — HomeView holds its own ask while the
+    /// pending flag is set.
+    private func presentOnboardingPaywallIfPending() async {
+        // Claimed before the first `await`, so only one run can ever present.
+        guard PaywallPresenter.hasPendingOnboardingPaywall,
+              !PaywallPresenter.onboardingPaywallClaimed else { return }
+        PaywallPresenter.onboardingPaywallClaimed = true
+        await EntitlementService.shared.refresh()
+        while UserDefaults.standard.aiConsentGranted == nil {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            if Task.isCancelled { PaywallPresenter.onboardingPaywallClaimed = false; return }
+        }
+        // Let the tab view and any just-dismissed sheet settle.
+        try? await Task.sleep(nanoseconds: 800_000_000)
+        if Task.isCancelled { PaywallPresenter.onboardingPaywallClaimed = false; return }
+        PaywallPresenter.present(.onboarding) {
+            PaywallPresenter.hasPendingOnboardingPaywall = false
+            PushNotificationManager.shared.requestAuthorization()
+        }
     }
 }
 
@@ -272,6 +405,62 @@ struct ProfileView: View {
     #if DEBUG
     @State private var debugTokenStatus: String? = nil
     #endif
+    @State private var notificationStatus: UNAuthorizationStatus = .notDetermined
+    @State private var calendarStatus: CalendarService.Status = .notConnected
+    @State private var isConnectingCalendar = false
+
+    private var notificationStatusLabel: String {
+        switch notificationStatus {
+        case .authorized, .provisional, .ephemeral: return "On"
+        case .denied: return "Off — tap to enable"
+        default: return "Turn on"
+        }
+    }
+
+    private var calendarStatusLabel: String {
+        switch calendarStatus {
+        case .connected: return "Connected"
+        case .scopeDenied: return "Reconnect"
+        case .notConnected: return isConnectingCalendar ? "Connecting…" : "Connect"
+        }
+    }
+
+    private var calendarRow: some View {
+        Button {
+            switch calendarStatus {
+            case .notConnected:
+                isConnectingCalendar = true
+                Task {
+                    await CalendarService.shared.connect()
+                    calendarStatus = CalendarService.shared.currentStatus()
+                    isConnectingCalendar = false
+                }
+            case .scopeDenied:
+                // Only Google's own settings can re-grant a declined/revoked
+                // scope — iOS Settings has no bearing on it.
+                if let url = URL(string: "https://myaccount.google.com/permissions") {
+                    UIApplication.shared.open(url)
+                }
+            case .connected:
+                break
+            }
+        } label: {
+            HStack {
+                Label("Google Calendar", systemImage: "calendar")
+                    .font(.system(size: 15))
+                    .foregroundStyle(AppTheme.ink)
+                Spacer()
+                Text(calendarStatusLabel)
+                    .font(AppTheme.mono(size: 12))
+                    .foregroundStyle(AppTheme.inkSoft)
+            }
+        }
+        .disabled(calendarStatus == .connected || isConnectingCalendar)
+        .listRowBackground(AppTheme.cream)
+        .task {
+            calendarStatus = CalendarService.shared.currentStatus()
+        }
+    }
 
     var body: some View {
         NavigationStack {
@@ -310,12 +499,13 @@ struct ProfileView: View {
                     // MARK: Spilr Pro
                     if !authViewModel.isGuest {
                         Section {
-                            if entitlements.isPro {
+                            if entitlements.hasProAccess {
                                 HStack(spacing: 12) {
                                     Image(systemName: "checkmark.seal.fill")
                                         .font(.system(size: 18))
                                         .foregroundStyle(AppTheme.terracotta)
-                                    Text("You're on Spilr Pro")
+                                    Text(entitlements.accessLabel)
+                                        .accessibilityIdentifier("profile.proStatus")
                                         .font(.system(size: 15, weight: .semibold))
                                         .foregroundStyle(AppTheme.ink)
                                 }
@@ -399,6 +589,24 @@ struct ProfileView: View {
                         }
                         .tint(AppTheme.terracotta)
                         .listRowBackground(AppTheme.cream)
+
+                        NavigationLink {
+                            MemoryProfileView(userId: authViewModel.currentUser?.id ?? "")
+                        } label: {
+                            Label("What Spilr remembers", systemImage: "brain")
+                                .font(.system(size: 15))
+                        }
+                        .listRowBackground(AppTheme.cream)
+
+                        calendarRow
+
+                        if calendarStatus == .connected {
+                            Button("Disconnect Google Calendar", role: .destructive) {
+                                CalendarService.shared.disconnect()
+                                calendarStatus = .notConnected
+                            }
+                            .listRowBackground(AppTheme.cream)
+                        }
                     } header: {
                         Text("AI & Privacy")
                             .foregroundStyle(AppTheme.inkSoft)
@@ -408,9 +616,50 @@ struct ProfileView: View {
                         // true; the storage half is not — JournalService writes the
                         // full plaintext `content` to users/{uid}/entries. Corrected
                         // so this doesn't contradict the Privacy Policy two rows down.
-                        Text("When enabled, your entry text is sent to Google Gemini to generate reflections and patterns. Google doesn't use it to train their models. Your entries are saved to your account either way — see Privacy Policy.")
+                        Text("When enabled, your entry text is sent for AI processing to generate reflections and patterns. It's never used to train AI models. Your entries are saved to your account either way — see Privacy Policy.")
                             .font(.caption)
                             .foregroundStyle(AppTheme.inkSoft)
+                    }
+
+                    // MARK: Notifications
+                    Section {
+                        Button {
+                            switch notificationStatus {
+                            case .notDetermined:
+                                PushNotificationManager.shared.requestAuthorization()
+                                Task {
+                                    // The system prompt is synchronous from the
+                                    // user's side but the callback isn't — give it a
+                                    // moment before re-reading status.
+                                    try? await Task.sleep(nanoseconds: 500_000_000)
+                                    notificationStatus = await PushNotificationManager.shared.currentAuthorizationStatus()
+                                }
+                            case .denied:
+                                if let url = URL(string: UIApplication.openSettingsURLString) {
+                                    UIApplication.shared.open(url)
+                                }
+                            default:
+                                break
+                            }
+                        } label: {
+                            HStack {
+                                Label("Notifications", systemImage: "bell")
+                                    .font(.system(size: 15))
+                                    .foregroundStyle(AppTheme.ink)
+                                Spacer()
+                                Text(notificationStatusLabel)
+                                    .font(AppTheme.mono(size: 12))
+                                    .foregroundStyle(AppTheme.inkSoft)
+                            }
+                        }
+                        .disabled(notificationStatus == .authorized || notificationStatus == .provisional)
+                        .listRowBackground(AppTheme.cream)
+                    } header: {
+                        Text("Notifications")
+                            .foregroundStyle(AppTheme.inkSoft)
+                    }
+                    .task {
+                        notificationStatus = await PushNotificationManager.shared.currentAuthorizationStatus()
                     }
 
                     // MARK: Appearance
@@ -463,6 +712,15 @@ struct ProfileView: View {
                     } header: {
                         Text("Feedback")
                             .foregroundStyle(AppTheme.inkSoft)
+                    }
+
+                    // MARK: Developer (owners + debug builds)
+                    //
+                    // Push and paywall diagnostics that work on TestFlight and
+                    // App Store builds too, but only for OwnerAccess accounts —
+                    // `sendTestPush` is owner-only server-side as well.
+                    if entitlements.isOwner || TestLaunchConfig.debugBuildBypassesPaywall {
+                        DeveloperSection(showPaywall: $showPaywall)
                     }
 
                     #if DEBUG
@@ -569,7 +827,7 @@ struct ProfileView: View {
             }
             // MARK: Spilr Pro paywall
             .sheet(isPresented: $showPaywall) {
-                SpilrPaywallView()
+                SpilrPaywallView(trigger: .profile) { showPaywall = false }
             }
             .task {
                 await entitlements.refresh()
@@ -583,13 +841,10 @@ struct ProfileView: View {
                 titleVisibility: .visible
             ) {
                 Button("Delete Account", role: .destructive) {
-                    if authViewModel.isAppleUser {
-                        // Apple users need a fresh authorization to obtain the
-                        // one-time authorizationCode for token revocation.
-                        authViewModel.requestAppleDeletion()
-                    } else {
-                        Task { await authViewModel.deleteAccount() }
-                    }
+                    // Apple accounts detour through a Sign in with Apple sheet
+                    // for the revocation code; everything else goes straight
+                    // to the server. See AuthViewModel.beginAccountDeletion.
+                    authViewModel.beginAccountDeletion()
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
@@ -643,6 +898,12 @@ private struct AppleDeletionSheetModifier: ViewModifier {
 
 /// Small sheet that triggers a Sign in with Apple flow purely to obtain the
 /// `authorizationCode` needed for token revocation before account deletion.
+///
+/// The copy deliberately doesn't say "sign in". Nothing is being signed into —
+/// the deletion itself needs no reauthentication, it happens server-side. This
+/// is Apple's disconnect confirmation, and wording it as a login made people
+/// think they were being asked to prove themselves all over again to delete
+/// something they'd already confirmed twice.
 private struct AppleDeletionAuthView: View {
     @ObservedObject var authViewModel: AuthViewModel
 
@@ -655,9 +916,9 @@ private struct AppleDeletionAuthView: View {
                 .foregroundStyle(.red)
 
             VStack(spacing: 8) {
-                Text("Confirm with Apple")
+                Text("One more step")
                     .font(.title3.bold())
-                Text("Sign in with Apple once more so we can securely revoke access before deleting your account.")
+                Text("Apple needs you to confirm before Spilr can disconnect from your Apple ID. Your account and everything in it is deleted straight after.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)

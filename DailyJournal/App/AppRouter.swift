@@ -32,6 +32,13 @@ enum AppTab: Int, Hashable, CaseIterable {
 @MainActor
 final class AppRouter: ObservableObject {
 
+    /// Singleton so `PushNotificationManager`'s `UNUserNotificationCenterDelegate`
+    /// callback — which fires outside any SwiftUI view and has no way to reach the
+    /// `@StateObject` `MainTabView` owns — can still route a notification tap.
+    /// `MainTabView` adopts this instance rather than creating its own; every other
+    /// consumer keeps using `@EnvironmentObject` as before.
+    static let shared = AppRouter()
+
     /// Which tab is on screen. Bound to `TabView(selection:)`.
     @Published var selectedTab: AppTab = .today
 
@@ -39,6 +46,11 @@ final class AppRouter: ObservableObject {
     /// appearance. Set alongside `selectedTab = .journal`; the Journal list clears
     /// it once consumed so the highlight plays exactly once.
     @Published var highlightedEntryId: String?
+
+    /// Set when a "weekly_letter" push is tapped. The Mirror tab consumes this
+    /// (fetching the letter fresh from the server, since a push means one was just
+    /// written) and clears it once handled — see `MirrorView.consumePendingLetterOpen`.
+    @Published var pendingWeeklyLetterOpen = false
 
     /// Jump to the Journal tab and point at a specific entry.
     ///
@@ -57,6 +69,13 @@ final class AppRouter: ObservableObject {
 
     /// Jump to the Mirror tab.
     func showMirror() {
+        selectedTab = .mirror
+    }
+
+    /// A "weekly_letter" push was tapped — jump to Mirror and flag that it should
+    /// open the letter once loaded.
+    func openWeeklyLetter() {
+        pendingWeeklyLetterOpen = true
         selectedTab = .mirror
     }
 }

@@ -5,7 +5,7 @@
 //  "Why these?" — separates the clinical/research evidence behind some
 //  templates from the product-adoption pattern behind the rest, and replaces
 //  the unsupported "written with licensed therapists" claim the gallery used
-//  to make. Structure borrowed from `StartOptionsView` / `FutureSelfSheet`
+//  to make. Structure borrowed from `FutureSelfSheet`
 //  (grabber capsule, eyebrow, display headline).
 //
 

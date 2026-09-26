@@ -7,12 +7,15 @@
 //  then weaves the whole conversation into a first-person journal entry.
 //
 //  Two AI calls live here, both going through `AIService.generate(...)`:
-//    • nextChatTurn(history:)  → the next Spilr line + a "ready to weave" signal
-//    • weaveEntry(from:)       → the conversation rewritten as a journal entry
+//    • nextChatTurn(history:)          → the next Spilr line + a "ready to weave" signal
+//    • weaveThoughtJournalSummary(from:) → the conversation rewritten as a Journal Snapshot
 //
-//  Both degrade silently to local fallbacks (UniversalQuestionBank for questions,
-//  a plain transcript stitch for the entry) so the feature works offline and never
-//  blocks the user — same contract as every other AI surface in the app.
+//  The turn call has NO local fallback by design: a canned question in Spilr's mouth
+//  reads as a non-sequitur mid-conversation, so a failure surfaces as an inline
+//  "couldn't reach Spilr" retry instead (see `DailyChatViewModel`). The weave call
+//  still degrades to `localWeaveEntry`, a plain transcript stitch — that failure mode
+//  is data loss, not a fake conversational turn, so it keeps the same silent-fallback
+//  contract as every other AI surface in the app.
 //
 //  See dailychatprd.md.
 //
@@ -47,15 +50,10 @@ struct ChatTurn {
     /// True once there's enough emotional material that weaving a worthwhile entry
     /// is possible. The UI uses this to promote the "Weave into an entry" action.
     let readyToWeave: Bool
-    /// Thought Journal mode only: the guide delivered its Journal Snapshot, so the
-    /// session has reached its destination. Detected from the snapshot's own "The Shift:"
-    /// line or the hidden completion tag, whichever appears.
+    /// The guide delivered its Journal Snapshot, so the session has reached its
+    /// destination. Detected from the snapshot's own "The Shift:" line or the
+    /// hidden completion tag, whichever appears.
     var cbtComplete: Bool = false
-    /// Up to two short quick-reply chips (Casual Vent mode only — see
-    /// `ChatPrompts.normal`'s "QUICK REPLIES" block), parsed out of the model's
-    /// hidden `<suggest>` tag by `AIService.parseSuggestions`. Empty when the
-    /// model didn't offer any, or when the reply came from `localNextTurn`.
-    var suggestions: [String] = []
 }
 
 /// A compact, session-scoped running memory — replaces the old "don't refer to
@@ -106,23 +104,11 @@ struct ChatSessionState: Codable, Equatable {
 extension AIService {
 
     /// A warm, local-instant opener so the chat never waits on the network to start.
-    /// Normal mode rotates a grounded opener; Thought Journal mode opens on Step 1 (the trigger).
-    static func chatOpener(for mode: ChatMode = .normal) -> String {
-        switch mode {
-        case .cbt:
-            return "What's on your mind today? Tell me what we're working through — a worry, a task you're stuck on, a decision, or just a brain dump — and I'll follow your lead."
-        case .normal:
-            let openers = [
-                "Hey. No agenda here — what's actually on your mind right now?",
-                "Let's just talk. What's the loudest thing in your head today?",
-                "What happened today that you're still turning over?",
-                "Start anywhere. What's the first thing that comes up when you think about today?",
-                "How are you, really? Not the version you'd give in passing."
-            ]
-            let day = Calendar.current.ordinality(of: .day, in: .era, for: Date()) ?? 0
-            return openers[day % openers.count]
-        }
-    }
+    /// Opens on Step 1 of the Thought Journal flow (the trigger). This is the fallback
+    /// — `DailyChatViewModel` prefers Prompt Q's `nextQuestion` (the Person Model's own
+    /// pick for tonight's discriminating question) when one is available and passes
+    /// the safety gate; see `PersonModelChatContext` and `seedContext`.
+    static let chatOpener = "What's on your mind today? Tell me what we're working through — a worry, a task you're stuck on, a decision, or just a brain dump — and I'll follow your lead."
 
     /// Strips the hidden Thought Journal state tags from a reply and returns the visible
     /// text plus the completion flag.
@@ -179,45 +165,19 @@ extension AIService {
         return (clean, complete)
     }
 
-    /// Pulls Casual Vent's hidden `<suggest>option one|option two</suggest>` line
-    /// (see `ChatPrompts.normal`) out of a reply, returning the visible text with
-    /// the tag removed and up to two trimmed, non-empty suggestion strings. A
-    /// reply with no tag — the common case, since the model is told to skip it
-    /// when nothing short fits — passes through unchanged with an empty array.
-    static func parseSuggestions(_ text: String) -> (clean: String, suggestions: [String]) {
-        guard let range = text.range(
-            of: #"<suggest>([^<]*)</suggest>"#,
-            options: [.regularExpression, .caseInsensitive]
-        ) else {
-            return (text, [])
-        }
-        let inner = String(text[range])
-            .replacingOccurrences(of: #"</?suggest>"#, with: "",
-                                  options: [.regularExpression, .caseInsensitive])
-        let options = inner
-            .split(separator: "|")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty && $0.count <= 40 }
-            .prefix(2)
-        let clean = text.replacingCharacters(in: range, with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return (clean, Array(options))
-    }
-
     // MARK: - Next turn
 
     /// Sends the conversation so far and asks for Spilr's next line.
     /// Returns plain text — no JSON contract with the model, which was causing
     /// parse failures. readyToWeave is determined locally from turn count.
-    /// Never throws into the UI — callers fall back to `localNextTurn` on any failure.
+    /// Throws into the UI on any failure — there is no local fallback for a chat
+    /// turn (see the file header comment), so the caller surfaces a retry instead.
     func nextChatTurn(
         history: [ChatMessage],
-        mode: ChatMode = .normal,
         sessionState: ChatSessionState? = nil
     ) async throws -> ChatTurn {
         guard isAIAvailable else { throw AIError.aiUnavailable }
 
-        let userTurns     = history.filter { $0.role == .user }.count
         let memoryContext = MemoryProfileService.shared.cachedPromptContext()
 
         // LifeContext (season/focus/people/sensitive-topics-to-avoid) and a
@@ -230,9 +190,20 @@ extension AIService {
         // SelfModelService is @MainActor; nextChatTurn isn't, so this hop is explicit.
         let selfModelContext = await SelfModelService.shared.selfModel.confirmedChatContext()
 
-        // The standing instruction: the scope fence + the mode's voice + this user's
-        // memory context. This goes in Gemini's top-level `systemInstruction` rather
-        // than as a leading turn inside `contents`.
+        // The Person Model (mirror-v3.1-person-model-2026-09-10.md §4/§6) — the
+        // falsifiable hypotheses and the daily discriminating question, previously
+        // visible only on the Mirror tab. DerivedService is @MainActor and already
+        // loaded by the time chat opens (see DailyChatViewModel.init); both hops are
+        // explicit for the same reason as selfModelContext above.
+        let personModelContext = PersonModelChatContext.block(
+            items: await DerivedService.shared.personModelItems,
+            aggregate: await DerivedService.shared.personModel,
+            sensitiveTopicsDisabled: sensitiveTopicsDisabledCached()
+        )
+
+        // The standing instruction: the scope fence + the conversational voice + this
+        // user's memory context. This goes in Gemini's top-level `systemInstruction`
+        // rather than as a leading turn inside `contents`.
         //
         // Why it moved: an instruction placed in `contents` is weighted like any other
         // user turn, so by turn 8 a real user message out-recencies it — which is how
@@ -267,11 +238,12 @@ extension AIService {
         let sessionStateBlock = sessionState?.promptBlock ?? ""
 
         let instruction = """
-        \(ChatPrompts.systemPrompt(for: mode))
+        \(ChatPrompts.systemPrompt)
         \(openerContext)
         \(memoryContext)
         \(lifeContext)
         \(selfModelContext)
+        \(personModelContext)
         \(sessionStateBlock)
         """
 
@@ -316,10 +288,9 @@ extension AIService {
         //
         // Nothing bounded this before: turn N sent all N prior turns, so a long
         // session's cost grew quadratically (see ai-cost-audit-2026-09-06.md cut
-        // #8). `openerContext`/`repetitionContext` above and `userTurns` already
-        // read the FULL, untruncated `history` — only the array actually sent to
-        // Gemini is windowed here, so `readyToWeave`'s turn count and the
-        // anti-repetition guard are unaffected by the cap.
+        // #8). `openerContext`/`repetitionContext` above already read the FULL,
+        // untruncated `history` — only the array actually sent to Gemini is
+        // windowed here, so the anti-repetition guard is unaffected by the cap.
         //
         // 12 turns ≈ 24 messages is generous for what a lite model needs to stay
         // coherent turn-to-turn; the opener and last-3-lines context above already
@@ -363,20 +334,16 @@ extension AIService {
         //
         // maxTokens: Thought Journal needs room to emit the whole Journal Snapshot plus
         // the closing line in a single turn; 260 truncated it often enough that the entry
-        // saved mid-field, so it's 400. Normal mode stays tight at 180 — the prompt caps
-        // a reply at two sentences, and a low ceiling is a useful second enforcement of
-        // that.
+        // saved mid-field, so it's 400.
         //
-        // temperature: normal drops 0.7 → 0.55. 0.7 was chosen when the prompt was mostly
-        // tone guidance and the risk being managed was scope escape. The prompt now has a
-        // hard evidence floor, and the failure mode that matters is the model filling
-        // gaps with invented emotional detail — which is exactly what sampling
-        // temperature buys. Lower is more literal about what's actually in the
-        // transcript. Variety now comes from the explicit shape rotation and the
-        // anti-repetition context above, not from sampling noise. Thought Journal goes to
-        // 0.5 for the same reason, plus it has a structured output to hold.
-        let maxTokens = (mode == .cbt) ? 400 : 180
-        let temperature = (mode == .cbt) ? 0.5 : 0.55
+        // temperature: 0.5. The prompt has a hard evidence floor, and the failure mode
+        // that matters is the model filling gaps with invented emotional detail — which
+        // is exactly what sampling temperature buys. Lower is more literal about what's
+        // actually in the transcript. Variety now comes from the explicit shape rotation
+        // and the anti-repetition context above, not from sampling noise.
+        let maxTokens = 400
+        let temperature = 0.5
+        let surface = "chat_turn_cbt"
 
         // One deterministic retry on a lint trip.
         //
@@ -387,9 +354,10 @@ extension AIService {
         // Prompt text is the soft layer; this is the hard one.
         //
         // A trip should be rare, so the latency cost is rare too, and it is bounded at one
-        // extra call: retry once at a lower temperature with the offence named, then give
-        // up and let the caller fall back to `localNextTurn` rather than ship a line that
-        // labels the user.
+        // extra call: retry once at a lower temperature with the offence named, then throw
+        // `AIError.parseError` rather than ship a line that labels the user — the caller
+        // surfaces that as a retry, same as any other failed turn (see the file header
+        // comment).
         // The user's own words, so the lint below can exempt vocabulary they already
         // used (see `SpilrVoice.tripsLint(_:allowingVocabularyFrom:)`).
         let userWords = history.filter { $0.role == .user }.map(\.text).joined(separator: " ")
@@ -410,7 +378,7 @@ extension AIService {
                 temperature: attempt == 0 ? temperature : 0.3,
                 wantJSON: false,
                 systemInstruction: instruction + extra,
-                surface: mode == .cbt ? "chat_turn_cbt" : "chat_turn"
+                surface: surface
             )
 
             // Blocked-safety propagates immediately — retrying a lower-temperature
@@ -425,34 +393,25 @@ extension AIService {
         }
         guard let reply else { throw AIError.parseError }
 
-        if mode == .cbt {
-            // Strip the hidden completion tag. The flow is adaptive (no numbered steps),
-            // so readiness comes from the snapshot itself — see the note on
-            // `parseThoughtJournalState` for why the field label is trusted over the tag.
-            // The turn-based exit ramp in the VM lets the user wrap up sooner if they want.
-            var (clean, complete) = Self.parseThoughtJournalState(reply)
-            if wasTruncated {
-                // A snapshot cut off mid-generation still contains the "The Shift:"
-                // label (it's early in the message), so `complete` would otherwise be
-                // true for a half-written entry. Trim to the last full sentence and
-                // never treat a truncated reply as the finished snapshot.
-                clean = Self.trimToLastCompleteSentence(clean)
-                complete = false
-            }
-            // The in-chat snapshot goes through the same symbol cleanup as the saved
-            // entry — a chat bubble reading "* **The Focus:**" is the same bug, just
-            // one screen earlier.
-            let plain = Self.stripMarkdownSymbols(clean)
-            guard !plain.isEmpty else { throw AIError.parseError }
-            return ChatTurn(reply: plain, readyToWeave: complete, cbtComplete: complete)
+        // Strip the hidden completion tag. The flow is adaptive (no numbered steps),
+        // so readiness comes from the snapshot itself — see the note on
+        // `parseThoughtJournalState` for why the field label is trusted over the tag.
+        // The turn-based exit ramp in the VM lets the user wrap up sooner if they want.
+        var (clean, complete) = Self.parseThoughtJournalState(reply)
+        if wasTruncated {
+            // A snapshot cut off mid-generation still contains the "The Shift:"
+            // label (it's early in the message), so `complete` would otherwise be
+            // true for a half-written entry. Trim to the last full sentence and
+            // never treat a truncated reply as the finished snapshot.
+            clean = Self.trimToLastCompleteSentence(clean)
+            complete = false
         }
-
-        let (visibleText, suggestions) = Self.parseSuggestions(reply)
-        var clean = visibleText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if wasTruncated { clean = Self.trimToLastCompleteSentence(clean) }
-        guard !clean.isEmpty else { throw AIError.parseError }
-        // readyToWeave is determined locally — 3 real user turns is enough material to weave.
-        return ChatTurn(reply: clean, readyToWeave: userTurns >= 3, suggestions: suggestions)
+        // The in-chat snapshot goes through the same symbol cleanup as the saved
+        // entry — a chat bubble reading "* **The Focus:**" is the same bug, just
+        // one screen earlier.
+        let plain = Self.stripMarkdownSymbols(clean)
+        guard !plain.isEmpty else { throw AIError.parseError }
+        return ChatTurn(reply: plain, readyToWeave: complete, cbtComplete: complete)
     }
 
     /// Trims a possibly mid-word/mid-sentence string back to its last complete
@@ -470,108 +429,14 @@ extension AIService {
         return String(trimmed[..<lastTerminal.upperBound]).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// On-device follow-up when AI is unavailable. Picks a question from the bank
-    /// that the conversation hasn't obviously already covered, and flags ready after
-    /// a couple of real replies so weaving is always reachable.
-    ///
-    /// Mode-aware: `.cbt`'s offline path used to fall through to this same Casual
-    /// Vent bank and set `readyToWeave` after 2 turns — so an offline "Wrap up &
-    /// save" tap wove a Journal Snapshot that was never actually reached. It now
-    /// asks a FOCUS → HURDLE → SHIFT-shaped local question instead, keyed on turn
-    /// count, and never sets `readyToWeave` itself in that mode — `DailyChatViewModel
-    /// .canWeave`'s own `.cbt` floor (3 real turns) is what still allows an
-    /// explicit "wrap up" tap.
-    func localNextTurn(history: [ChatMessage], mode: ChatMode = .normal) -> ChatTurn {
-        let userTurns = history.filter { $0.role == .user }.count
-
-        if mode == .cbt {
-            let cbtQuestions = [
-                "What's the actual thing here — in a sentence?",
-                "What's the specific thought or feeling that's in the way?",
-                "What's the smallest next step, or is this one that just needs to be named as still open?",
-            ]
-            let idx = min(userTurns, cbtQuestions.count - 1)
-            return ChatTurn(reply: cbtQuestions[idx], readyToWeave: false)
-        }
-
-        let askedSoFar = Set(history.filter { $0.role == .spilr }.map { $0.text })
-
-        // Prefer questions that probe rather than restate; rotate through the bank.
-        let pool = UniversalQuestionBank.all
-            .map { $0.text }
-            .filter { !askedSoFar.contains($0) }
-
-        let fallback = "What part of that still feels unfinished?"
-        let next = pool.shuffled().first ?? fallback
-        return ChatTurn(reply: next, readyToWeave: userTurns >= 2)
-    }
-
     // MARK: - Weave entry
 
-    /// Composes the conversation into a first-person journal entry. Preserves the
-    /// user's words and voice — it stitches and lightly reshapes, it does not invent.
-    /// Returns nil on failure so the caller can fall back to a plain transcript stitch.
-    func weaveEntry(from history: [ChatMessage]) async throws -> String {
-        guard isAIAvailable else { throw AIError.aiUnavailable }
-
-        let userText = history.filter { $0.role == .user }
-            .map { $0.text }
-            .joined(separator: " ")
-        guard userText.split(separator: " ").count >= 12 else { throw AIError.textTooShort }
-
-        let transcript = Self.transcript(from: history)
-
-        let prompt = """
-        \(SpilrVoice.system)
-
-        WEAVING TASK — chat conversation → first-person journal entry.
-
-        Below is a short back-and-forth between you (Spilr) and the person. Turn THEIR
-        side of it into a journal entry written in their first-person voice ("I…").
-
-        Rules:
-        1. PRESERVE the person's own words, phrases and images wherever possible. You are
-           stitching their answers into flowing prose, not rewriting or "improving" them.
-        2. Use ONLY what they actually said. Do not invent events, feelings, or details
-           that aren't in their replies. Drop your own questions — they are scaffolding.
-        3. MATCH LENGTH TO DEPTH. If they gave 1–2 short replies, write 1–2 sentences —
-           nothing more. If the exchange is longer and emotionally richer, write 2–3 short
-           paragraphs. NEVER pad a short conversation into a longer entry; that invents
-           emotional weight that isn't there. Each part should flow into the next.
-        4. First person throughout. No second-person address, no "you".
-        5. ABSOLUTELY NO bullet points, dashes, numbered lists, or any list formatting.
-           Every sentence must live inside a paragraph. If you are tempted to use a dash
-           or bullet, weave that thought into the surrounding prose instead.
-        6. Output ONLY the entry body — no title, no heading, no quotes, no AI commentary,
-           observations, or questions.
-
-        \(MemoryProfileService.shared.cachedPromptContext())
-
-        Conversation:
-        \"\"\"
-        \(transcript)
-        \"\"\"
-
-        Respond with flowing prose only — no JSON, no markdown, no labels, no lists.
-        """
-
-        // wantJSON: false — weave produces prose, not JSON.
-        let data = try await generate(prompt: prompt, maxTokens: 700, temperature: 0.3, wantJSON: false, surface: "chat_weave_entry")
-
-        let (text, truncated) = try AIService.parseTextCandidate(data)
-        var trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { throw AIError.parseError }
-        // A weave cut off mid-paragraph would otherwise be saved as the entry body
-        // verbatim — trim back to the last complete sentence.
-        if truncated { trimmed = Self.trimToLastCompleteSentence(trimmed) }
-
-        return Self.stripListFormatting(trimmed)
-    }
-
-    /// Thought Journal weave — turns the conversation into a structured Thought Journal
-    /// summary card (markdown). Unlike the normal weave this KEEPS structure: the
-    /// card is the point. Returns nil on failure so the caller can fall back to a
-    /// plain transcript stitch.
+    /// Thought Journal weave — turns the conversation into a structured Journal
+    /// Snapshot card. KEEPS structure: the card is the point. Returns nil on
+    /// failure so the caller can fall back to a plain transcript stitch
+    /// (`localWeaveEntry`) — that fallback is data-loss prevention, not a fake
+    /// conversational turn, so it's kept even though the turn-by-turn call above
+    /// has no equivalent fallback.
     func weaveThoughtJournalSummary(from history: [ChatMessage]) async throws -> String {
         guard isAIAvailable else { throw AIError.aiUnavailable }
 
@@ -641,9 +506,9 @@ extension AIService {
     /// body — once it's saved with `### 📝` and `**The Focus:**` in it, the user is
     /// looking at those characters forever. Cheap to run, so we run it.
     ///
-    /// Unlike `stripListFormatting` (which flattens everything into prose for the
-    /// Casual Vent weave), this PRESERVES line structure — the snapshot's one-item-
-    /// per-line shape is the point. It only removes the symbols.
+    /// Unlike `stripListFormatting` (which flattens everything into prose — see
+    /// `AIService+Template.swift`'s template weave), this PRESERVES line structure —
+    /// the snapshot's one-item-per-line shape is the point. It only removes the symbols.
     static func stripMarkdownSymbols(_ raw: String) -> String {
         var lines: [String] = []
         for line in raw.components(separatedBy: .newlines) {
@@ -774,6 +639,103 @@ extension AIService {
             askedAlready: Array(((json["asked_already"] as? [String]) ?? []).suffix(6)),
             openThread: (json["open_thread"] as? String) ?? ""
         )
+    }
+
+    // MARK: - Model write-back
+
+    /// One instruction the model believes the person gave Spilr about what to
+    /// track or believe about them — parsed from a whole conversation, not yet
+    /// applied. `DailyChatViewModel` validates and applies these; nothing here
+    /// touches Firestore.
+    struct ParsedModelOp {
+        let op: ModelOpKind
+        /// The personModel item this targets, for `.confirm`/`.notMe` — the
+        /// caller must check this against the SAME item list the model was
+        /// actually shown (`PersonModelChatContext`) before trusting it; a
+        /// lite model can invent a plausible-looking id.
+        let targetItemId: String?
+        let subject: String
+        /// Must be verified against the real transcript before use — see the
+        /// groundedness check at the end of `extractModelOps` below.
+        let quote: String
+    }
+
+    /// Reads the whole conversation once, at save time, and asks whether the
+    /// person gave Spilr an explicit instruction about what to track or
+    /// believe — "track whether exercise actually helps", "that's not true
+    /// about me", "stop tracking work". This is the ONE structured-output call
+    /// in the chat surface, and it runs once per session, never per turn — a
+    /// misparse here writes to LifeContext or a personModel item's userStatus
+    /// with no confirmation tap, so the model is asked to be conservative
+    /// (`{"ops": []}` is the expected, common answer) and every proposed op is
+    /// checked against the actual transcript before the caller may apply it.
+    ///
+    /// Silent on any failure — a session that produces nothing to apply is the
+    /// ordinary case, not an error worth surfacing.
+    func extractModelOps(history: [ChatMessage]) async throws -> [ParsedModelOp] {
+        guard isAIAvailable else { return [] }
+        let userTexts = history.filter { $0.role == .user }.map(\.text)
+        guard !userTexts.isEmpty else { return [] }
+        // The same deterministic crisis gate the corpus-level pattern engine
+        // uses (PatternSafety.corpusHasCrisisSignal) — a session that shows
+        // any crisis signal never reaches the model for this call at all.
+        guard !PatternSafety.corpusHasCrisisSignal(userTexts) else { return [] }
+
+        let transcript = Self.transcript(from: history)
+        let prompt = """
+        Read this conversation and decide whether the person gave Spilr an EXPLICIT
+        instruction about what to track or believe about them — not a topic they
+        happened to mention, an actual instruction directed at Spilr ("track whether
+        exercise helps", "stop tracking work", "that's not true about me", "yes,
+        that's exactly right").
+
+        Return ONLY valid JSON, no markdown, no code fences:
+        {"ops": [{"op": "track|untrack_topic|not_me|confirm",
+                  "targetItemId": "string or null",
+                  "subject": "their words, at most 8 words",
+                  "quote": "the exact sentence they typed that licensed this"}]}
+
+        Rules:
+        - Emit an op ONLY for an explicit instruction. Never infer one from tone,
+          topic, or how many times something came up. An empty "ops" array is the
+          common and correct answer — most conversations produce none.
+        - "confirm" / "not_me" need a "targetItemId" from the model rows the
+          conversation was given, if any were shown; if none were shown or the
+          instruction doesn't clearly match one, use "track" or "untrack_topic"
+          instead, or omit the op entirely.
+        - "quote" must be copied verbatim, character for character, from one of
+          their messages below — never paraphrased, never invented. An op whose
+          quote cannot be found this way will be discarded.
+        - Never emit an op from a message describing self-harm, crisis, or abuse.
+
+        Conversation:
+        \"\"\"
+        \(transcript)
+        \"\"\"
+        """
+
+        let data = try await generate(prompt: prompt, maxTokens: 250, temperature: 0.2, surface: "chat_model_ops")
+        let (text, _) = try AIService.parseTextCandidate(data)
+        guard
+            let jsonData = text.data(using: .utf8),
+            let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+            let rawOps = json["ops"] as? [[String: Any]]
+        else { return [] }
+
+        return rawOps.compactMap { raw -> ParsedModelOp? in
+            guard
+                let opRaw = raw["op"] as? String, let kind = ModelOpKind(rawValue: opRaw),
+                let subject = (raw["subject"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !subject.isEmpty,
+                let quote = (raw["quote"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !quote.isEmpty
+            else { return nil }
+            // Never trust a hallucinated quote — the same "verify before you ship
+            // it" discipline Prompt M's receipt check uses server-side
+            // (functions/index.js's groundedness check before a Mirror line goes
+            // out). An op is real only if its quote is something the person
+            // actually typed, not something that sounds like them.
+            guard userTexts.contains(where: { $0.contains(quote) }) else { return nil }
+            return ParsedModelOp(op: kind, targetItemId: raw["targetItemId"] as? String, subject: subject, quote: quote)
+        }
     }
 
     // MARK: - Helpers

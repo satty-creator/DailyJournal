@@ -273,6 +273,29 @@ final class DerivedService: ObservableObject {
                 "shownAt": Timestamp(date: Date())
             ], merge: true) { _ in }
     }
+
+    /// User-set correction on a Person Model item — "That's me" / "Not me",
+    /// including the version of that gesture that now happens inside a Daily
+    /// Chat conversation (see AIService+Chat's `extractModelOps` and
+    /// SelfModelService's write-back). Writes directly to the item doc; the
+    /// client may patch only `userStatus`/`shownAt`/`notQuiteCount`/
+    /// `respondedAt` (firestore.rules) — this call only ever touches the first
+    /// and last of those.
+    ///
+    /// No optimistic local echo: `PersonModelItem`'s fields are all `let` (it
+    /// decodes straight off a snapshot, like every other model in this file),
+    /// so reflecting this instantly would mean rebuilding the whole item from
+    /// its raw dict here too. The next `load()` picks it up; this collection
+    /// isn't rendered anywhere that's visible mid-conversation.
+    func markPersonModelItemStatus(itemId: String, userStatus: String, userId: String) {
+        guard !userId.isEmpty, !itemId.isEmpty else { return }
+        db.collection("users").document(userId)
+            .collection("personModel").document(itemId)
+            .updateData([
+                "userStatus": userStatus,
+                "respondedAt": Timestamp(date: Date())
+            ]) { _ in }
+    }
 }
 
 // MARK: - Reading mutation helper
@@ -296,7 +319,6 @@ private extension Reading {
             data["source"] = ["id": sourceId, "type": sourceType, "kind": "observation"]
         }
         if let shape { data["shape"] = shape }
-        if let wouldBeFalseIf { data["wouldBeFalseIf"] = wouldBeFalseIf }
         if let receipt {
             data["receipt"] = [
                 "quote": receipt.quote,

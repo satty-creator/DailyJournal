@@ -149,28 +149,6 @@ function figurativeHits(text, vocabTop200) {
   return METAPHORS.filter((p) => h.includes(p) && !vocab.has(normalise(p)));
 }
 
-/** Rule 9: strip quotes, proper nouns and numerals; what's left must contain
- *  >= 2 tokens from this user's own top-200 vocabulary. A line that survives
- *  stripping into something universally true is Barnum by construction — the
- *  swap test names the failure the whole language spec exists to prevent. */
-function swapTestFails(originalText, vocabTop200) {
-  if (!vocabTop200 || vocabTop200.length === 0) return false; // nothing to check against
-  let stripped = String(originalText)
-    .replace(/["“][^"”]*["”]/g, " ")
-    .replace(/'[^']*'/g, " ")
-    .replace(/\d+/g, " ");
-  const words = stripped.split(/\s+/);
-  const isSentenceStart = (i) => i === 0 || /[.!?]$/.test(words[i - 1] || "");
-  const kept = words.filter((w, i) => {
-    if (!w) return false;
-    if (/^[A-Z]/.test(w) && !isSentenceStart(i)) return false; // proper-noun proxy
-    return true;
-  });
-  const vocab = new Set((vocabTop200 || []).map(normalise));
-  const overlap = new Set(contentTokens(kept.join(" ")).filter((t) => vocab.has(t)));
-  return overlap.size < 2;
-}
-
 // Observational voice, not character claims (R4 — self-distancing). Extended
 // beyond the original three with §6's "you tend" / "your (need|inability|fear)".
 const TRAIT_PHRASING =
@@ -424,18 +402,14 @@ function lintMirrorLineText(text, ctx = {}) {
   const reassurance = REASSURANCE.find((p) => h.includes(p));
   if (reassurance) return fail(8, "reassurance", reassurance);
 
-  // Rule 9 — the swap test.
-  if (swapTestFails(trimmed, ctx.vocabTop200)) return fail(9, "swap_test");
-
   return { ok: true, rule: null, reason: null, term: null };
 }
 
 /**
  * The full gate on Prompt M's structured output — `{line, shape, receipt,
- * question, would_be_false_if}` — combining lintMirrorLineText on the line,
- * the question's own (looser) length/question-mark check, the
- * `would_be_false_if` non-null requirement, and "last clause must be a
- * question or an exception."
+ * question}` — combining lintMirrorLineText on the line, the question's own
+ * (looser) length/question-mark check, and "last clause must be a question
+ * or an exception."
  *
  * @param {object} output  Prompt M's parsed JSON
  * @param {object} ctx     { receiptQuote, vocabTop200 }
@@ -450,10 +424,6 @@ function lintMirrorM(output, ctx = {}) {
   if (output.question != null && String(output.question).trim()) {
     const q = lintCopy(output.question, { kind: "mirrorQuestion" });
     if (!q.ok) return { ok: false, rule: 1, reason: `question_${q.reason}` };
-  }
-
-  if (output.would_be_false_if == null || !String(output.would_be_false_if).trim()) {
-    return { ok: false, rule: null, reason: "no_would_be_false_if" };
   }
 
   const hasQuestion = output.question != null && String(output.question).trim().endsWith("?");
@@ -488,7 +458,6 @@ module.exports = {
   hasSpecificity,
   concretenessCheck,
   figurativeHits,
-  swapTestFails,
   endsWell,
   BANNED_SUBSTRINGS,
   BANNED_LABELS,

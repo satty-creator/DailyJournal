@@ -42,30 +42,19 @@ final class ChatSessionService {
         collection(for: userId).document(id).delete(completion: nil)
     }
 
-    /// The most recent session in `mode` for `userId`, if any — used to offer
-    /// "resume where you left off" on a fresh Daily Chat open.
+    /// The most recent session for `userId`, if any — used to offer "resume where
+    /// you left off" on a fresh Daily Chat open.
     ///
-    /// Filters by `mode` server-side and orders by `updatedAt` — a user with 5+
-    /// recent sessions in the OTHER mode used to silently get no resume offer at
-    /// all, because the old query fetched the 5 most-recently-updated sessions
-    /// across BOTH modes and filtered for `mode` in Swift afterward.
-    ///
-    /// REQUIRES the `chatSessions` composite index (mode ASC, updatedAt DESC)
-    /// declared in `firestore.indexes.json` — deploy it with
-    /// `firebase deploy --only firestore:indexes` before this ships, or the query
-    /// throws "the query requires an index" and this silently returns nil (same
-    /// degradation as any other failed read here, but resume would never work
-    /// until the index exists). A plain equality-only query without `order(by:)`
-    /// was deliberately rejected: `.limit(to: N)` with no ordering returns an
-    /// UNDEFINED N documents, not necessarily the N most recent, so sorting the
-    /// result in Swift wouldn't reliably find the true most-recent session once a
-    /// mode has accumulated more than N total documents (see AIService+Chat.swift's
-    /// PRD note that abandoned conversations are never pruned).
-    func fetchMostRecent(userId: String, mode: ChatMode) async -> ChatSession? {
-        let cacheKey = "recentChatSessions.\(userId).\(mode.rawValue)"
+    /// Formerly filtered by `mode` (Casual Vent vs Thought Journal, retired) — that
+    /// filter existed because a plain equality-only query without `order(by:)` would
+    /// have returned an UNDEFINED N documents rather than the N most recent, so
+    /// sorting in Swift couldn't reliably find the true most-recent session once a
+    /// user had accumulated more than N total documents. With one mode there's
+    /// nothing left to filter on; only the ordering matters now.
+    func fetchMostRecent(userId: String) async -> ChatSession? {
+        let cacheKey = "recentChatSessions.\(userId)"
         guard let snapshot = try? await FirestoreCacheFirst.documents(
             collection(for: userId)
-                .whereField("mode", isEqualTo: mode.rawValue)
                 .order(by: "updatedAt", descending: true)
                 .limit(to: 1),
             key: cacheKey

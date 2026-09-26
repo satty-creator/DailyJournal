@@ -236,7 +236,13 @@ extension AIService {
         request.timeoutInterval = 30
 
         guard let (data, response) = try? await URLSession.shared.data(for: request),
-              let http = response as? HTTPURLResponse, http.statusCode == 200,
+              let http = response as? HTTPURLResponse else { return nil }
+        if http.statusCode == 402 {
+            // Spilr Pro gate (preview over) — same handling as geminiProxy's 402.
+            Self.handlePaymentRequired(data)
+            return nil
+        }
+        guard http.statusCode == 200,
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let answer = root["answer"] as? String, !answer.isEmpty
         else { return nil }
@@ -301,8 +307,19 @@ extension AIService {
         UserDefaults.standard.string(forKey: "cachedLifeContextBlock") ?? ""
     }
 
+    /// The raw `sensitiveTopicsDisabled` list, cached alongside the prose
+    /// block above. Chat's Person Model context (`PersonModelChatContext`)
+    /// needs the actual strings to apply as a deterministic code gate — the
+    /// prose block's "DO NOT surface patterns about: …" is an instruction to
+    /// the model, which the privacy PRD is explicit is not the same thing as
+    /// enforcement.
+    func sensitiveTopicsDisabledCached() -> [String] {
+        UserDefaults.standard.stringArray(forKey: "cachedSensitiveTopicsDisabled") ?? []
+    }
+
     /// Call once at load time to cache the rendered life context block.
     static func cacheLifeContext(_ ctx: LifeContext) {
+        UserDefaults.standard.set(ctx.sensitiveTopicsDisabled, forKey: "cachedSensitiveTopicsDisabled")
         guard ctx.currentSeason != nil || !ctx.primaryFocus.isEmpty else {
             UserDefaults.standard.removeObject(forKey: "cachedLifeContextBlock")
             return

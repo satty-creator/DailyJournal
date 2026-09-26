@@ -29,9 +29,16 @@ final class TemplateRunnerViewModel: ObservableObject {
     @Published var showReview = false
     /// The woven entry text shown (and editable) on the review screen.
     @Published var wovenPreview: String = ""
-    /// Whether the preview came from Gemini or the local fallback — surfaced
-    /// so `trackEntryCreated(hasAI:)` reflects what actually happened, not
-    /// just whether AI was available.
+    /// Photo picked on the review screen. Kept on the VM so it survives
+    /// "Keep going" and back, like `wovenPreview`. Not written to the draft.
+    @Published var attachedPhoto: UIImage?
+    /// Whether the preview came from Gemini or the local fallback.
+    ///
+    /// No longer feeds analytics: `entry_created` reports `ai_available` (does
+    /// this person have AI on at all) rather than "did AI produce this text",
+    /// because the entry's real insights are generated detached, after the
+    /// event fires, so no composer can answer the second question honestly at
+    /// save time.
     @Published private(set) var usedAI = false
 
     @Published private(set) var savedEntry: JournalEntry?
@@ -192,8 +199,10 @@ final class TemplateRunnerViewModel: ObservableObject {
         let trimmed = finalText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
+        // Sentiment and tags are derived data and stay local. Reflection is
+        // AI-only — `EntryEnrichment` patches it in when Gemini answers. See
+        // CLAUDE.md, "No local text in Spilr's voice".
         let sentiment  = LocalAI.detectSentiment(from: trimmed)
-        let reflection = SpilrVoice.localReflection(from: trimmed, sentiment: sentiment)
 
         // Seeded from the template's real topic tags ("clarity", "calm", …) —
         // NOT `template.id`, which is a kebab-case slug that would otherwise
@@ -211,8 +220,6 @@ final class TemplateRunnerViewModel: ObservableObject {
             content: trimmed,
             tags: mergedTags,
             sessionType: .template,
-            aiSummaryBullets: reflection.observations,
-            aiQuestion: reflection.question,
             sentimentLabel: sentiment,
             templateId: template.id,
             templateScaleBefore: delta?.before,
@@ -227,19 +234,13 @@ final class TemplateRunnerViewModel: ObservableObject {
             userId: userId,
             entryCreatedAt: entry.createdAt,
             text: trimmed,
+            photo: attachedPhoto,
             service: service,
+            sessionType: .template,
+            composedFrom: startedAt,
             templateId: entry.templateId,
             templateScaleBefore: entry.templateScaleBefore,
             templateScaleAfter: entry.templateScaleAfter
-        )
-
-        AnalyticsManager.shared.trackEntryCreated(
-            sessionType: "template",
-            wordCount: entry.wordCount,
-            hasMood: false,
-            hasPhoto: false,
-            hasAI: usedAI,
-            duration: Date().timeIntervalSince(startedAt)
         )
     }
 
@@ -253,6 +254,7 @@ final class TemplateRunnerViewModel: ObservableObject {
             .joined(separator: " ")
             .split(separator: " ")
             .count
+        attachedPhoto = nil
         clearDraft()
         AnalyticsManager.shared.trackEntryDiscarded(sessionType: "template", wordCount: wordCount)
     }

@@ -92,6 +92,40 @@ final class AskViewModel: ObservableObject {
     }
 }
 
+/// The "ask your journal anything" entry point, pinned at the top of the Mirror
+/// tab. Lives here rather than inside the Mirror screen because the Mirror tab
+/// is now the living profile (SelfModelView) and this card is the only piece of
+/// the old daily-digest screen that survived it.
+///
+/// HomeView has its own `askJournalPill` with different styling — deliberately
+/// not shared. Two entry points, two surfaces, one AskView behind them.
+struct MirrorAskCard: View {
+    let onTap: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(AppTheme.terracotta)
+                Text("Ask about your entries\u{2026}")
+                    .font(AppTheme.editorialBody(size: 14))
+                    .foregroundStyle(AppTheme.inkSoft)
+                Spacer()
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 12)
+            .background(AppTheme.cream.opacity(0.7))
+            .clipShape(Capsule())
+            .overlay(
+                Capsule().stroke(AppTheme.inkSoft.opacity(0.12), lineWidth: 1)
+            )
+            .shadow(color: AppTheme.cardShadow, radius: 8, x: 0, y: 3)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 struct AskView: View {
     let userId: String
 

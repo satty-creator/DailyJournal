@@ -20,7 +20,6 @@
 //
 
 import SwiftUI
-import PhotosUI
 import UIKit
 
 struct SpillWriteView: View {
@@ -35,7 +34,6 @@ struct SpillWriteView: View {
     @FocusState private var isFocused: Bool
 
     @StateObject private var speech = SpeechManager()
-    @State private var photoItem: PhotosPickerItem?
     @State private var photoUIImage: UIImage?
     @State private var saved = false
     @State private var micError: String?
@@ -83,24 +81,48 @@ struct SpillWriteView: View {
         trimmed.isEmpty ? 0 : trimmed.split { $0 == " " || $0 == "\n" }.count
     }
 
+    private let editorAnchor = "spillEditorAnchor"
+
     var body: some View {
         ZStack {
             AppTheme.paper.ignoresSafeArea()
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    screenHead
-                    promptCard
-                    moodPicker
-                    editor
-                    uploadZone
-                    saveButton
-                    aiShelf
+            ScrollViewReader { scrollProxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        screenHead
+                        promptCard
+                        moodPicker
+                        editor
+                            .id(editorAnchor)
+                        uploadZone
+                        saveButton
+                        aiShelf
+                    }
+                    .padding(20)
+                    .padding(.bottom, 40)
                 }
-                .padding(20)
-                .padding(.bottom, 40)
+                .scrollDismissesKeyboard(.interactively)
+                // The editor sits below the prompt card + mood picker, so once the
+                // keyboard is up only a sliver of it is visible. Nothing else tells
+                // this outer ScrollView to follow the cursor as text grows, so we
+                // drive it explicitly: on focus, and on every keystroke/dictated
+                // chunk, keep the editor's bottom edge (where the cursor lives)
+                // pinned just above the keyboard/mic bar.
+                .onChange(of: isFocused) { _, focused in
+                    guard focused else { return }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                        withAnimation(.easeOut(duration: 0.25)) {
+                            scrollProxy.scrollTo(editorAnchor, anchor: .bottom)
+                        }
+                    }
+                }
+                .onChange(of: vm.content) { _, _ in
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        scrollProxy.scrollTo(editorAnchor, anchor: .bottom)
+                    }
+                }
             }
-            .scrollDismissesKeyboard(.interactively)
         }
         .safeAreaInset(edge: .bottom) { micFloatingBar }
         .onChange(of: vm.content) { _, _ in
@@ -127,15 +149,6 @@ struct SpillWriteView: View {
             vm.content = live
         }
         .onChange(of: speech.errorMessage) { _, message in micError = message }
-        .onChange(of: photoItem) { _, item in
-            guard let item else { return }
-            Task {
-                if let data = try? await item.loadTransferable(type: Data.self),
-                   let ui = UIImage(data: data) {
-                    photoUIImage = ui
-                }
-            }
-        }
         .onAppear {
             isFocused = true
             AnalyticsManager.shared.trackEntryCompositionStarted(sessionType: "timed")
@@ -336,7 +349,7 @@ struct SpillWriteView: View {
                 .background(Color.clear)
                 .focused($isFocused)
                 .lineSpacing(5)
-                .frame(minHeight: 200)
+                .frame(minHeight: 200, maxHeight: 340)
                 .padding(12)
         }
         .background(AppTheme.cream.opacity(0.74))
@@ -349,56 +362,7 @@ struct SpillWriteView: View {
 
     // MARK: - Photo upload zone (local preview; opt-in)
     private var uploadZone: some View {
-        HStack(spacing: 12) {
-            ZStack {
-                if let photoUIImage {
-                    Image(uiImage: photoUIImage)
-                        .resizable()
-                        .scaledToFill()
-                } else {
-                    LinearGradient(colors: [AppTheme.terracotta.opacity(0.26), AppTheme.sun.opacity(0.26)],
-                                   startPoint: .topLeading, endPoint: .bottomTrailing)
-                    Image(systemName: "photo")
-                        .font(.system(size: 18))
-                        .foregroundStyle(AppTheme.inkSoft)
-                }
-            }
-            .frame(width: 58, height: 58)
-            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(AppTheme.inkSoft.opacity(0.15), lineWidth: 1))
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Add a moment")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(AppTheme.ink)
-                Text("A photo makes the memory richer. Sharing stays opt-in.")
-                    .font(AppTheme.editorialBody(size: 12))
-                    .foregroundStyle(AppTheme.inkSoft)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            Spacer(minLength: 4)
-
-            PhotosPicker(selection: $photoItem, matching: .images) {
-                Text(photoUIImage == nil ? "Upload" : "Change")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(AppTheme.ink)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .background(AppTheme.cream.opacity(0.8))
-                    .clipShape(Capsule())
-                    .overlay(Capsule().stroke(AppTheme.inkSoft.opacity(0.15), lineWidth: 1))
-            }
-        }
-        .padding(11)
-        .background(AppTheme.terracotta.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .strokeBorder(AppTheme.terracotta.opacity(0.42),
-                              style: StrokeStyle(lineWidth: 1.4, dash: [5, 4]))
-        )
+        PhotoAttachCard(image: $photoUIImage)
     }
 
     // MARK: - Mood picker (compact — optional, shows above editor)

@@ -162,10 +162,10 @@ enum TemplateContent {
         ),
         TemplateStep(
             id: "underneath",
-            label: "What's underneath it",
-            question: "What's underneath that?",
-            helper: "Keep going past the first answer.",
-            kind: .text(placeholder: "Underneath that\u{2026}")
+            label: "How it makes you feel",
+            question: "How is it making you feel \u{2014} and why?",
+            helper: "Name the feeling first, then what's driving it.",
+            kind: .text(placeholder: "It makes me feel\u{2026}")
         ),
         TemplateStep(
             id: "needs-you",

@@ -9,7 +9,7 @@ import Foundation
 import FirebaseCore
 import FirebaseAuth
 import FirebaseFirestore
-import FirebaseStorage
+import FirebaseAppCheck
 import GoogleSignIn
 import CryptoKit
 import RevenueCat
@@ -37,6 +37,7 @@ enum AuthError: LocalizedError {
     case emailAlreadyInUse
     case invalidCredentials
     case networkError
+    case tooManyRequests
     case unknown(String)
 
     var errorDescription: String? {
@@ -46,6 +47,11 @@ enum AuthError: LocalizedError {
         case .emailAlreadyInUse:    return "An account with this email already exists."
         case .invalidCredentials:   return "Incorrect email or password."
         case .networkError:         return "Network error. Please try again."
+        // Firebase's own copy for this one reads "we have blocked all requests
+        // from this device due to unusual activity", which describes a 60-second
+        // throttle as if the account were banned. It is the first thing a new
+        // user sees if they tap Resend a few times waiting on a slow inbox.
+        case .tooManyRequests:      return "Too many attempts — wait a minute and try again."
         case .unknown(let msg):     return msg
         }
     }
@@ -69,7 +75,32 @@ final class AuthService {
     // Best-effort: a failure here must never block sign-in. Worst case, the
     // user stays anonymous to RevenueCat until the next successful call.
     private func identifyRevenueCat(uid: String) async {
+        // UI tests sign in emulator-only accounts; don't mint RevenueCat
+        // customers for them in the production project.
+        if TestLaunchConfig.isUITest { return }
         _ = try? await Purchases.shared.logIn(uid)
+    }
+
+    /// Public entry point for re-identifying RevenueCat outside the sign-in
+    /// paths above — used by `AuthViewModel.listenToAuthState()` on session
+    /// restore. RevenueCat persists its App User ID across launches on its
+    /// own, but iOS Keychain (where Firebase's session lives) outlives app
+    /// deletion, so a reinstall can otherwise leave a user signed into
+    /// Firebase and permanently anonymous to RevenueCat with no other path
+    /// to recover. `logIn` with an already-current id is a cheap no-op, so
+    /// calling this on every restore is safe.
+    func reidentifyRevenueCat(uid: String) async {
+        await identifyRevenueCat(uid: uid)
+    }
+
+    // Resets RevenueCat back to a fresh anonymous App User ID. Called on
+    // sign-out/delete so the next account on this device (a shared device,
+    // most likely) doesn't inherit this user's RevenueCat identity — without
+    // this, account B's purchases/webhook events would land on account A's
+    // `entitlements/{uid}` and `aiUsage/{uid}` docs until B's own `logIn`
+    // fires. Best-effort, same as `identifyRevenueCat` above.
+    private func deidentifyRevenueCat() async {
+        _ = try? await Purchases.shared.logOut()
     }
 
     // MARK: - Email/Password Sign Up
@@ -88,7 +119,7 @@ final class AuthService {
 
             // Send the verification email. We don't fail signup if this throws —
             // the user can resend from the verification screen.
-            try? await result.user.sendEmailVerification()
+            try? await sendVerificationLogged(to: result.user, context: "signup")
 
             let resolvedName = (trimmedName?.isEmpty == false) ? trimmedName : nil
             let user = AppUser(id: result.user.uid, email: email, displayName: resolvedName)
@@ -106,7 +137,137 @@ final class AuthService {
         guard let user = Auth.auth().currentUser else {
             throw AuthError.unknown("No signed-in user to verify.")
         }
-        try await user.sendEmailVerification()
+        do {
+            try await sendVerificationLogged(to: user, context: "resend")
+        } catch let error as AuthError {
+            throw error
+        } catch let error as NSError {
+            throw mapFirebaseError(error)
+        }
+    }
+
+    /// Sends the verification email and logs the outcome. Failures used to be
+    /// swallowed at sign-up, so "no email arrived" left no trace anywhere —
+    /// this prints the full Firebase error to the console and records it in
+    /// analytics (`app_error`, context `verification_send_<context>`).
+    private func sendVerificationLogged(to user: User, context: String) async throws {
+        print("AuthService: sending verification email (\(context)) uid=\(user.uid) email=\(user.email ?? "nil") project=\(FirebaseApp.app()?.options.projectID ?? "nil")")
+        switch await sendAuthEmailViaServer(kind: "verifyEmail") {
+        case .sent:
+            print("AuthService: branded verification email sent (\(context)) uid=\(user.uid)")
+            await AnalyticsManager.shared.logEvent(.verificationEmailSent, parameters: ["context": context, "via": "server"])
+            return
+        case .throttled:
+            throw AuthError.tooManyRequests
+        case .unavailable:
+            break
+        }
+        do {
+            try await user.sendEmailVerification(with: Self.verificationLinkSettings)
+            print("AuthService: verification email accepted by Firebase (\(context)) uid=\(user.uid)")
+            await AnalyticsManager.shared.logEvent(.verificationEmailSent, parameters: ["context": context])
+        } catch let error as NSError {
+            let name = error.userInfo[AuthErrorUserInfoNameKey] as? String ?? "?"
+            let underlying = (error.userInfo[NSUnderlyingErrorKey] as? NSError).map { "\($0.domain)#\($0.code) \($0.userInfo)" } ?? "none"
+            print("AuthService: verification email FAILED (\(context)) uid=\(user.uid) code=\(error.code) name=\(name) — \(error.localizedDescription) | underlying: \(underlying)")
+            await AnalyticsManager.shared.trackError(error, context: "verification_send_\(context)")
+            throw error
+        }
+    }
+
+    enum ServerEmailResult { case sent, throttled, unavailable }
+
+    /// Sends a branded auth email through the `sendAuthEmail` Cloud Function.
+    /// Firebase locks template editing on new projects, so its own emails go
+    /// out with a raw URL and a "noreply" sender and land in spam.
+    ///
+    /// `.unavailable` covers everything short of a definite answer — function
+    /// not deployed, SMTP not configured (503), network, 5xx — and callers
+    /// then fall back to Firebase's built-in send, so an email always goes out.
+    /// `.throttled` is final: falling back would just dodge the rate limit.
+    private func sendAuthEmailViaServer(kind: String, email: String? = nil) async -> ServerEmailResult {
+        guard let url = URL(string: AIService.sendAuthEmailURLString) else { return .unavailable }
+        var body: [String: Any] = ["kind": kind]
+        if let email { body["email"] = email }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if kind == "verifyEmail" {
+            guard let token = await AIService.shared.idToken() else { return .unavailable }
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        request.timeoutInterval = 20
+
+        guard let (_, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse else { return .unavailable }
+        switch http.statusCode {
+        case 200: return .sent
+        case 429: return .throttled
+        default:
+            print("AuthService: sendAuthEmail(\(kind)) returned \(http.statusCode) — falling back to Firebase")
+            return .unavailable
+        }
+    }
+
+    /// Continue URL for the verification email.
+    ///
+    /// The template's custom action URL (Firebase Console → Auth → Templates)
+    /// is `https://spilr-100f7.web.app/auth/action`. That domain's
+    /// apple-app-site-association (served automatically by Firebase Hosting)
+    /// claims `/*`, so tapping the link opens the app, which applies the
+    /// `oobCode` itself (`AuthViewModel.handleVerificationLink`). Opened in a
+    /// browser instead, `public/auth/action.html` applies it and tells the user
+    /// to return; the app re-checks on launch and on foreground.
+    ///
+    /// Without the custom action URL the link falls back to Firebase's own
+    /// handler on firebaseapp.com, whose "Continue" button lands on this URL.
+    ///
+    /// Not `handleCodeInApp` + `linkDomain`: Firebase rejects a default hosting
+    /// domain (web.app / firebaseapp.com) as a link domain, and sends nothing.
+    /// That needs a custom domain connected to Hosting.
+    private static let verificationLinkSettings: ActionCodeSettings = {
+        let settings = ActionCodeSettings()
+        settings.url = URL(string: "https://\(returnHost)/")
+        settings.handleCodeInApp = false
+        return settings
+    }()
+
+    /// Host of the continue URL above. `onOpenURL` treats any link to it as
+    /// "the user may have just verified".
+    static let returnHost = "spilr-100f7.web.app"
+
+    /// Pulls a verify-email `oobCode` out of an incoming link. The code may sit
+    /// on the URL itself or on the URL nested in its `link` query parameter
+    /// (the `/__/auth/links` wrapper), so both are searched.
+    static func verificationCode(in url: URL) -> String? {
+        var candidates = [url]
+        if let nested = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "link" })?.value,
+           let nestedURL = URL(string: nested) {
+            candidates.append(nestedURL)
+        }
+        for candidate in candidates {
+            let items = URLComponents(url: candidate, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            guard items.first(where: { $0.name == "mode" })?.value == "verifyEmail" else { continue }
+            if let code = items.first(where: { $0.name == "oobCode" })?.value { return code }
+        }
+        return nil
+    }
+
+    /// Applies a verification link opened in the app, then reloads the user so
+    /// `isEmailVerified` reflects it. Returns whether the email is now verified.
+    func applyVerificationLink(code: String) async throws -> Bool {
+        print("AuthService: applying verification link from inbox")
+        do {
+            try await Auth.auth().applyActionCode(code)
+        } catch let error as NSError {
+            print("AuthService: applyActionCode FAILED code=\(error.code) — \(error.localizedDescription)")
+            await AnalyticsManager.shared.trackError(error, context: "verification_apply_link")
+            throw mapFirebaseError(error)
+        }
+        return try await reloadEmailVerified()
     }
 
     /// Reloads the current user from the server and returns whether their email
@@ -114,7 +275,11 @@ final class AuthService {
     @discardableResult
     func reloadEmailVerified() async throws -> Bool {
         guard let user = Auth.auth().currentUser else { return false }
-        try await user.reload()
+        do {
+            try await user.reload()
+        } catch let error as NSError {
+            throw mapFirebaseError(error)
+        }
         return user.isEmailVerified
     }
 
@@ -273,19 +438,6 @@ final class AuthService {
         }
     }
 
-    // MARK: - Anonymous / Guest Sign In
-    //
-    // Satisfies App Store Guideline 5.1.1(v): apps may not require account
-    // creation to access features that aren't account-based. Anonymous Firebase
-    // Auth gives the guest a real UID so all services (Firestore, AI proxy)
-    // work identically — the user just hasn't set a password or email yet.
-    // The anonymous account can be upgraded to a permanent one later via
-    // AuthViewModel.linkGuestAccount(…).
-    func signInAnonymously() async throws -> AppUser {
-        let result = try await Auth.auth().signInAnonymously()
-        return AppUser(id: result.user.uid, email: "", displayName: nil)
-    }
-
     // MARK: - Upgrade guest → permanent account (link credentials)
     func linkGuestWithEmail(email: String, password: String, displayName: String?) async throws -> AppUser {
         guard let current = Auth.auth().currentUser, current.isAnonymous else {
@@ -301,14 +453,25 @@ final class AuthService {
             req.displayName = name
             try? await req.commitChanges()
         }
-        try? await result.user.sendEmailVerification()
+        try? await sendVerificationLogged(to: result.user, context: "link_guest")
         let user = AppUser(id: result.user.uid, email: email, displayName: trimmedName)
         try await saveUserToFirestore(user)
+        // The uid is unchanged by linking (Firebase keeps the anonymous uid),
+        // but RevenueCat has no reason to know that — without this call the
+        // user stays on RevenueCat's anonymous App User ID indefinitely, the
+        // exact app_user_id/uid divergence identifyRevenueCat's doc comment
+        // above warns about.
+        await identifyRevenueCat(uid: user.id)
         return user
     }
 
     // MARK: - Password Reset
     func sendPasswordReset(email: String) async throws {
+        switch await sendAuthEmailViaServer(kind: "resetPassword", email: email) {
+        case .sent:      return
+        case .throttled: throw AuthError.tooManyRequests
+        case .unavailable: break
+        }
         do {
             try await Auth.auth().sendPasswordReset(withEmail: email)
         } catch let error as NSError {
@@ -318,101 +481,107 @@ final class AuthService {
 
     // MARK: - Sign Out
     func signOut() throws {
+        // Drop this device's push token BEFORE signing out — the read needs
+        // `Auth.auth().currentUser`, and once signed out there is no uid to key
+        // the deletion on. Left undone, the next account on a shared device
+        // would keep receiving this user's weekly letter / daily read pushes.
+        PushNotificationManager.shared.removeCurrentToken()
         try Auth.auth().signOut()
         GIDSignIn.sharedInstance.signOut()
         // Drop the cache-first hydration flags. They record "we have fetched this
         // query at least once" per user, and leaving them set would let the next
         // account on this device serve an empty cache as a real answer.
         FirestoreCacheFirst.reset()
+        // Fire-and-forget: this function is synchronous, and RevenueCat logout
+        // must never delay/block the sign-out the user is waiting on.
+        Task.detached(priority: .utility) { [weak self] in
+            await self?.deidentifyRevenueCat()
+        }
     }
 
     // MARK: - Delete Account
     //
-    // Permanently erases all user data from Firestore, revokes the Apple
-    // OAuth token if applicable, then deletes the Firebase Auth user.
+    // Deletion runs server-side, in the `deleteAccount` Cloud Function. The
+    // client's only jobs are Apple token revocation, making the authenticated
+    // call, and tearing down local state afterwards.
     //
-    // Firebase requires a recent sign-in before `user.delete()` succeeds.
-    // If the token is stale the call throws `requiresRecentLogin` — callers
-    // should surface "please sign out and back in, then try again."
+    // It is not done here on the device because a client `user.delete()`
+    // throws `requiresRecentLogin` for any sign-in older than a few minutes —
+    // which is nearly every session — so the old client-side implementation
+    // silently never deleted anything. Forcing the user back through a sign-in
+    // sheet would have fixed that, but the Admin SDK has no recency rule at
+    // all: the ID token this call carries is proof enough. The function's
+    // header comment has the full rationale, including why it also finishes
+    // more reliably than a chain of awaited batches on a phone that can be
+    // backgrounded mid-erase.
     //
-    // For Sign in with Apple users Apple also requires token revocation
-    // (App Store guideline 5.1.1v). Pass the authorizationCode from a fresh
-    // ASAuthorization when available; pass nil for email/Google accounts.
+    // For Sign in with Apple users Apple requires token revocation (App Store
+    // guideline 5.1.1v). That stays on the client: Firebase already holds the
+    // Apple OAuth config for `revokeToken`, whereas revoking from the function
+    // would mean provisioning an Apple private key for no behavioural gain.
+    // Pass the authorizationCode from a fresh ASAuthorization; pass nil for
+    // email/Google/guest accounts.
     func deleteAccount(appleAuthorizationCode: String? = nil) async throws {
-        guard let user = Auth.auth().currentUser else {
+        guard Auth.auth().currentUser != nil else {
             throw AuthError.unknown("No signed-in user.")
         }
-        let uid = user.uid
 
-        // 1. Delete all Firestore data under users/{uid}.
-        //    Each subcollection is fetched and batch-deleted. Fire-and-forget
-        //    semantics apply — if a partial delete occurs the Auth user is
-        //    still removed and orphaned documents become inaccessible.
-        await eraseFirestoreData(for: uid)
-
-        // 2. Revoke the Apple OAuth token so Apple removes app authorisation
-        //    from the user's Apple ID settings (required by Apple).
+        // 1. Revoke the Apple OAuth token while the account still exists.
+        //    Best-effort — a revoke failure must not leave the user stuck with
+        //    an account they have asked twice to delete.
         if let code = appleAuthorizationCode {
             try? await Auth.auth().revokeToken(withAuthorizationCode: code)
         }
 
-        // 3. Delete the Firebase Auth account. Throws requiresRecentLogin if
-        //    the session is older than ~5 minutes.
-        try await user.delete()
+        // 2. The server erases Firestore + Storage and deletes the Auth user.
+        try await requestServerDeletion()
+
+        // 3. Local teardown. The Auth user is gone, but this client won't
+        //    notice until its token next refreshes, so sign out explicitly —
+        //    that's what fires the state listener and returns the app to the
+        //    signed-out root. The rest mirrors `signOut`; see it for why each
+        //    of these outlives the account otherwise.
+        try? Auth.auth().signOut()
+        GIDSignIn.sharedInstance.signOut()
+        FirestoreCacheFirst.reset()
+
+        // 4. Wipe the device-local half of the account — onboarding progress,
+        //    AI consent, the goals and tone that shape every prompt. Deliberately
+        //    after the sign-out above: clearing `spilr.onboardingCompleted` while
+        //    the app still thinks it's authenticated would flash OnboardingView
+        //    on the way out. See LocalUserState for what each key leaked.
+        await MainActor.run { LocalUserState.clearForDeletedAccount() }
+
+        await deidentifyRevenueCat()
     }
 
-    // Deletes every document in every known subcollection plus the user
-    // root document. Uses WriteBatches (max 500 ops each) to stay within
-    // Firestore limits.
-    //
-    // The collection list lives in `FirestoreSchema.userSubcollections` — do NOT
-    // inline it here again. A previous hand-maintained copy drifted from the names
-    // the services actually write ("reads" vs `dailyReads`, "moods" vs `moodLogs`)
-    // and omitted `riverMarks` and `pushTokens` entirely, so four collections
-    // survived account deletion. One list, one place.
-    private func eraseFirestoreData(for uid: String) async {
-        let userRef = db.collection(FirestoreSchema.users).document(uid)
-
-        for name in FirestoreSchema.userSubcollections {
-            await deleteCollection(userRef.collection(name))
+    /// POSTs to the `deleteAccount` Cloud Function with the user's ID token.
+    /// Throws unless the server reports the account gone — a silent failure
+    /// here would tell the user their data was erased when it wasn't.
+    private func requestServerDeletion() async throws {
+        guard let token = await AIService.shared.idToken() else {
+            throw AuthError.unknown("Couldn't verify your session. Please try again.")
         }
 
-        // Finally, delete the root user document.
-        try? await userRef.delete()
-
-        // Delete Firebase Storage photos (users/{uid}/entryPhotos/).
-        // Storage has no batch-delete API; we list and delete individually.
-        await eraseStorageFolder(path: FirestoreSchema.entryPhotosPath(for: uid))
-    }
-
-    /// Lists and deletes all items under a Storage folder path.
-    private func eraseStorageFolder(path: String) async {
-        let ref = Storage.storage().reference().child(path)
-        guard let result = try? await ref.listAll() else { return }
-        for item in result.items {
-            try? await item.delete()
+        var request = URLRequest(url: URL(string: AIService.deleteAccountURLString)!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let appCheckToken = try? await AppCheck.appCheck().token(forcingRefresh: false) {
+            request.setValue(appCheckToken.token, forHTTPHeaderField: "X-Firebase-AppCheck")
         }
-        // Recurse into any sub-prefixes (e.g. nested folders).
-        for prefix in result.prefixes {
-            await eraseStorageFolder(path: prefix.fullPath)
+        // A long-tenured account is a lot of documents. The function itself is
+        // allowed 540s; don't give up on it from this side first.
+        request.timeoutInterval = 300
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw AuthError.networkError
         }
-    }
-
-    /// Deletes all documents in `collection` in batches of 400.
-    private func deleteCollection(_ collection: CollectionReference) async {
-        guard let snapshot = try? await collection.getDocuments() else { return }
-        let docs = snapshot.documents
-        guard !docs.isEmpty else { return }
-
-        // Firestore batch limit is 500 writes; use 400 for safety headroom.
-        let batchSize = 400
-        var offset = 0
-        while offset < docs.count {
-            let batch = db.batch()
-            let slice = docs[offset ..< min(offset + batchSize, docs.count)]
-            slice.forEach { batch.deleteDocument($0.reference) }
-            try? await batch.commit()
-            offset += batchSize
+        guard http.statusCode == 200 else {
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let detail = (json ?? nil)?["error"] as? String
+            throw AuthError.unknown(detail ?? "Couldn't delete your account. Please try again.")
         }
     }
 
@@ -448,9 +617,15 @@ final class AuthService {
         case AuthErrorCode.invalidEmail.rawValue:           return .invalidEmail
         case AuthErrorCode.weakPassword.rawValue:           return .weakPassword
         case AuthErrorCode.emailAlreadyInUse.rawValue:      return .emailAlreadyInUse
+        // `invalidCredential` is what a wrong password comes back as once email
+        // enumeration protection is on (the default for new projects) — without
+        // it the reauthentication sheet shows Firebase's raw "supplied auth
+        // credential is malformed or has expired" for a simple typo.
         case AuthErrorCode.wrongPassword.rawValue,
+             AuthErrorCode.invalidCredential.rawValue,
              AuthErrorCode.userNotFound.rawValue:           return .invalidCredentials
         case AuthErrorCode.networkError.rawValue:           return .networkError
+        case AuthErrorCode.tooManyRequests.rawValue:        return .tooManyRequests
         default:                                            return .unknown(error.localizedDescription)
         }
     }

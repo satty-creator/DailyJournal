@@ -102,12 +102,45 @@ final class EchoService {
     // MARK: - Answer
 
     /// Call when the user confirms an echo (taps "done", "it happened", etc.).
+    /// `response` is the optional "how did it go?" text, in the user's own words.
     /// Fire-and-forget.
-    func markAnswered(id: String, userId: String) {
-        collection(for: userId).document(id).updateData([
+    func markAnswered(_ echo: Echo, response: String?) {
+        let trimmed = response?.trimmingCharacters(in: .whitespacesAndNewlines)
+        var fields: [String: Any] = [
             "status":     EchoStatus.answered.rawValue,
             "answeredAt": Timestamp(date: Date())
-        ])
+        ]
+        if let trimmed, !trimmed.isEmpty { fields["response"] = trimmed }
+        collection(for: echo.userId).document(echo.id).updateData(fields)
+
+        if let trimmed, !trimmed.isEmpty {
+            recordOutcome(for: echo, response: trimmed)
+        }
+    }
+
+    /// An answered echo is the only place the app learns what actually HAPPENED
+    /// after something the user said they would do — everything else it stores is
+    /// an intention or an interpretation. Episodes are the one unit the nightly
+    /// miner can build an action→outcome claim from, so the outcome is appended
+    /// to the source entry's analysis as one.
+    ///
+    /// Three constraints worth knowing (all in `mineHypothesesForUser`,
+    /// functions/index.js): `arrayUnion` rather than read-modify-write, because
+    /// `analyzeEntry` owns this document and persists it with `setData`; a later
+    /// re-analysis (only triggered by editing the entry text) drops the episode;
+    /// and the miner reads only the first 3 episodes, so an entry that already
+    /// produced 3 will not carry this one to the model.
+    private func recordOutcome(for echo: Echo, response: String) {
+        let episode = EpisodeFrame(
+            episodeId: "echo-\(echo.id)",
+            situation: echo.quote,
+            emotions: [],
+            bodySignals: [],
+            outcome: response
+        )
+        db.collection("users").document(echo.userId)
+            .collection("entryAnalyses").document(echo.sourceEntryId)
+            .updateData(["episodes": FieldValue.arrayUnion([episode.toFirestoreData()])])
     }
 
     // MARK: - Decay

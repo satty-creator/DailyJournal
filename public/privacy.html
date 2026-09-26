@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Spilr — Privacy Policy</title>
+<style>
+  :root { color-scheme: light; }
+  body {
+    margin: 0;
+    background: #FBF3EA;
+    color: #2B1B10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+  }
+  main {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 48px 24px 96px;
+  }
+  h1 {
+    font-size: 2rem;
+    margin-bottom: 4px;
+  }
+  .updated {
+    color: #8A7A6E;
+    font-size: 0.85rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: 0.02em;
+    margin-bottom: 40px;
+  }
+  h2 {
+    font-size: 1.25rem;
+    margin-top: 40px;
+    margin-bottom: 12px;
+  }
+  p {
+    margin: 0 0 14px;
+  }
+  a { color: #C1592E; }
+  hr {
+    border: none;
+    border-top: 1px solid rgba(43, 27, 16, 0.1);
+    margin: 32px 0;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Spilr — Privacy Policy</h1>
+  <div class="updated">Last updated: 18 September 2026</div>
+
+  <h2>The short version</h2>
+  <p>You write private things here, so you should know exactly where they go.</p>
+  <p>What you write is stored in your account on our servers, and it is linked to your account — that is how it is still there tomorrow and on your other devices. It is not anonymous, and we are not going to pretend it is.</p>
+  <p>Nobody else reads it. We do not sell it, we do not advertise against it, and we do not use it to train AI models. You can delete all of it, permanently, from Settings.</p>
+
+  <h2>What we store</h2>
+  <p><strong>Your entries.</strong> The full text of everything you write, plus any title, tags, mood and photo attached to it. Stored under your account.</p>
+  <p><strong>What we work out from your entries.</strong> To make Today's Read, Echoes, Mirror and Patterns work, the app derives and saves things like recurring themes, emotional vocabulary, short quotes lifted from your own entries, and the names of people or places you mention. These are stored under your account too. They are not anonymised or pooled with other users.</p>
+  <p><strong>Your account details.</strong> Email address, display name, sign-in method, time zone, and the notification token for your device.</p>
+  <p><strong>Your Google Calendar, if you connect it.</strong> This is entirely optional and off by default. If you connect it, the app reads your primary calendar's event titles, times, and locations, directly from Google, to show them to you in Spilr's own Calendar view. We request read-only access and never create, edit, or delete anything on your calendar. This data is not stored on our servers and not sent to any AI — it's fetched live from Google each time you open the Calendar view, and only stays in memory on your device. You can disconnect at any time from Settings, or revoke access entirely from your Google Account's permissions page.</p>
+  <p>That is the whole list. We do not collect your contacts, your location (beyond what you've chosen to put in a connected calendar event), your health data, or your activity in other apps.</p>
+
+  <h2>Who can see it</h2>
+  <p><strong>You.</strong> Other users cannot see your entries, and there is no social feed, following, or sharing by default.</p>
+  <p><strong>Our infrastructure providers, as processors.</strong> Your data lives in Google Firebase (Firestore, Authentication, Cloud Storage, Cloud Functions).</p>
+  <p><strong>Us, in narrow circumstances.</strong> Technically we hold the keys to the database, so we could read your entries. We do not, as a matter of practice: no employee browses user journals. We would only access specific data if you asked us to for support, or if we were legally compelled. Your entries are not encrypted in a way that would make us unable to read them — see "What we have not built".</p>
+  <p><strong>Nobody else.</strong> We do not sell, rent, or share your data with advertisers, data brokers, or analytics companies.</p>
+
+  <h2>AI, and what it is sent</h2>
+  <p>The reflective features are powered by Google Gemini, reached through our own server so that no AI key ever sits in the app.</p>
+  <p><strong>When AI Insights is on,</strong> the text of your recent entries is sent to Gemini to generate reflections, questions and patterns. Google processes it to return a result and does not use it to train their models. We do not keep a separate copy of the prompt.</p>
+  <p><strong>When AI Insights is off,</strong> nothing is sent to Gemini. The app falls back to on-device logic, and every feature still works — just more simply. You can switch this in Settings at any time.</p>
+  <p><strong>What the AI is not.</strong> It is not a therapist, a doctor, or a diagnostic tool. It is instructed never to diagnose you, never to use clinical language, and never to treat a repeated feeling as a medical conclusion. It is a language model and it can still get things wrong — if something it says does not sound like you, it isn't you, and you can tell it so.</p>
+
+  <h2>Deleting your data</h2>
+  <p><strong>Settings → Delete account</strong> permanently erases your entries, everything derived from them, your photos, and your account itself. It is immediate and it is not recoverable — there is no restore.</p>
+  <p>If you want a copy of your data, or want specific entries removed rather than all of them, email <a href="mailto:support@spilr.app">support@spilr.app</a> and we will do it by hand. There is no self-service export in the app yet.</p>
+
+  <h2>What we have not built</h2>
+  <p>We would rather tell you this than let you assume otherwise.</p>
+  <p><strong>Your entries are not end-to-end encrypted.</strong> They are encrypted in transit and encrypted at rest by our hosting provider, which is standard — but we hold the keys, not you. A journal that only you could ever decrypt is a genuinely better design and it is not what ships today.</p>
+  <p><strong>There is no in-app data export yet.</strong> Ask us and we will send it.</p>
+  <p>We will update this page when either of those changes, rather than quietly leaving it vague.</p>
+
+  <h2>Children</h2>
+  <p>Spilr is not intended for anyone under 13, and we do not knowingly collect data from children. If you believe a child has created an account, email us and we will delete it.</p>
+
+  <h2>Changes to this policy</h2>
+  <p>If we change how we handle your data, we will update this page and the date at the top, and surface a notice in the app rather than relying on you to re-read it.</p>
+
+  <h2>Contact</h2>
+  <p>Questions, deletion requests, or a copy of your data: <a href="mailto:support@spilr.app">support@spilr.app</a></p>
+  <p>If you are in the UK or EU, journal content counts as special-category data under UK-GDPR / GDPR Article 9, and you have rights of access, correction, erasure and objection. Email us and we will action it. The data controller is the publisher of Spilr; processing by Google Firebase and Gemini is governed by our agreement with Google Cloud.</p>
+</main>
+</body>
+</html>

@@ -2,11 +2,12 @@
 //  TemplateGalleryView.swift
 //  DailyJournal
 //
-//  The "Templates" gallery — Spilr Redesign 3b, pushed from the start sheet.
+//  The "Templates" gallery, presented as a sheet from the invitation card's
+//  "Templates" chip on Home.
 //
 //  Cards are tappable: picking one hands the template back to `onStart`,
-//  which `HomeView` uses to stash a `StartChoice.template` and present
-//  `TemplateRunnerView` — see `HomeView.handlePendingStart`.
+//  which `HomeView` uses to stash the pick and present `TemplateRunnerView`
+//  once this sheet has finished dismissing.
 //
 
 import SwiftUI
@@ -87,8 +88,8 @@ struct TemplateGalleryView: View {
     private var header: some View {
         HStack(alignment: .top, spacing: 12) {
             Button { dismiss() } label: {
-                Image(systemName: "chevron.left")
-                    .font(.system(size: 16, weight: .semibold))
+                Image(systemName: "xmark")
+                    .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(AppTheme.inkSoft)
                     .frame(width: 34, height: 34)
                     .background(AppTheme.cream.opacity(0.7))
@@ -96,7 +97,7 @@ struct TemplateGalleryView: View {
                     .overlay(Circle().stroke(AppTheme.inkSoft.opacity(0.15), lineWidth: 1))
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Back")
+            .accessibilityLabel("Close")
 
             VStack(alignment: .leading, spacing: 4) {
                 Text("Templates")

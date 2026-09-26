@@ -225,10 +225,14 @@ final class HomeViewModel: ObservableObject {
 
     /// User confirmed the echo ("done ✓", "it happened", "noted").
     /// Called after the EchoAnsweredView sheet is closed.
-    func answerEcho() {
-        guard let echo = pendingEcho else { return }
-        AnalyticsManager.shared.trackEchoAnswered()
-        echoService.markAnswered(id: echo.id, userId: userId)
+    ///
+    /// Takes the echo explicitly rather than reading `pendingEcho`: the view
+    /// captures it on tap precisely because `pendingEcho` may already be nil by
+    /// the time the sheet's `onDismiss` fires, and guarding on it here meant the
+    /// write and the analytics event were silently skipped when that raced.
+    func answerEcho(_ echo: Echo, response: String?) {
+        AnalyticsManager.shared.trackEchoAnswered(hasResponse: !(response ?? "").isEmpty)
+        echoService.markAnswered(echo, response: response)
         withAnimation(.easeOut(duration: 0.25)) { pendingEcho = nil }
     }
 }
@@ -243,45 +247,52 @@ struct HomeView: View {
     @State private var showingDailyChat     = false
     @State private var showProfile          = false
     @State private var showAsk              = false
+    @State private var showCalendar         = false
     /// First-entry celebration: shown once when the user saves their very first entry.
     @AppStorage("spilr.firstEntryCelebrationShown") private var firstEntryCelebrationShown = false
     @State private var celebrationEntry: JournalEntry?
-    /// The echo currently being answered — captured on tap so it survives
-    /// `vm.pendingEcho` clearing to nil before the sheet's `onDismiss` runs.
+    /// Drives the answered sheet. `.sheet(item:)` clears this before `onDismiss`
+    /// runs, so the write below reads `echoPendingWrite` instead.
     @State private var answeringEcho: Echo?
+    /// The echo whose answer still needs writing, and what the user typed into
+    /// the sheet. Both live here rather than inside `EchoAnsweredView` because
+    /// `onDismiss` — which performs the write — cannot see that view's state.
+    @State private var echoPendingWrite: Echo?
+    @State private var echoResponse = ""
 
     /// The starter prompt passed into the Spill write screen. Empty when
-    /// reached via the start sheet's "Blank page" — SpillWriteView already
-    /// handles an empty prompt by picking its own starter.
+    /// reached via the invitation card's "Blank page" chip — SpillWriteView
+    /// already handles an empty prompt by picking its own starter.
     @State private var spillPrompt = ""
 
-    // ── Start sheet ("How do you want to start?", Spilr Redesign 3b) ────
-    @State private var showingStartSheet = false
-    /// Empty = the options screen; `[.templates]` = the pushed gallery. Also
-    /// what the sheet's own detent (short ↔ `.large`) is keyed off, so the
-    /// sheet grows in the same transaction as the push.
-    @State private var startPath: [StartRoute] = []
-    /// Set by an option row, read by the sheet's `onDismiss` once the sheet
-    /// has actually finished dismissing — see the note at the `.sheet` call
-    /// site for why a cover can't be presented directly from the row's action.
-    @State private var pendingStart: StartChoice?
-    /// Set alongside `showingDailyChat` when the start sheet's "Talk it out"
-    /// row is chosen, so the chat cover knows to open the mic immediately.
+    // ── Templates ───────────────────────────────────────────────────────
+    /// The gallery, opened by the invitation card's "Templates" chip.
+    @State private var showingTemplates = false
+    /// The template picked in the gallery, read by the sheet's `onDismiss`
+    /// once the sheet has actually finished dismissing — the runner is a
+    /// `fullScreenCover` and one can't be presented while a sheet is on its
+    /// way out, so the choice is stashed rather than acted on directly.
+    @State private var pendingTemplate: JournalTemplate?
+    /// Set alongside `showingDailyChat` when the invitation card's mic is
+    /// tapped, so the chat cover opens in voice-first mode (big talk/send
+    /// button, already listening — see `DailyChatView.isVoiceMode`). Always set
+    /// explicitly on both paths — it used to latch on, so once a user had
+    /// talked once, every later tap on the card's primary action reopened the
+    /// chat with the mic already hot.
     @State private var startChatWithDictation = false
     /// The template whose guided runner is currently presented. `nil` = no
-    /// runner on screen. Set from `handlePendingStart`'s `.template` case;
+    /// runner on screen. Set from the gallery sheet's `onDismiss`;
     /// `JournalTemplate`'s `Identifiable` id lets this drive
     /// `.fullScreenCover(item:)` directly.
     @State private var runningTemplate: JournalTemplate?
     /// Set by `TemplateRunnerView.onExitWithoutSaving` right before it calls
-    /// `dismiss()`. The Templates gallery the runner was opened from lives on
-    /// the start sheet's own `NavigationStack` and is already torn down by
-    /// the time the runner is on screen (see `handlePendingStart`) — so
+    /// `dismiss()`. The Templates gallery the runner was opened from is a
+    /// sheet, already dismissed by the time the runner is on screen — so
     /// without this, every exit lands on Home instead of back on the gallery
     /// to browse another exercise. Read (and reset) in the cover's
     /// `onDismiss`, once the runner is actually gone, for the same
-    /// can't-present-while-dismissing reason `pendingStart` is stashed rather
-    /// than acted on directly.
+    /// can't-present-while-dismissing reason `pendingTemplate` is stashed
+    /// rather than acted on directly.
     @State private var returnToTemplatesGalleryOnDismiss = false
 
     @ObservedObject private var mirrorVM: MirrorViewModel
@@ -311,26 +322,6 @@ struct HomeView: View {
               celebrationEntry == nil
         else { return }
         celebrationEntry = first
-    }
-
-    /// Fires the cover the start sheet's chosen row actually wants, once the
-    /// sheet has finished dismissing (see `.sheet(isPresented: $showingStartSheet)`).
-    private func handlePendingStart() {
-        guard let choice = pendingStart else { return }
-        pendingStart = nil
-        switch choice {
-        case .spill:
-            spillPrompt = ""
-            showingTimedSession = true
-        case .chat:
-            startChatWithDictation = false
-            showingDailyChat = true
-        case .talk:
-            startChatWithDictation = true
-            showingDailyChat = true
-        case .template(let template):
-            runningTemplate = template
-        }
     }
 
     var body: some View {
@@ -377,7 +368,10 @@ struct HomeView: View {
                 // very-first-entry case is handled at the celebration-sheet
                 // dismiss below (the ideal high-consent moment). iOS shows the
                 // system prompt only once regardless of how often this is called.
-                if !vm.recentEntries.isEmpty {
+                // Also held while the post-onboarding Spilr Pro paywall is
+                // pending — MainTabView asks for push once it closes, so the
+                // system alert never lands on top of the paywall.
+                if !vm.recentEntries.isEmpty && !PaywallPresenter.hasPendingOnboardingPaywall {
                     PushNotificationManager.shared.requestAuthorization()
                 }
             }
@@ -417,54 +411,20 @@ struct HomeView: View {
                     }
                 }
             }
-            .sheet(isPresented: $showingStartSheet, onDismiss: {
-                // Reset in onDismiss, not onAppear — otherwise reopening the
-                // sheet lands straight back on the gallery instead of the
-                // options screen.
-                startPath = []
-                handlePendingStart()
-            }) {
-                NavigationStack(path: $startPath) {
-                    StartOptionsView(
-                        onPick: { choice in
-                            // A fullScreenCover can't be presented while this
-                            // sheet is still dismissing — stash the choice and
-                            // let onDismiss above fire it once the sheet is
-                            // actually gone, rather than acting here directly.
-                            pendingStart = choice
-                            showingStartSheet = false
-                        },
-                        onOpenTemplates: { startPath = [.templates] }
-                    )
-                    .navigationDestination(for: StartRoute.self) { _ in
-                        TemplateGalleryView(onStart: { template in
-                            // Same stash-and-dismiss dance as the other three
-                            // choices — the runner is a fullScreenCover, and
-                            // one can't present while this sheet is still
-                            // dismissing.
-                            pendingStart = .template(template)
-                            showingStartSheet = false
-                        })
-                    }
+            .sheet(isPresented: $showingTemplates, onDismiss: {
+                // A fullScreenCover can't be presented while this sheet is
+                // still dismissing — fire the stashed pick once it's gone.
+                if let template = pendingTemplate {
+                    pendingTemplate = nil
+                    runningTemplate = template
                 }
-                // 420 used to leave the invitation card's cream "Begin →"
-                // button peeking out above the sheet's rounded top corner —
-                // it read as a stray shape stuck to the modal. 500 clears the
-                // card entirely, `dayOne` copy included (its body text runs
-                // longer than the returning-user copy).
-                .presentationDetents(startPath.isEmpty ? [.height(500)] : [.large])
-                // `StartOptionsView` draws its own drag-handle capsule, so the
-                // system indicator stays hidden here too — otherwise the two
-                // overlap on the options screen.
-                .presentationDragIndicator(.hidden)
+            }) {
+                TemplateGalleryView(onStart: { template in
+                    pendingTemplate = template
+                    showingTemplates = false
+                })
+                .presentationDetents([.large])
                 .presentationCornerRadius(28)
-                // `.clear`, not `AppTheme.paper` — `StartOptionsView` now
-                // paints its own rounded-top background (see
-                // `sheetCornerRadius` there). A system-drawn background here
-                // left a seam along the top edge against dark content behind
-                // the sheet (e.g. the "Today with Spilr" card) on the custom
-                // `.height(420)` detent.
-                .presentationBackground(.clear)
             }
             .fullScreenCover(item: $runningTemplate, onDismiss: {
                 Task {
@@ -475,11 +435,9 @@ struct HomeView: View {
                 }
                 if returnToTemplatesGalleryOnDismiss {
                     returnToTemplatesGalleryOnDismiss = false
-                    // Reopens the start sheet straight onto the gallery,
-                    // rather than the options screen it normally starts on —
-                    // mirrors `onOpenTemplates` pushing `.templates`.
-                    startPath = [.templates]
-                    showingStartSheet = true
+                    // Back to browsing, rather than dumping the user on Home
+                    // after they backed out of an exercise.
+                    showingTemplates = true
                 }
             }) { template in
                 TemplateRunnerView(
@@ -515,11 +473,19 @@ struct HomeView: View {
             .sheet(isPresented: $showAsk) {
                 AskView(userId: vm.userId)
             }
+            .sheet(isPresented: $showCalendar) {
+                CalendarView()
+            }
             .sheet(item: $vm.selectedLetter) { letter in
                 JournalEditorView(userId: vm.userId, existingEntry: letter)
             }
-            .sheet(item: $answeringEcho, onDismiss: { vm.answerEcho() }) { echo in
-                EchoAnsweredView(echo: echo)
+            .sheet(item: $answeringEcho, onDismiss: {
+                guard let echo = echoPendingWrite else { return }
+                vm.answerEcho(echo, response: echoResponse)
+                echoPendingWrite = nil
+                echoResponse = ""
+            }) { echo in
+                EchoAnsweredView(echo: echo, response: $echoResponse)
             }
         }
         .trackScreen(.home)
@@ -604,12 +570,27 @@ struct HomeView: View {
             .opacity(headerReady ? 1 : 0)
             .animation(.easeInOut(duration: 0.25), value: headerReady)
             Spacer()
-            // Single profile chip showing the user's initial.
-            Button { showProfile = true } label: {
-                avatarChip(profileInitial, colors: [AppTheme.rose, AppTheme.lav])
+            HStack(spacing: 12) {
+                Button { showCalendar = true } label: {
+                    Image(systemName: "calendar")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(AppTheme.ink)
+                        .frame(width: 38, height: 38)
+                        .background(AppTheme.cream)
+                        .clipShape(Circle())
+                        .shadow(color: AppTheme.cardShadow, radius: 6, x: 0, y: 3)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Calendar")
+
+                // Single profile chip showing the user's initial.
+                Button { showProfile = true } label: {
+                    avatarChip(profileInitial, colors: [AppTheme.rose, AppTheme.lav])
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Profile")
+                .accessibilityIdentifier("home.profile")
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Profile")
         }
         .padding(.horizontal, 20)
         .padding(.top, 60)
@@ -641,12 +622,18 @@ struct HomeView: View {
         invitationCard
     }
 
-    /// The dark hero CTA — always present, always the primary way in.
+    /// The dark hero CTA — always present, always the primary way in, and now
+    /// the only way in: all four composers hang off it directly.
     private var invitationCard: some View {
         InvitationCardView(
             dayOne: vm.entriesLoaded ? vm.recentEntries.isEmpty : nil,
-            onPrimary: { showingDailyChat = true },
-            onMoreWays: { showingStartSheet = true }
+            // Reset explicitly on both chat paths. `startWithDictation` is read
+            // when the cover is built, and this flag used to be set true and
+            // never cleared.
+            onWrite:     { startChatWithDictation = false; showingDailyChat = true },
+            onSpeak:     { startChatWithDictation = true;  showingDailyChat = true },
+            onBlankPage: { spillPrompt = ""; showingTimedSession = true },
+            onTemplates: { showingTemplates = true }
         )
         .padding(.horizontal, 20)
         .padding(.bottom, 16)
@@ -730,7 +717,11 @@ struct HomeView: View {
                 echo: echo,
                 onSkip: { vm.skipEcho() },
                 onNotYet: { vm.skipEcho() },
-                onAnswer: { answeringEcho = echo },
+                onAnswer: {
+                    echoResponse = ""
+                    echoPendingWrite = echo
+                    answeringEcho = echo
+                },
                 onThemeTap: { router.showInJournal(entryId: nil) }
             )
             .padding(.horizontal, 20)

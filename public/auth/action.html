@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex">
+<title>Spilr</title>
+<!--
+  Custom action URL for Firebase Auth emails (Console → Authentication →
+  Templates → Customize action URL = https://spilr-100f7.web.app/auth/action).
+
+  With the app installed, iOS opens the app for this URL (the domain's
+  auto-served apple-app-site-association claims /*) and the app applies the
+  code itself. This page only runs when the link opens in a browser.
+
+  verifyEmail is handled here. Every other mode (resetPassword, recoverEmail,
+  …) is forwarded to Firebase's default handler, since the custom action URL
+  applies to all templates.
+-->
+<style>
+  :root { color-scheme: light; }
+  body {
+    margin: 0;
+    background: #FBF3EA;
+    color: #2B1B10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+  }
+  main {
+    max-width: 480px;
+    padding: 24px 16px;
+    text-align: center;
+  }
+  h1 {
+    font-size: 2.5rem;
+    font-style: italic;
+    margin-bottom: 8px;
+  }
+  h2 {
+    font-size: 1.3rem;
+    font-weight: 600;
+    margin: 24px 0 8px;
+  }
+  p {
+    color: #8A7A6E;
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>spilr.</h1>
+  <h2 id="title">Verifying your email…</h2>
+  <p id="detail"></p>
+</main>
+<script>
+  (function () {
+    var params = new URLSearchParams(location.search);
+    var mode = params.get("mode");
+
+    if (mode !== "verifyEmail") {
+      location.replace("https://spilr-100f7.firebaseapp.com/__/auth/action" + location.search);
+      return;
+    }
+
+    var title = document.getElementById("title");
+    var detail = document.getElementById("detail");
+    function show(t, d) { title.textContent = t; detail.textContent = d; }
+
+    var code = params.get("oobCode");
+    var key = params.get("apiKey");
+    if (!code || !key) {
+      show("This link is incomplete", "Open the Spilr app and tap Resend email for a fresh link.");
+      return;
+    }
+
+    fetch("https://identitytoolkit.googleapis.com/v1/accounts:update?key=" + encodeURIComponent(key), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ oobCode: code })
+    })
+      .then(function (res) {
+        if (res.ok) {
+          show("Email verified", "You're all set. Go back to the Spilr app to continue.");
+        } else {
+          show("This link has expired", "It may already have been used. Go back to the Spilr app. If you're still asked to verify, tap Resend email.");
+        }
+      })
+      .catch(function () {
+        show("Couldn't reach the server", "Check your connection and open the link again.");
+      });
+  })();
+</script>
+</body>
+</html>

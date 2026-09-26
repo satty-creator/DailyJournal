@@ -11,12 +11,17 @@ import SwiftUI
 enum SessionType: String, Codable, CaseIterable {
     case timed        = "ninetySecond"   // raw value kept for Firestore back-compat
     case freeWrite    = "freeWrite"
-    /// An entry woven from a Daily Chat conversation with Spilr (Day One-style
-    /// interactive journaling). Behaves exactly like any other entry downstream —
-    /// Echoes, River and Patterns all treat it as normal prose.
+    /// An entry woven from a Daily Chat conversation with Spilr, back when chat had
+    /// a "Casual Vent" mode alongside Thought Journal (retired — chat is Thought
+    /// Journal only now, and always saves as `.cbtReframe`). No longer a write
+    /// target; kept only to decode historical entries. Behaves exactly like any
+    /// other entry downstream — Echoes, River and Patterns all treat it as normal
+    /// prose.
     case dailyChat    = "dailyChat"
-    /// A structured thought-journal card produced by the "Unpack Stress" chat
-    /// mode. Stored as markdown; behaves like any other entry downstream.
+    /// A structured Journal Snapshot card (Focus / Hurdle / Shift) produced by
+    /// Daily Chat. Stored as plain text; behaves like any other entry downstream.
+    /// (Raw value kept as "cbtReframe" for Firestore back-compat, from when this
+    /// was one of two chat modes.)
     case cbtReframe   = "cbtReframe"
     /// A guided template run (`TemplateRunnerViewModel`) — a short structured
     /// exercise whose answers were woven into prose. Behaves like any other

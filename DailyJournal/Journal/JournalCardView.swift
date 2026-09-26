@@ -64,7 +64,7 @@ struct JournalCardView: View {
                     ForEach(entry.tags.prefix(4), id: \.self) { tag in
                         Text("#\(tag)")
                             .font(.system(size: 11, weight: .bold))
-                            .foregroundStyle(entry.accentColor.mix(with: AppTheme.ink, by: 0.35))
+                            .foregroundStyle(entry.accentColor.blended(with: AppTheme.ink, amount: 0.35))
                             .padding(.horizontal, 11)
                             .padding(.vertical, 6)
                             .background(entry.accentColor.opacity(0.32))

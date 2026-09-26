@@ -120,9 +120,11 @@ final class JournalEditorViewModel: ObservableObject {
 
         let trimmed   = content.trimmingCharacters(in: .whitespacesAndNewlines)
         let sentiment = sentimentLabel ?? LocalAI.detectSentiment(from: trimmed)
-        let localRef  = SpilrVoice.localReflection(from: trimmed, sentiment: sentiment)
-        let bullets   = aiSummaryBullets.isEmpty ? localRef.observations : aiSummaryBullets
-        let question  = aiQuestion ?? localRef.question
+        // Reflection is AI-only — see CLAUDE.md, "No local text in Spilr's voice".
+        // On a new entry these are empty and `EntryEnrichment` patches them in when
+        // Gemini answers; on an edit they carry whatever the entry already had.
+        let bullets   = aiSummaryBullets
+        let question  = aiQuestion
 
         if let selectedMood {
             AnalyticsManager.shared.trackMoodLogged(mood: selectedMood.rawValue)
@@ -163,16 +165,6 @@ final class JournalEditorViewModel: ObservableObject {
             service.createEntry(entry)
             savedEntry = entry
             savedId = entry.id
-
-            let wordCount = trimmed.split(separator: " ").count
-            AnalyticsManager.shared.trackEntryCreated(
-                sessionType: "freeWrite",
-                wordCount: wordCount,
-                hasMood: selectedMood != nil,
-                hasPhoto: photo != nil,
-                hasAI: !bullets.isEmpty,
-                duration: Date().timeIntervalSince(entry.createdAt)
-            )
         }
 
         // The entry is committed — drop any saved draft so it doesn't resurface.
@@ -194,7 +186,9 @@ final class JournalEditorViewModel: ObservableObject {
             text: trimmed,
             photo: photo,
             service: service,
-            extractEcho: isNewEntry
+            extractEcho: isNewEntry,
+            sessionType: .freeWrite,
+            mood: selectedMood
         )
     }
 

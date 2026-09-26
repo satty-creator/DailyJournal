@@ -28,6 +28,17 @@ enum LocalAI {
         return sentimentLabels.first { $0.caseInsensitiveCompare(raw) == .orderedSame }
     }
 
+    /// True for entries too sparse to support any real reflection — a couple of
+    /// words, "ok", a typo. Below this bar, fabricating an "observation" just
+    /// invents meaning from noise; callers should fall back to the raw text
+    /// instead (see JournalEntry.displayTitle).
+    static func isLowContent(_ text: String) -> Bool {
+        let words = text.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+        return words.count <= 3
+    }
+
     static func detectSentiment(from text: String) -> String {
         let lower = text.lowercased()
 
@@ -228,101 +239,4 @@ enum LocalAI {
         return Array(scored.prefix(limit)).map { $0.tag }
     }
 
-    // MARK: - Tiny act
-    /// A small, concrete, behavioural suggestion (NOT a question) derived from the
-    /// text's dominant topic — mirrors the prototype's "Today's Tiny Act."
-    static func tinyAct(from text: String) -> String {
-        let acts: [String: String] = [
-            "work":       "Write tomorrow's first task on a sticky note, then close the laptop.",
-            "sleep":      "Tonight: dim the lights and put your phone across the room.",
-            "people":     "Send one honest sentence to someone — skip the perfect reply.",
-            "money":      "Open the banking app once, look, and close it. No fixing tonight.",
-            "food":       "Drink one glass of water before your next meal.",
-            "health":     "Take three slow breaths, longer on the exhale.",
-            "exercise":   "Take a 7-minute walk and notice one physical sensation.",
-            "home":       "Clear one surface — just one — and stop there.",
-            "love":       "Name one thing you appreciate about them, out loud if you can.",
-            "study":      "Set a 10-minute timer and start the smallest piece.",
-            "creativity": "Make something tiny and bad on purpose for two minutes.",
-            "nature":     "Step outside for two minutes and look up."
-        ]
-        let topic = extractTopics(from: text, limit: 1).first
-        return acts[topic ?? ""]
-            ?? "Pick one tiny thing future-you would thank you for — keep it two minutes small."
-    }
-
-    // MARK: - Summary Bullets
-    /// Returns up to 3 short bullets that summarise the entry.
-    /// This is intentionally simple local logic — replace with an LLM call for the real product.
-    static func generateBullets(from text: String) -> [String] {
-        let sentences = text
-            .components(separatedBy: CharacterSet(charactersIn: ".!?"))
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { $0.count > 20 }
-
-        guard !sentences.isEmpty else { return [] }
-
-        // Score sentences by emotional weight
-        let emotionWords = Set(["feel", "feels", "feeling", "felt", "think", "thought", "want",
-                                "need", "wish", "hope", "fear", "love", "hate", "miss", "worry",
-                                "wonder", "realize", "realise", "know", "understand", "angry",
-                                "sad", "happy", "excited", "scared", "tired", "frustrated", "proud"])
-
-        let scored = sentences.map { s -> (sentence: String, score: Int) in
-            let words = s.lowercased().split(separator: " ").map(String.init)
-            let score = words.filter { emotionWords.contains($0) }.count
-            return (s, score)
-        }.sorted { $0.score > $1.score }
-
-        return Array(scored.prefix(3)).map { s in
-            // Trim to max 80 chars for display
-            let trimmed = s.sentence
-            return trimmed.count > 80 ? String(trimmed.prefix(77)) + "…" : trimmed
-        }
-    }
-
-    // MARK: - Reflective Question
-    static func generateQuestion(from text: String, sentiment: String) -> String {
-        let questions: [String: [String]] = [
-            "Anxious": [
-                "What's the worst realistic outcome — and could you handle it?",
-                "Whose voice is in your head when you imagine things going wrong?",
-                "What would feel like enough to manage this?"
-            ],
-            "Sad": [
-                "What do you need from someone right now — and have you asked?",
-                "What would it mean to be gentle with yourself today?",
-                "If this sadness could speak, what would it say?"
-            ],
-            "Frustrated": [
-                "What expectation isn't being met — and is that expectation fair?",
-                "What part of this is in your control?",
-                "What would letting go of this actually feel like?"
-            ],
-            "Excited": [
-                "What would it mean if this went better than you expected?",
-                "What are you most afraid of losing if this goes well?",
-                "Who needs to know you're excited about this?"
-            ],
-            "Happy": [
-                "What made today different — can you make more of it?",
-                "Who contributed to how you're feeling right now?",
-                "What would you tell yourself on a harder day to remember this?"
-            ],
-            "Calm": [
-                "What helped you arrive at this feeling?",
-                "What would protect this calm if tomorrow gets harder?",
-                "What can you appreciate about this moment?"
-            ]
-        ]
-
-        let fallbacks = [
-            "What would the most honest version of you add to this?",
-            "What are you not saying here that matters?",
-            "If you re-read this in a year, what would surprise you?"
-        ]
-
-        let options = questions[sentiment] ?? fallbacks
-        return options[Int.random(in: 0..<options.count)]
-    }
 }

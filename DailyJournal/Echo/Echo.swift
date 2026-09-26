@@ -74,6 +74,11 @@ struct Echo: Identifiable, Codable {
     /// Spilr's voice line that FRAMES the quote (shown above it). The whole point
     /// of an echo's depth — a perspective, not a replay. Optional + default-safe.
     var line: String?
+    /// What the user said actually happened, in their own words, when the echo
+    /// came back. The only place the app learns an OUTCOME rather than an
+    /// intention — see `EchoService.markAnswered`, which also folds this into
+    /// the source entry's analysis as an episode so the nightly miner can use it.
+    var response: String?
 
     // MARK: - Computed
 
@@ -144,6 +149,7 @@ struct Echo: Identifiable, Codable {
         self.answeredAt           = (data["answeredAt"] as? Timestamp)?.dateValue()
         self.themeKeyword         = data["themeKeyword"] as? String
         self.line                 = data["line"] as? String
+        self.response             = data["response"] as? String
     }
 
     // MARK: - Firestore serialisation
@@ -165,6 +171,7 @@ struct Echo: Identifiable, Codable {
         if let answeredAt   = answeredAt   { data["answeredAt"]   = Timestamp(date: answeredAt) }
         if let themeKeyword = themeKeyword { data["themeKeyword"] = themeKeyword }
         if let line         = line         { data["line"]         = line }
+        if let response     = response     { data["response"]     = response }
         return data
     }
 }

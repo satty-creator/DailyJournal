@@ -71,8 +71,9 @@ final class MirrorViewModel: ObservableObject {
     /// It only covers the Firestore fan-out, which is fast and cache-first; the
     /// card's own state is `cardLoadState`.
     @Published var isLoading = true
-    @Published var showFirstSketch = false
-    @Published var showSelfModel = false
+    // `showFirstSketch` / `showSelfModel` are gone with the daily Mirror screen:
+    // the first-sketch sheet had no trigger left, and the profile is no longer
+    // pushed — it IS the tab.
     @Published var weeklyLetter: MirrorLetter? = nil
 
     // MARK: - Mirror v3 / v3.1 derived layer
@@ -526,6 +527,19 @@ final class MirrorViewModel: ObservableObject {
         // the next Mirror load will still see `hypotheses.isEmpty`, same as now).
         await MirrorGraphService.shared.loadHypotheses(for: userId)
         hypotheses = MirrorGraphService.shared.hypotheses
+
+        // …and re-assemble the Self Model from them, exactly as `performLoad`
+        // does. This step used to be missing: mining ran AFTER `isLoading`
+        // cleared, refreshed `hypotheses`, and left `selfModel` at whatever it
+        // was when the screen painted. That was survivable while the profile sat
+        // two taps down a "Go deeper" row — you'd see it populated next visit.
+        // Now the profile IS the Mirror tab, so a first-time user whose very
+        // first mine just succeeded would otherwise stare at "Still learning"
+        // until the 60s staleness window let `loadIfStale` run again.
+        if !selfModel.isSurfaceable && hypotheses.count >= 3 {
+            SelfModelService.shared.assembleFromHypotheses(hypotheses, userId: userId)
+            selfModel = SelfModelService.shared.selfModel
+        }
     }
 
     /// True once `functions:mineUserInsights` has run for this user at least once
@@ -606,200 +620,55 @@ final class MirrorViewModel: ObservableObject {
 }
 
 // MARK: - MirrorView
+//
+// The Mirror tab is the living profile. It was previously a daily-digest screen
+// — Today's reading, "what Spilr thinks it knows", "what it doesn't know yet",
+// the first-sketch banner — with the profile buried behind a dashed "Your living
+// profile" row in a "Go deeper when you want" section. The profile IS the thing
+// worth opening the tab for, so it is now the tab, and the digest is gone as a
+// surface.
+//
+// What this view still owns: the NavigationStack (SelfModelView deliberately has
+// none of its own), the cold-load spinner, the compose FAB, and the Ask sheet.
+//
+// MirrorViewModel is unchanged and still loads the whole derived layer — Home's
+// "Spilr noticed" bridge card reads `bridgeInsightTitle`, which is built from
+// `reading` and `personModelItems`, and `runMiningIfNeeded()` is what produces
+// the profile this screen renders.
 
 struct MirrorView: View {
     // Accepts a pre-warmed VM from MainTabView to avoid cold-load spinner on first tap.
     // Falls back to creating its own when used standalone (previews, deep links).
     @ObservedObject private var vm: MirrorViewModel
+    @EnvironmentObject private var router: AppRouter
     @State private var showAsk = false
-    @State private var showExploreChat = false
-    @State private var exploreSeed: String? = nil
-    @State private var silenceSeedPrompt: String? = nil
-    @State private var showWeeklyLetter = false
-    /// The §5.2 proof sheet — opened from "more…" on Today.
-    @State private var showProofSheet = false
-    @State private var showTeachSheet = false
-    @State private var teachText = ""
+    @State private var showLetter = false
 
     init(userId: String, viewModel: MirrorViewModel? = nil) {
         vm = viewModel ?? MirrorViewModel(userId: userId)
     }
 
-    /// The question shown on the silence card: the top surfaceable
-    /// hypothesis's callback question if one exists, else a MirrorSeed lens
-    /// rotated by day-of-year so a quiet stretch doesn't show the same seed
-    /// every day.
-    private var silenceQuestion: String {
-        if let q = vm.surfaceablePatterns.first?.callbackQuestion { return q }
-        let dayOfYear = Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 0
-        let seed = MirrorSeed.all[dayOfYear % MirrorSeed.all.count]
-        return seed.prompt
-    }
-
-    /// True when at least one of the sections above (Today, What Spilr thinks
-    /// it knows, What it doesn't know yet) has something to show, on its own
-    /// terms — including its own "not yet" empty state for the model rows.
-    /// When every one of them is genuinely silent, `mirrorEmptyStateCard`
-    /// takes over instead of falling straight through to `goDeepSection`
-    /// unexplained.
-    private var hasAnyDailyContent: Bool {
-        vm.reading != nil
-            || vm.cardLoadState == .working
-            || vm.facts.isFresh
-            || !vm.personModelItems.isEmpty
-            || !vm.personModel.openHypotheses.isEmpty
-    }
-
-    /// Distinguishes the two reasons the screen can be this empty: a real
-    /// server/network failure (`vm.derivedLoadFailed`) versus an account that
-    /// is honestly this new — the case §7 of the v3 PRD calls "the first
-    /// honest state".
-    private var mirrorEmptyStateCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if vm.derivedLoadFailed {
-                Text("Couldn't reach the server")
-                    .font(AppTheme.editorialDisplay(size: 20, weight: .semibold))
-                    .foregroundStyle(AppTheme.ink)
-                Text("Pull down to try again.")
-                    .font(AppTheme.editorialBody(size: 14))
-                    .foregroundStyle(AppTheme.inkSoft)
-            } else {
-                Text("Nothing new to show today.")
-                    .font(AppTheme.editorialDisplay(size: 20, weight: .semibold))
-                    .foregroundStyle(AppTheme.ink)
-                if let hint = vm.unlockHint {
-                    Text(hint)
-                        .font(AppTheme.editorialBody(size: 14))
-                        .foregroundStyle(AppTheme.inkSoft)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Button { silenceSeedPrompt = silenceQuestion } label: {
-                    HStack(spacing: 8) {
-                        Text(silenceQuestion)
-                            .font(AppTheme.editorialBody(size: 15).italic())
-                            .foregroundStyle(AppTheme.terracotta)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .multilineTextAlignment(.leading)
-                        Image(systemName: "arrow.up.right")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(AppTheme.terracotta)
-                    }
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .softCard(cornerRadius: 30, padding: 22)
-    }
-
     var body: some View {
         NavigationStack {
             ZStack {
-                pastelBackground.ignoresSafeArea()
+                AppTheme.paper.ignoresSafeArea()
 
                 if vm.isLoading {
-                    ProgressView("Reading your mirror…")
+                    ProgressView("Reading your mirror\u{2026}")
                         .tint(AppTheme.terracotta)
                 } else {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 20) {
-                            // Ask pinned at top
-                            if vm.totalEntries >= 5 { askCard }
-
-                            // Weekly letter banner (§3.10) — above the Line,
-                            // not in its slot, so Sunday doesn't collide the
-                            // letter with the daily card.
-                            if let letter = vm.weeklyLetter, letter.isFreshAndUnread {
-                                WeeklyLetterBanner {
-                                    showWeeklyLetter = true
-                                }
-                            }
-
-                            // ── TODAY (§5.2) ──────────────────────────────
-                            // One line, one receipt, two taps. `reading` is
-                            // server-written and always sits on top of a
-                            // deterministic observation; `reading.silence`
-                            // means the day is deliberately quiet, which is
-                            // different from `reading == nil` (nothing has
-                            // been computed for this account yet).
-                            if let reading = vm.reading {
-                                if reading.silence {
-                                    ReadingSilenceCardView(
-                                        reading: reading,
-                                        seedQuestion: silenceQuestion,
-                                        onTapQuestion: { silenceSeedPrompt = $0 }
-                                    )
-                                } else {
-                                    TodayReadingCardView(
-                                        reading: reading,
-                                        onFeedback: { feedback, reason in
-                                            vm.onReadingFeedback(feedback, reason: reason, reading: reading)
-                                        },
-                                        onMore: { showProofSheet = true },
-                                        onTapQuestion: { question in
-                                            exploreSeed = question
-                                            showExploreChat = true
-                                        }
-                                    )
-                                    .onAppear { vm.markReadingShown(reading) }
-                                }
-                            } else if vm.cardLoadState == .working {
-                                MirrorCardSkeletonView()
-                            }
-
-                            // ── WHAT SPILR THINKS IT KNOWS (§9) ───────────
-                            // The Person Model's signatures — v3.1's
-                            // replacement for the Threads section. Shown once
-                            // there is at least one item OR the account has
-                            // reached the point threads used to unlock at, so
-                            // the empty state ("nothing confirmed yet")
-                            // appears rather than the section just vanishing.
-                            if vm.maturity.canShowThreads || !vm.personModelItems.isEmpty {
-                                ModelRowsSectionView(
-                                    items: vm.personModelItems,
-                                    onSelect: { item in
-                                        exploreSeed = item.testQuestion ?? "Tell me more about: \(item.displayTitle)"
-                                        showExploreChat = true
-                                    }
-                                )
-                            }
-
-                            // ── WHAT IT DOESN'T KNOW YET (§9) ─────────────
-                            // 1-2 open hypotheses, tappable — data collection
-                            // and therapy are the same act (§6).
-                            OpenQuestionsSectionView(
-                                openHypotheses: vm.personModel.openHypotheses,
-                                onSelect: { hyp in
-                                    exploreSeed = hyp.testQuestion ?? hyp.hypothesis
-                                    showExploreChat = true
-                                    AnalyticsManager.shared.trackMirrorOpenHypothesisTapped()
-                                }
-                            )
-
-                            if vm.maturity.canShowFirstSketch && vm.firstSevenAvailable && !firstSketchSeen {
-                                firstSketchBanner
-                            }
-
-                            // Every section above independently decided it has
-                            // nothing to show. Previously that meant the
-                            // screen fell straight through to `goDeepSection`
-                            // — one dashed "Your living profile" row — with no
-                            // explanation of WHY, indistinguishable from a
-                            // genuine loading failure. Say which case this is.
-                            if !hasAnyDailyContent {
-                                mirrorEmptyStateCard
-                            }
-
-                            // Progressive disclosure: the weekly letter and
-                            // the full profile.
-                            goDeepSection
-
-                            Spacer(minLength: 90)
-                        }
-                        .padding(.horizontal, 20)
-                        .padding(.top, 16)
-                    }
-                    .scrollIndicators(.hidden)
+                    // `onAsk` nil below the entry threshold — the card simply
+                    // isn't rendered, same gate the old screen applied.
+                    SelfModelView(
+                        userId: vm.userId,
+                        selfModel: vm.selfModel,
+                        onAsk: vm.totalEntries >= 5 ? {
+                            showAsk = true
+                            AnalyticsManager.shared.trackMirrorAskUsed()
+                        } : nil,
+                        weeklyLetter: vm.weeklyLetter,
+                        onOpenLetter: { openLetter(source: "banner") }
+                    )
                     .refreshable { await vm.load() }
                 }
             }
@@ -809,294 +678,58 @@ struct MirrorView: View {
             .task {
                 await vm.loadIfStale()
                 AnalyticsManager.shared.logEvent(.mirrorGraphViewed)
+                await consumePendingLetterOpen()
             }
-            .sheet(isPresented: $vm.showFirstSketch) {
-                FirstSketchView(
-                    selfModel: vm.selfModel,
-                    serverCard: DerivedService.shared.firstSeven
-                ) {
-                    vm.showFirstSketch = false
-                    markFirstSketchSeen()
-                }
+            // Push tapped while the app is already running and on this tab (or
+            // any tab — `openWeeklyLetter()` also switches to Mirror, which
+            // re-triggers this view's body but not necessarily a fresh `.task`).
+            .onChange(of: router.pendingWeeklyLetterOpen) { _, pending in
+                guard pending else { return }
+                Task { await consumePendingLetterOpen() }
+            }
+            // Cold launch from a push: MainTabView sets the real uid a beat
+            // after this view first appears with `userId: ""` — the pending
+            // flag can arrive before there's a uid to serve it with.
+            .onChange(of: vm.userId) { _, _ in
+                Task { await consumePendingLetterOpen() }
             }
             .sheet(isPresented: $showAsk) {
                 AskView(userId: vm.userId)
             }
-            // §5.2's proof sheet, opened from Today's "more…". A v3.0 reading
-            // (source is an observation) has a numeric `proof`; a v3.1 line
-            // (source is a Person Model signature/because/say-do/exception)
-            // does not — its receipt and `wouldBeFalseIf` ARE the proof, so
-            // that case gets the lighter PersonModelReadingDetailView instead.
-            .sheet(isPresented: $showProofSheet) {
-                if let reading = vm.reading, let proof = reading.proof {
-                    ProofSheetView(
-                        line: reading.line,
-                        proof: proof,
-                        userStatus: reading.userStatus,
-                        onFeedback: { feedback, reason in
-                            vm.onReadingFeedback(feedback, reason: reason, reading: reading)
-                        },
-                        onAsk: {
-                            showProofSheet = false
-                            exploreSeed = reading.line
-                            showExploreChat = true
-                        },
-                        onTeach: {
-                            showProofSheet = false
-                            showTeachSheet = true
-                        },
-                        onDismiss: { showProofSheet = false }
-                    )
-                } else if let reading = vm.reading {
-                    PersonModelReadingDetailView(
-                        reading: reading,
-                        onFeedback: { feedback, reason in
-                            vm.onReadingFeedback(feedback, reason: reason, reading: reading)
-                        },
-                        onAsk: {
-                            showProofSheet = false
-                            exploreSeed = reading.line
-                            showExploreChat = true
-                        },
-                        onTeach: {
-                            showProofSheet = false
-                            showTeachSheet = true
-                        },
-                        onDismiss: { showProofSheet = false }
-                    )
-                }
-            }
-            // "Teach Spilr" — free text straight into `profileCorrections`,
-            // the collection the nightly miner already reads as hard
-            // exclusions. The correction outranks the inference (PI-010).
-            .sheet(isPresented: $showTeachSheet) {
-                TeachSpilrSheet(
-                    subject: vm.reading?.line ?? "",
-                    onSubmit: { text in
-                        vm.submitCorrection(text,
-                                            hypothesisId: nil,
-                                            observationId: vm.reading?.sourceId)
-                        showTeachSheet = false
-                    },
-                    onCancel: { showTeachSheet = false }
-                )
-            }
-            .sheet(isPresented: $showWeeklyLetter, onDismiss: {
-                MirrorLetterService.shared.markOpened(userId: vm.userId)
-                vm.weeklyLetter = MirrorLetterService.shared.latest
-            }) {
+            .sheet(isPresented: $showLetter) {
                 if let letter = vm.weeklyLetter {
-                    WeeklyLetterView(letter: letter) { showWeeklyLetter = false }
+                    WeeklyLetterView(letter: letter, onDismiss: { showLetter = false })
                 }
-            }
-            .fullScreenCover(isPresented: $showExploreChat) {
-                DailyChatView(userId: vm.userId, seedContext: exploreSeed) {
-                    Task { await vm.load(showSpinner: false) }
-                }
-            }
-            .fullScreenCover(item: $silenceSeedPrompt.asIdentifiablePrompt) { prompt in
-                SpillWriteView(userId: vm.userId, prompt: prompt.value) {
-                    Task { await vm.load(showSpinner: false) }
-                }
-            }
-            .navigationDestination(isPresented: $vm.showSelfModel) {
-                SelfModelView(userId: vm.userId, selfModel: vm.selfModel)
             }
         }
         .trackScreen(.mirror)
     }
 
-    // MARK: - Background
-
-    private var pastelBackground: some View {
-        LinearGradient(
-            colors: [AppTheme.paper, AppTheme.rose2.opacity(0.4), AppTheme.blue.opacity(0.3)],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
+    /// Opens the letter reader and marks it read. Marking happens on OPEN, not
+    /// dismiss — MIRROR_V3_TEST_CASES.md 7.6 is "Open the weekly letter →
+    /// `openedAt` set". `source` separates in-app discovery (the banner) from
+    /// push delivery for the open-rate metric (PRD §10).
+    private func openLetter(source: String) {
+        showLetter = true
+        MirrorLetterService.shared.markOpened(userId: vm.userId)
+        // `markOpened` mutates `latest.openedAt` locally — re-sync so the
+        // banner's `isFreshAndUnread` check sees it and disappears immediately.
+        vm.weeklyLetter = MirrorLetterService.shared.latest
+        AnalyticsManager.shared.trackWeeklyLetterOpened(source: source)
     }
 
-    // MARK: - First sketch: shown until opened once
-    //
-    // Keyed by uid so switching accounts on one device doesn't inherit
-    // another user's "already seen" state.
-
-    private var firstSketchSeenKey: String { "mirrorFirstSketchSeen_\(vm.userId)" }
-
-    private var firstSketchSeen: Bool {
-        UserDefaults.standard.bool(forKey: firstSketchSeenKey)
-    }
-
-    private func markFirstSketchSeen() {
-        UserDefaults.standard.set(true, forKey: firstSketchSeenKey)
-    }
-
-    private var firstSketchBanner: some View {
-        Button {
-            vm.showFirstSketch = true
-        } label: {
-            HStack(spacing: 16) {
-                sketchRing
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("first sketch unlocked")
-                        .font(AppTheme.mono(size: 10))
-                        .foregroundStyle(AppTheme.terracottaDeep)
-                        .tracking(1.2)
-                        .textCase(.uppercase)
-
-                    Text("Not a label. A living profile.")
-                        .font(.system(size: 16, weight: .bold, design: .rounded))
-                        .foregroundStyle(AppTheme.ink)
-
-                    Text("Spilr is learning how you work. Tap to see the first sketch.")
-                        .font(AppTheme.editorialBody(size: 13))
-                        .foregroundStyle(AppTheme.inkSoft)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer()
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(AppTheme.terracotta)
-            }
-            .padding(18)
-            .background(
-                LinearGradient(
-                    colors: [AppTheme.rose.opacity(0.25), AppTheme.lav.opacity(0.2)],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-            )
-            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .stroke(AppTheme.terracotta.opacity(0.3), lineWidth: 1)
-            )
-        }
-        .buttonStyle(.plain)
-    }
-
-    private var sketchRing: some View {
-        ZStack {
-            Circle()
-                .stroke(AppTheme.paperWarm, lineWidth: 7)
-            Circle()
-                .trim(from: 0, to: 84.0 / 360.0)
-                .stroke(
-                    AngularGradient(
-                        colors: [AppTheme.terracotta, AppTheme.lav, AppTheme.terracotta],
-                        center: .center
-                    ),
-                    style: StrokeStyle(lineWidth: 7, lineCap: .round)
-                )
-                .rotationEffect(.degrees(-90))
-            Text("✦")
-                .font(.system(size: 20))
-                .foregroundStyle(AppTheme.terracotta)
-        }
-        .frame(width: 78, height: 78)
-    }
-
-    // MARK: - Ask pill (pinned at top)
-
-    private var askCard: some View {
-        Button {
-            showAsk = true
-            AnalyticsManager.shared.trackMirrorAskUsed()
-        } label: {
-            HStack(spacing: 10) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(AppTheme.terracotta)
-                Text("Ask about your entries\u{2026}")
-                    .font(AppTheme.editorialBody(size: 14))
-                    .foregroundStyle(AppTheme.inkSoft)
-                Spacer()
-            }
-            .padding(.horizontal, 18)
-            .padding(.vertical, 12)
-            .background(AppTheme.cream.opacity(0.7))
-            .clipShape(Capsule())
-            .overlay(
-                Capsule().stroke(AppTheme.inkSoft.opacity(0.12), lineWidth: 1)
-            )
-            .shadow(color: AppTheme.cardShadow, radius: 8, x: 0, y: 3)
-        }
-        .buttonStyle(.plain)
-    }
-
-
-    // MARK: - Go deeper (progressive disclosure)
-    //
-    // Two rows: the weekly letter and the profile. The "Your patterns" row and
-    // `PatternListView` behind it are GONE (Mirror v3 M7) — that list was the
-    // pattern engine's raw output rendered as a product surface, nineteen
-    // items deep with a taxonomy label and a lifecycle chip on each. Threads
-    // (§5.4) replaces it with at most three, each of which had to happen on
-    // three different days and survive an audit to appear at all.
-
-    private var goDeepSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            sectionLabel("Go deeper when you want")
-
-            if vm.weeklyLetter != nil {
-                Button { showWeeklyLetter = true } label: {
-                    mirrorDisclosureRow(icon: "envelope", title: "Your weekly letter")
-                }
-                .buttonStyle(.plain)
-            }
-
-            // Living profile row (dashed border)
-            Button { vm.showSelfModel = true } label: {
-                HStack(spacing: 12) {
-                    Image(systemName: "person.crop.circle")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(AppTheme.lav)
-                    Text("Your living profile")
-                        .font(.system(size: 14.5, weight: .semibold, design: .rounded))
-                        .foregroundStyle(AppTheme.ink)
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(AppTheme.inkSoft)
-                }
-                .padding(14)
-                .background(.clear)
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(style: StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
-                        .foregroundStyle(AppTheme.terracotta.opacity(0.4))
-                )
-            }
-            .buttonStyle(.plain)
-        }
-    }
-
-    private func mirrorDisclosureRow(icon: String, title: String) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: icon)
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(AppTheme.terracotta)
-            Text(title)
-                .font(.system(size: 14.5, weight: .semibold, design: .rounded))
-                .foregroundStyle(AppTheme.ink)
-            Spacer()
-            Image(systemName: "chevron.right")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(AppTheme.inkSoft)
-        }
-        .padding(14)
-        .background(AppTheme.cream.opacity(0.7))
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-    }
-
-    // MARK: - Shared helpers
-
-    private func sectionLabel(_ text: String) -> some View {
-        Text(text.uppercased())
-            .font(.system(size: 11, weight: .heavy, design: .rounded))
-            .foregroundStyle(AppTheme.inkSoft)
-            .tracking(1.2)
+    /// Consumes a "weekly_letter" push tap. Fetches the letter fresh from the
+    /// server (a push means one was just written; the cache-first `loadLatest`
+    /// path would still show last week's) and opens it if one exists. No-ops
+    /// silently offline, or before a uid is known — the flag stays set for the
+    /// next call (see the `.onChange(of: vm.userId)` above).
+    private func consumePendingLetterOpen() async {
+        guard router.pendingWeeklyLetterOpen, !vm.userId.isEmpty else { return }
+        router.pendingWeeklyLetterOpen = false
+        await MirrorLetterService.shared.refreshFromServer(for: vm.userId)
+        vm.weeklyLetter = MirrorLetterService.shared.latest
+        guard vm.weeklyLetter != nil else { return }
+        openLetter(source: "push")
     }
 }
 
@@ -1107,25 +740,25 @@ struct MirrorView: View {
 // nineteen rows on the account in the 9 Sept screenshots, eighteen of them
 // seen once and six of them the same pattern reworded. v3's Threads section
 // replaced it (at most three, each requiring three distinct days, a contrast
-// set and a passed audit); v3.1 replaces THAT in turn with the Person
+// set and a passed audit); v3.1 replaced THAT in turn with the Person
 // Model's signatures (ModelRowsSectionView, "what Spilr thinks it knows").
 
-
-// MARK: - Ask, AskView, MirrorMoreSheet, MirrorSilenceCardView live in their
-// own files (AskView.swift, MirrorMoreSheet.swift, TodayMirrorCardView.swift).
-
-// MARK: - Small helper for presenting a String prompt as a sheet item
-
-private struct IdentifiablePrompt: Identifiable {
-    let value: String
-    var id: String { value }
-}
-
-private extension Binding where Value == String? {
-    var asIdentifiablePrompt: Binding<IdentifiablePrompt?> {
-        Binding<IdentifiablePrompt?>(
-            get: { wrappedValue.map(IdentifiablePrompt.init) },
-            set: { wrappedValue = $0?.value }
-        )
-    }
-}
+// MARK: - The daily Mirror screen — DELETED
+//
+// Today's reading card, the model rows, the open-questions section, the
+// first-sketch banner, the silence/empty-state card and the "Go deeper when you
+// want" disclosure section all lived here and are gone with the tab rewrite
+// above. `askCard` moved to AskView.swift as `MirrorAskCard`.
+//
+// Their component files are still in the tree and now have no call site:
+// TodayReadingCardView.swift, ModelRowsSectionView.swift,
+// OpenQuestionsSectionView.swift, ProofSheetView.swift, FirstSketchView.swift,
+// TeachSpilrSheet.swift, and MirrorCardSkeletonView in TodayMirrorCardView.swift.
+// Deleting them is a separate call — several encode server contracts and
+// PRD-documented behaviour.
+//
+// WeeklyLetterView.swift is the one exception: it and its WeeklyLetterBanner
+// were also stranded here, but the letter itself is generated and pushed
+// correctly server-side (see functions/index.js's buildUserWeeklyLetter) — it
+// was just never rendered. Both are wired back in above and in
+// SelfModelView.swift, rather than deleted.
