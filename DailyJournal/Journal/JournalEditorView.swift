@@ -15,6 +15,9 @@ struct JournalEditorView: View {
     @FocusState private var isContentFocused: Bool
     @State private var showDeleteConfirm = false
     @State private var micError: String?
+    /// "Continue with Spilr" — replaces the mic for a chat-woven entry (see
+    /// `JournalEditorViewModel.isFromChat` and `micBottomBar`).
+    @State private var showContinueChat = false
     // Photo picker state (edit mode)
     @State private var photoItem: PhotosPickerItem?
     @State private var photoUIImage: UIImage?
@@ -169,6 +172,13 @@ struct JournalEditorView: View {
             } message: {
                 Text("This can't be undone.")
             }
+            .fullScreenCover(isPresented: $showContinueChat) {
+                DailyChatView(
+                    userId: viewModel.userId,
+                    continueEntryText: viewModel.content,
+                    onSave: {}
+                )
+            }
         }
         .trackScreen(.entryEditor)
     }
@@ -206,8 +216,14 @@ struct JournalEditorView: View {
                                 .tracking(0.3)
                                 .multilineTextAlignment(.center)
                                 .lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
-                        .frame(maxWidth: .infinity)
+                        // A fixed height rather than just `maxWidth: .infinity`
+                        // — "Very pleasant"/"Very unpleasant" wrap to 2 lines
+                        // while the other three labels fit on 1, so without
+                        // this those two chips were visibly taller than their
+                        // neighbours.
+                        .frame(maxWidth: .infinity, minHeight: 58)
                         .padding(.vertical, 10)
                         .background(
                             viewModel.selectedMood == mood
@@ -233,23 +249,14 @@ struct JournalEditorView: View {
                 }
             }
 
-            // Live sentiment
-            if let sentiment = viewModel.sentimentLabel {
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(AppTheme.sentimentColor(sentiment))
-                        .frame(width: 6, height: 6)
-                    Text(SpilrVoice.sentenceCased(sentiment))
-                        .font(AppTheme.mono(size: 10))
-                        .foregroundStyle(AppTheme.sentimentColor(sentiment))
-                        .tracking(1)
-                }
-                .padding(.top, 4)
-                .transition(.opacity)
-            }
+            // `viewModel.sentimentLabel` (derived from the text, not from the
+            // mood chips above) used to render here as a small "• Tired"-style
+            // tag. It's kept as data — filters, tags and the pattern engine
+            // still read it — but showing it next to a hand-picked mood made
+            // it look like the app had silently picked a second mood the
+            // person never chose.
         }
         .padding(.bottom, 24)
-        .animation(.easeInOut(duration: 0.3), value: viewModel.sentimentLabel)
     }
 
     // MARK: - Content editor
@@ -570,30 +577,55 @@ struct JournalEditorView: View {
 
             Spacer()
 
-            // Mic button
-            Button {
-                isContentFocused = false
-                Task { await speech.toggle(existingText: viewModel.content) }
-            } label: {
-                ZStack {
-                    Circle()
-                        .fill(speech.isRecording ? AppTheme.terracotta : AppTheme.ink)
-                        .frame(width: 48, height: 48)
-
-                    if speech.isRecording {
-                        Circle()
-                            .stroke(AppTheme.terracotta.opacity(0.4), lineWidth: 2)
-                            .frame(width: 62, height: 62)
-                            .scaleEffect(1.1)
-                            .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true), value: speech.isRecording)
+            if viewModel.isFromChat {
+                // This entry is Spilr's own woven snapshot — dictating into it
+                // directly would mix the person's later, unrelated words into
+                // wording they didn't write. Picking the conversation back up
+                // instead weaves a second, separately-saved entry.
+                Button {
+                    isContentFocused = false
+                    showContinueChat = true
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "bubble.left.and.bubble.right.fill")
+                            .font(.system(size: 15, weight: .semibold))
+                        Text("Continue with Spilr")
+                            .font(.system(size: 14, weight: .semibold, design: .rounded))
                     }
-
-                    Image(systemName: speech.isRecording ? "stop.fill" : "mic.fill")
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundStyle(AppTheme.cream)
+                    .foregroundStyle(AppTheme.cream)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 13)
+                    .background(AppTheme.ink)
+                    .clipShape(Capsule())
                 }
+                .buttonStyle(.plain)
+            } else {
+                // Mic button — appends dictation to this entry's own text.
+                Button {
+                    isContentFocused = false
+                    Task { await speech.toggle(existingText: viewModel.content) }
+                } label: {
+                    ZStack {
+                        Circle()
+                            .fill(speech.isRecording ? AppTheme.terracotta : AppTheme.ink)
+                            .frame(width: 48, height: 48)
+
+                        if speech.isRecording {
+                            Circle()
+                                .stroke(AppTheme.terracotta.opacity(0.4), lineWidth: 2)
+                                .frame(width: 62, height: 62)
+                                .scaleEffect(1.1)
+                                .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true), value: speech.isRecording)
+                        }
+
+                        Image(systemName: speech.isRecording ? "stop.fill" : "mic.fill")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundStyle(AppTheme.cream)
+                    }
+                }
+                // Not disabled when denied — tapping surfaces the Open Settings alert.
+                .accessibilityLabel(speech.isRecording ? "Stop dictation" : "Add a thought")
             }
-            // Not disabled when denied — tapping surfaces the Open Settings alert.
 
             Spacer()
 

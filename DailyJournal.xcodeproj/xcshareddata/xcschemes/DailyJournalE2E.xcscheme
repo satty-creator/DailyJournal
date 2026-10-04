@@ -16,7 +16,7 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "564DED242FC4646E00D4E7CB"
-               BuildableName = "DailyJournal.app"
+               BuildableName = "Spilr.app"
                BlueprintName = "DailyJournal"
                ReferencedContainer = "container:DailyJournal.xcodeproj">
             </BuildableReference>
@@ -58,7 +58,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "564DED242FC4646E00D4E7CB"
-            BuildableName = "DailyJournal.app"
+            BuildableName = "Spilr.app"
             BlueprintName = "DailyJournal"
             ReferencedContainer = "container:DailyJournal.xcodeproj">
          </BuildableReference>
@@ -82,7 +82,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "564DED242FC4646E00D4E7CB"
-            BuildableName = "DailyJournal.app"
+            BuildableName = "Spilr.app"
             BlueprintName = "DailyJournal"
             ReferencedContainer = "container:DailyJournal.xcodeproj">
          </BuildableReference>

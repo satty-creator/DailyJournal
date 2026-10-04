@@ -47,6 +47,16 @@ const PREVIEW_BUDGET = { inTok: 150000, outTok: 25000 };  // whole preview
 const PAID_DAILY_BUDGET = { inTok: 150000, outTok: 25000 };
 const OWNER_DAILY_BUDGET = { inTok: 3000000, outTok: 500000 };
 const SURFACE_SHARE_CAP = 0.5;
+// Chat burns more of a single preview than any other surface (a conversation is
+// many turns), and the flat 0.5 cap was cutting previewers off mid-chat before
+// they'd seen what Daily Chat does. Lift the chat surfaces to 0.7 of the preview
+// budget — TEMPORARY, until the chat prompt trim lands and brings per-turn cost
+// back down. Preview tier only; the paid daily budget keeps the flat cap.
+const CHAT_SURFACE_SHARE_CAP = 0.7;
+const CHAT_SURFACES = new Set([
+  "chat_turn", "chat_turn_cbt", "chat_weave_entry",
+  "chat_weave_thought_journal", "chat_session_state", "chat_model_ops",
+]);
 
 /* The preview clock is `previewStartedAt`, stamped on a user's first AI call
  * under THIS policy (see checkAIBudget in index.js). Accounts from the old
@@ -136,7 +146,12 @@ function hasAIAccess(data, nowMs, { isOwner = false } = {}) {
  *   ledger:      which counter pair to charge — "day" or "trial"
  */
 function decideAccess(data, nowMs, surface, isOwner = false) {
-  const ent = effectiveEntitlement(data, nowMs, isOwner);
+  // Honour the `owner` flag stamped on the doc, not just the caller-supplied
+  // `isOwner`. Server-side reflection calls (callGeminiJSON) now run this check
+  // too, and they have no ID token to pass — without this an owner's own nightly
+  // jobs would be budgeted as a free previewer. Matches hasAIAccess, which
+  // already reads `data.owner`.
+  const ent = effectiveEntitlement(data, nowMs, isOwner || !!(data && data.owner));
 
   if (ent === "expired") {
     return { allowed: false, entitlement: ent, reason: "expired", ledger: "trial" };
@@ -164,8 +179,9 @@ function decideAccess(data, nowMs, surface, isOwner = false) {
     return { allowed: false, entitlement: "free", reason: "preview_ended", ledger: "trial" };
   }
   const per = (data && data.trialPerSurface && data.trialPerSurface[surface]) || { inTok: 0, outTok: 0 };
-  if (per.inTok >= PREVIEW_BUDGET.inTok * SURFACE_SHARE_CAP ||
-      per.outTok >= PREVIEW_BUDGET.outTok * SURFACE_SHARE_CAP) {
+  const previewCap = CHAT_SURFACES.has(surface) ? CHAT_SURFACE_SHARE_CAP : SURFACE_SHARE_CAP;
+  if (per.inTok >= PREVIEW_BUDGET.inTok * previewCap ||
+      per.outTok >= PREVIEW_BUDGET.outTok * previewCap) {
     return { allowed: false, entitlement: "free", reason: "surface_cap", ledger: "trial" };
   }
   return { allowed: true, entitlement: "free", reason: null, ledger: "trial" };
@@ -226,7 +242,8 @@ function entitlementUpdateFromEvent(event) {
 
 module.exports = {
   OWNER_EMAILS, OWNER_UIDS, PREVIEW_DAYS, PREVIEW_BUDGET, PAID_DAILY_BUDGET,
-  OWNER_DAILY_BUDGET, SURFACE_SHARE_CAP, EXPIRY_GRACE_MS,
+  OWNER_DAILY_BUDGET, SURFACE_SHARE_CAP, CHAT_SURFACE_SHARE_CAP, CHAT_SURFACES,
+  EXPIRY_GRACE_MS,
   PRO_ENTITLEMENT_ID,
   isOwnerToken, effectiveEntitlement, hasAIAccess, decideAccess, previewStartMs,
   resolveAppUserId, entitlementUpdateFromEvent,

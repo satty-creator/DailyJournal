@@ -31,6 +31,13 @@ struct TemplateRunnerView: View {
     /// of back where the user was browsing. A completed save still goes to
     /// Home, same as every other composer.
     let onExitWithoutSaving: () -> Void
+    /// Optional: fires alongside `onSave()`, with the entry that was just
+    /// written. `vm.savedEntry` is already set synchronously by the time
+    /// `TemplateReviewView` calls `onSave()` (see `TemplateRunnerViewModel.save`),
+    /// so this never races. Used by onboarding's guided first entry to hand the
+    /// saved entry to the payoff screen — every other caller leaves this nil
+    /// and just goes to Home, same as before.
+    var onSaved: ((JournalEntry) -> Void)?
 
     @Environment(\.dismiss) private var dismiss
     @StateObject private var vm: TemplateRunnerViewModel
@@ -49,12 +56,14 @@ struct TemplateRunnerView: View {
         userId: String,
         template: JournalTemplate,
         onSave: @escaping () -> Void,
-        onExitWithoutSaving: @escaping () -> Void
+        onExitWithoutSaving: @escaping () -> Void,
+        onSaved: ((JournalEntry) -> Void)? = nil
     ) {
         self.userId = userId
         self.template = template
         self.onSave = onSave
         self.onExitWithoutSaving = onExitWithoutSaving
+        self.onSaved = onSaved
         _vm = StateObject(wrappedValue: TemplateRunnerViewModel(userId: userId, template: template))
     }
 
@@ -106,6 +115,7 @@ struct TemplateRunnerView: View {
                 vm: vm,
                 onSave: {
                     onSave()
+                    if let onSaved, let saved = vm.savedEntry { onSaved(saved) }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { dismiss() }
                 },
                 onDiscard: {
@@ -246,6 +256,10 @@ struct TemplateRunnerView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            if !vm.currentStep.examples.isEmpty {
+                examplesHint(vm.currentStep.examples)
+            }
+
             stepControl
                 .padding(.top, 4)
 
@@ -270,8 +284,12 @@ struct TemplateRunnerView: View {
             textControl(placeholder: placeholder)
         case .choice(let options):
             choiceControl(options: options)
-        case .scale:
-            scaleControl
+        case .multiChoice(let options, let allowsOther):
+            multiChoiceControl(options: options, allowsOther: allowsOther)
+        case .scale(_, let values):
+            scaleControl(values: values)
+        case .breathing(let cycles):
+            breathingControl(cycles: cycles)
         }
     }
 
@@ -309,6 +327,7 @@ struct TemplateRunnerView: View {
                 .lineSpacing(5)
                 .frame(minHeight: 150)
                 .padding(12)
+                .accessibilityIdentifier("templateRunner.textField")
         }
         .background(AppTheme.cream.opacity(0.74))
         .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
@@ -388,48 +407,88 @@ struct TemplateRunnerView: View {
         }
     }
 
+    // MARK: - Multi-choice control (emotions, thinking traps — any number on at once)
+
+    private func multiChoiceControl(options: [String], allowsOther: Bool) -> some View {
+        let step = vm.currentStep
+        return MultiChoiceStepControl(
+            options: options,
+            allowsOther: allowsOther,
+            chipHelp: step.chipHelp,
+            selected: Binding(
+                get: { vm.answer(for: step)?.choiceValues ?? [] },
+                set: { vm.setAnswer(.choices($0), for: step) }
+            )
+        )
+    }
+
     // MARK: - Scale control
 
-    private var scaleControl: some View {
+    private func scaleControl(values: [Int]) -> some View {
         let step = vm.currentStep
-        let selected: Int? = vm.answer(for: step)?.scaleValue
-        let values = [0, 2, 4, 6, 8, 10]
-        return VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 6) {
-                ForEach(values, id: \.self) { v in
-                    let isSelected = selected == v
-                    // Maps 0…10 onto the app's canonical -3…+3 valence gradient.
-                    let tint = AppTheme.valenceColor(v / 2 - 3)
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.15)) { vm.setAnswer(.scale(v), for: step) }
-                    } label: {
-                        Text("\(v)")
-                            .font(.system(size: 15, weight: .bold, design: .rounded))
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 12)
-                            .background(isSelected ? tint.opacity(0.85) : AppTheme.cream.opacity(0.7))
-                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                    .stroke(isSelected ? tint : AppTheme.inkSoft.opacity(0.15), lineWidth: 1.5)
-                            )
-                            .foregroundStyle(isSelected ? AppTheme.ink : AppTheme.inkSoft)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("\(v) out of 10")
-                    .accessibilityAddTraits(isSelected ? .isSelected : [])
-                }
+        return ZeroToTenScale(
+            values: values,
+            selected: Binding(
+                get: { vm.answer(for: step)?.scaleValue },
+                set: { if let v = $0 { vm.setAnswer(.scale(v), for: step) } }
+            )
+        )
+    }
+
+    // MARK: - Breathing control
+
+    /// `.breathing` steps store no real content — `onComplete`/`onSkip` just
+    /// mark the step answered (so the footer's "Skip" label flips to
+    /// "Continue") and log which way it went. See `BoxBreathingView`.
+    private func breathingControl(cycles: Int) -> some View {
+        let step = vm.currentStep
+        return BoxBreathingView(
+            cycles: cycles,
+            onComplete: {
+                vm.setAnswer(.choice("done"), for: step)
+                AnalyticsManager.shared.logEvent(.templateBreathingCompleted, parameters: ["template_id": template.id])
+            },
+            onSkip: {
+                vm.setAnswer(.choice("skipped"), for: step)
+                AnalyticsManager.shared.logEvent(.templateBreathingSkipped, parameters: ["template_id": template.id])
             }
-            Text("Use an approximate number. The point is comparison, not precision.")
-                .font(AppTheme.editorialBody(size: 12))
-                .foregroundStyle(AppTheme.inkSoft)
-        }
+        )
+        // The breathing view sizes to its ~180pt content and doesn't stretch;
+        // the question stack is `.leading`, so without this it hugs the left
+        // edge. Fill the width and center it — every other control already
+        // expands to full width on its own.
+        .frame(maxWidth: .infinity)
     }
 
     // MARK: - "Why ask this?" (only on steps that supply their own rationale —
     // see `TemplateStep.whyThis`. Deliberately NOT the template-level evidence
     // blurb on every step; that repeated one paragraph verbatim across a
     // 7-step template and duplicated the review screen's Framework card.)
+
+    // MARK: - Examples hint
+    //
+    // A quiet "FOR EXAMPLE" block under a text step's helper (see
+    // `TemplateStep.examples`). Shows what a real answer looks like without
+    // writing one for the user — deliberately not a card and not in the entry's
+    // voice, so it reads as a prompt, not as content. Left-aligned with the
+    // question in the `.leading` question stack.
+
+    private func examplesHint(_ examples: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("FOR EXAMPLE")
+                .font(AppTheme.mono(size: 9))
+                .tracking(1.5)
+                .foregroundStyle(AppTheme.inkSoft)
+            ForEach(examples, id: \.self) { example in
+                Text(example)
+                    .font(AppTheme.editorialBody(size: 13))
+                    .italic()
+                    .foregroundStyle(AppTheme.slate)
+                    .lineSpacing(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
 
     private func whyAskThisCard(_ text: String) -> some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -504,6 +563,7 @@ struct TemplateRunnerView: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(vm.isWeaving)
+                .accessibilityIdentifier("templateRunner.next")
             }
             .padding(.horizontal, 22)
             .padding(.bottom, 34)
@@ -516,5 +576,134 @@ struct TemplateRunnerView: View {
                     )
             )
         }
+    }
+}
+
+// MARK: - Multi-choice step control
+
+/// Chip grid for `.multiChoice` steps — any number of `options` can be on at
+/// once, plus an optional free-text "Other" chip. A dedicated struct (rather
+/// than inline state on `TemplateRunnerView`, like every other control here)
+/// because it needs its own `otherText`/`showOtherField` state that must NOT
+/// bleed from one step to the next; `questionArea`'s `.id(vm.stepIndex)` on
+/// the parent gives this view a fresh identity — and fresh `@State` — every
+/// time the step changes, the same guarantee `textControl`'s focus reset
+/// relies on.
+private struct MultiChoiceStepControl: View {
+    let options: [String]
+    let allowsOther: Bool
+    /// One-line definition per option, shown under the chip once it's on —
+    /// see `TemplateStep.chipHelp`.
+    let chipHelp: [String: String]
+    @Binding var selected: [String]
+
+    @State private var standardSelected: [String]
+    @State private var otherText: String
+    @State private var showOtherField: Bool
+
+    init(options: [String], allowsOther: Bool, chipHelp: [String: String], selected: Binding<[String]>) {
+        self.options = options
+        self.allowsOther = allowsOther
+        self.chipHelp = chipHelp
+        self._selected = selected
+        let current = selected.wrappedValue
+        let other = current.first { !options.contains($0) } ?? ""
+        self._standardSelected = State(initialValue: current.filter { options.contains($0) })
+        self._otherText = State(initialValue: other)
+        self._showOtherField = State(initialValue: !other.isEmpty)
+    }
+
+    private func commit() {
+        var result = standardSelected
+        let trimmedOther = otherText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedOther.isEmpty { result.append(trimmedOther) }
+        selected = result
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            FlowLayout(spacing: 8) {
+                ForEach(options, id: \.self) { option in
+                    chip(option)
+                }
+                if allowsOther {
+                    otherChip
+                }
+            }
+
+            if showOtherField {
+                TextField("Something else\u{2026}", text: $otherText)
+                    .font(AppTheme.editorialBody(size: 14))
+                    .foregroundStyle(AppTheme.ink)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(AppTheme.cream.opacity(0.7))
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(AppTheme.inkSoft.opacity(0.12), lineWidth: 1)
+                    )
+                    .onChange(of: otherText) { _, _ in commit() }
+            }
+
+            ForEach(standardSelected.filter { chipHelp[$0] != nil }, id: \.self) { option in
+                if let help = chipHelp[option] {
+                    HStack(alignment: .top, spacing: 6) {
+                        Text(option + ":")
+                            .font(.system(size: 11, weight: .bold, design: .rounded))
+                        Text(help)
+                            .font(AppTheme.editorialBody(size: 11.5))
+                    }
+                    .foregroundStyle(AppTheme.inkSoft)
+                }
+            }
+        }
+    }
+
+    private func chip(_ option: String) -> some View {
+        let isSelected = standardSelected.contains(option)
+        return Button {
+            withAnimation(.easeOut(duration: 0.15)) {
+                if isSelected {
+                    standardSelected.removeAll { $0 == option }
+                } else {
+                    standardSelected.append(option)
+                }
+                commit()
+            }
+        } label: {
+            chipLabel(option, isSelected: isSelected)
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private var otherChip: some View {
+        Button {
+            withAnimation(.easeOut(duration: 0.15)) {
+                showOtherField.toggle()
+                if !showOtherField {
+                    otherText = ""
+                    commit()
+                }
+            }
+        } label: {
+            chipLabel("Other", isSelected: showOtherField)
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(showOtherField ? .isSelected : [])
+    }
+
+    private func chipLabel(_ text: String, isSelected: Bool) -> some View {
+        Text(text)
+            .font(.system(size: 13, weight: .bold, design: .rounded))
+            .foregroundStyle(isSelected ? AppTheme.cream : AppTheme.inkSoft)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 11)
+            .background(isSelected ? AppTheme.ink : AppTheme.cream)
+            .clipShape(Capsule())
+            .overlay(
+                Capsule().stroke(AppTheme.inkSoft.opacity(isSelected ? 0 : 0.16), lineWidth: 1)
+            )
     }
 }

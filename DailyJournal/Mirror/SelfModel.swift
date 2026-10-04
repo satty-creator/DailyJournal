@@ -81,39 +81,41 @@ struct SelfModelHypothesis: Identifiable {
 
     var isActive: Bool { stability != .retired }
 
-    /// Plain-language certainty. Never a percentage — a number implies a
-    /// precision that a language model's guess about a person does not have.
-    /// This is the Exist.io discipline: strength and confidence are separate
-    /// axes, and a hedged claim that misses costs nothing while a confident
-    /// claim that misses burns trust permanently.
-    enum ConfidenceBand: String {
-        case hunch  = "A hunch"
-        case maybe  = "Might be a thing"
-        case likely = "Showing up repeatedly"
-        case yours  = "You confirmed this"
-    }
-
-    var confidenceBand: ConfidenceBand {
-        if userStatus == .thisIsMe { return .yours }
-        if confidence >= 0.7 && timesSeen >= 3 { return .likely }
-        if confidence >= 0.45 { return .maybe }
-        return .hunch
-    }
-
     /// One honest line about how well-tested this is. Empty when there is
     /// nothing truthful to say, because silence beats false reassurance.
     /// May this item appear in the profile at all? (Mirror v3 §5.6.)
     ///
-    /// Either the user confirmed it, or it recurred on 3+ distinct entries AND
-    /// an audit actually ran and did not drop it. Everything else stays in the
-    /// corpus, invisible — which is what makes the "A hunch · Not checked
-    /// against other entries yet" caption unnecessary rather than merely
-    /// hidden. The app should not show you something and simultaneously tell
-    /// you it hasn't checked it.
+    /// mirrorprd.md's maturity table gates this on entry count, not on audit
+    /// status: 3 entries unlocks soft, hedged hypotheses (confidence starts
+    /// low, so early items read as tentative);
+    /// the disconfirmation pass only becomes mandatory reading at 14. This
+    /// used to ALSO require `testedAgainstEntries > 0` — added to kill the
+    /// "A hunch · Not checked against other entries yet" caption that was
+    /// printing the absence of QA as a finding on 17 of 19 cards — but the
+    /// server's audit needs 3 entries the claim hasn't already cited as
+    /// evidence (functions/index.js's `unseen.length < 3` skip), so gating
+    /// visibility on it too pushed the real floor to ~6 entries against a
+    /// promised 3. The caption itself is what needed killing, not the
+    /// section: `evidenceCaveat` already returns "" for an unaudited item, so
+    /// nothing here claims a check that hasn't happened.
     var isProfileSurfaceable: Bool {
         if userStatus == .thisIsMe { return true }
         guard timesSeen >= 3 else { return false }
-        guard testedAgainstEntries > 0 else { return false }
+        return disconfirmationVerdict != "drop"
+    }
+
+    /// May this item appear in the EARLY "First observations" section — the
+    /// 3-to-6-entry stage, before anything has recurred enough to be a profile
+    /// pattern? Deliberately looser than `isProfileSurfaceable`: it does NOT
+    /// require `timesSeen >= 3`, because at 3 entries a recurrence across 3
+    /// distinct entries essentially never exists and that floor is exactly why
+    /// the "unlock observations at 3" promise rendered an empty screen. It still
+    /// drops anything the disconfirmation pass told us to drop, and anything
+    /// retired — an early observation is allowed to be tentative, never wrong or
+    /// dead. The UI that renders these frames them as forming, not confirmed, so
+    /// a single-entry hunch is honestly presented as one.
+    var isObservationSurfaceable: Bool {
+        guard stability != .retired else { return false }
         return disconfirmationVerdict != "drop"
     }
 
@@ -123,10 +125,10 @@ struct SelfModelHypothesis: Identifiable {
         }
         // The "Not checked against other entries yet" string is GONE (Mirror
         // v3 M7). It appeared on 17 of 19 cards — the UI printing the ABSENCE
-        // of QA as though it were a finding about the user. Unaudited items
-        // are no longer shown at all (see `isProfileSurfaceable`), so this
-        // branch is unreachable rather than merely hidden; returning empty
-        // keeps it that way if the gate above is ever relaxed.
+        // of QA as though it were a finding about the user. `isProfileSurfaceable`
+        // no longer requires an audit to have run (see its doc comment), so an
+        // unaudited item CAN reach this card now — it just says nothing about
+        // testing rather than announcing the absence of it.
         if testedAgainstEntries == 0 { return "" }
         if counterEvidenceEntryIds.isEmpty {
             return "Held up against \(testedAgainstEntries) other entries"

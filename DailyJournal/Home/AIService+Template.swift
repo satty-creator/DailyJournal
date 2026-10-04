@@ -15,6 +15,9 @@
 //     own, and the model must never narrate a scale change (e.g. 8 → 3) as
 //     improvement or a result — that's an interpretation the safety rules
 //     forbid. Rule 8 below says so explicitly.
+//  4. A `.breathing` step (see `TemplateStep.Kind.breathing`) never reaches
+//     either weave — it's a pause, not content, so both functions below
+//     filter it out before anything else, same as a genuinely blank step.
 //
 //  This is a REFLECTION surface (like Echo/Mirror/Reads), not live
 //  conversation, so it's built on `SpilrVoice.system` (which already embeds
@@ -37,6 +40,7 @@ extension AIService {
         guard isAIAvailable else { throw AIError.aiUnavailable }
 
         let answered = template.steps.compactMap { step -> (TemplateStep, TemplateAnswer)? in
+            if case .breathing = step.kind { return nil }
             guard let answer = answers[step.id], answer.isAnswered else { return nil }
             return (step, answer)
         }
@@ -80,6 +84,12 @@ extension AIService {
            app never makes.
         9. If a step was left blank, just write around it — never invent what they
            would have said.
+        10. Some answers are a comma-separated list of chips the person picked
+            themselves (e.g. emotions, or thinking traps like "Mind reading"). Weave
+            these in naturally as their own words ("I felt anxious and ashamed", "I
+            noticed I was mind reading"). Use ONLY the chips they actually picked —
+            never add an emotion or a thinking trap they didn't select, and never
+            diagnose or psychoanalyze beyond naming what they chose.
 
         \(MemoryProfileService.shared.cachedPromptContext())
 
@@ -116,6 +126,7 @@ extension AIService {
         answers: [String: TemplateAnswer]
     ) -> String {
         let sentences: [String] = template.steps.compactMap { step in
+            if case .breathing = step.kind { return nil }
             guard let answer = answers[step.id], answer.isAnswered else { return nil }
             switch answer {
             case .text(let s):
@@ -129,6 +140,17 @@ extension AIService {
                 return "I'd have called it \(s.lowercased())."
             case .scale(let n):
                 return "On a scale of 0 to 10, I'd have put it at \(n)."
+            case .choices(let items):
+                guard !items.isEmpty else { return nil }
+                let joined = AIService.joinWithAnd(items.map { $0.lowercased() })
+                // Per-step lead-in so an emotions chip list and a thinking-traps
+                // chip list don't read identically — see `TemplateContent`'s
+                // `emotionOptions` / `thinkingTrapOptions` for what fills these.
+                switch step.id {
+                case "emotions": return "I felt \(joined)."
+                case "traps":    return "Looking back, I noticed I was \(joined)."
+                default:         return "I'd pick out \(joined)."
+                }
             }
         }
 
@@ -141,5 +163,17 @@ extension AIService {
             Array(sentences[$0 ..< min($0 + chunkSize, sentences.count)])
         }
         return chunks.map { $0.joined(separator: " ") }.joined(separator: "\n\n")
+    }
+
+    /// "a", "a and b", "a, b, and c" — used by `localWeaveTemplateEntry` to
+    /// turn a `.choices` chip list into a grammatical clause instead of a
+    /// raw comma join.
+    static func joinWithAnd(_ items: [String]) -> String {
+        switch items.count {
+        case 0: return ""
+        case 1: return items[0]
+        case 2: return "\(items[0]) and \(items[1])"
+        default: return items.dropLast().joined(separator: ", ") + ", and " + items[items.count - 1]
+        }
     }
 }

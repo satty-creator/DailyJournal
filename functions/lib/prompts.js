@@ -111,41 +111,6 @@ Return ONLY valid JSON:
 }`;
 }
 
-/** Prompt Q — Next question (daily; feeds Mirror Seeds and chat). Temp 0.5. */
-function buildNextQuestionPrompt({ safetyRules, openHypothesesBlock, askedRecentlyBlock }) {
-  return `${safetyRules}
-
-Pick ONE question for tomorrow's journal from the model's open
-hypotheses. Choose the hypothesis with the highest value that has not
-been asked about in 7 days. The question must:
-- be answerable from one ordinary day in <= 90 seconds;
-- discriminate: an honest answer should make the hypothesis more or
-  less likely (state which answers do which, in scoring);
-- be a question the person can answer from experience, not a request
-  for self-analysis ("what's the pattern?" is banned);
-- name something concrete from their entries (a word they used, a
-  person, a time), never the hypothesis itself;
-- never be a leading question toward the answer you expect.
-Style: plain, warm, one sentence, <= 20 words. The word rules apply:
-their nouns, no category nouns, no clinical words, no image that does
-not save words.
-
-OPEN HYPOTHESES (ranked by value of information):
-${openHypothesesBlock}
-
-ALREADY ASKED IN THE LAST 7 DAYS (do not pick these again):
-${askedRecentlyBlock || "(none)"}
-
-BAD: "Do you use projects to avoid uncertainty?"     <- names the hypothesis
-BAD: "What patterns do you notice in your free time?" <- asks for analysis
-GOOD: "You wrote 'lucky' three times this week, all on nights nothing
-       got built. Tonight: what did you not do today?"
-
-Return ONLY valid JSON:
-{ "question": "", "hypothesisId": "", "scoring": {"confirms_if": "", "rejects_if": ""},
-  "seed_label": "" }`;
-}
-
 /** Prompt M — The Mirror line (daily, one). Temp 0.3. */
 function buildMirrorMPrompt({
   safetyRules, spilrVoice, styleRules, itemBlock, shape, quotesBlock, testQuestion,
@@ -250,7 +215,6 @@ Return ONLY valid JSON:
 module.exports = {
   DO_NOT_INFER_LINE,
   buildFormulationPrompt,
-  buildNextQuestionPrompt,
   buildMirrorMPrompt,
   buildAskPrompt,
 };

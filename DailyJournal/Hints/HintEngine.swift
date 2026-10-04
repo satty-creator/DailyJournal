@@ -2,17 +2,17 @@
 //  HintEngine.swift
 //  DailyJournal
 //
-//  The observable owner of one session's hint state — just the re-roll
-//  (gentler / more direct / weirder) on the composer's starter prompt. Purely
-//  local: `HintLadder.starterPrompt` computes each phrasing synchronously and
-//  nothing here ever calls the network.
+//  The observable owner of one session's blank-page starter question. Draws
+//  from `StarterQuestionBank` via `StarterQuestionPicker` — purely local and
+//  synchronous, nothing here ever calls the network — and keeps a small
+//  per-user history in UserDefaults so re-rolling (and re-opening the
+//  composer) doesn't repeat the same question back to back.
 //
-//  Used to also own a full `HintBundle` (starter + the Hint Ladder panel's
-//  tiny/specific/choice lanes), enrich the starter with a Gemini call fired
-//  from init (see ai-cost-audit-2026-09-06.md §3.2), and drive the panel's
-//  "make it smaller" descent. All of that was cut — the panel was unreachable
-//  UI, and the enrichment cost 11% of AI spend for an upgrade to one line of
-//  text — leaving only the re-roll, the one piece the composer actually uses.
+//  Used to own `HintLadder`'s pebble-combo starter + a 3-way gentler/direct/
+//  weirder re-roll; pebbles were never wired up from any live UI, so that
+//  engine always produced the same one fixed question for everyone. Replaced
+//  by this context-aware bank (time of day, weekday, first-entry / returning)
+//  and a single re-roll.
 //
 //  Non-blocking and failure-tolerant — a hint never stalls the writing surface.
 //
@@ -22,29 +22,47 @@ import Foundation
 @MainActor
 final class HintEngine: ObservableObject {
 
-    let context: HintContext
+    private let userId: String
+    private var lastKind: StarterKind?
 
-    init(context: HintContext) {
-        self.context = context
+    init(userId: String) {
+        self.userId = userId
     }
 
-    // MARK: - Starter
-
-    /// Per-style rotation index so tapping the SAME restyle again yields a new
-    /// question instead of repeating one fixed string.
-    private var styleVariant: [HintLadder.PromptStyle: Int] = [:]
-
-    /// Re-roll the starter locally when the user taps gentler / direct / weirder.
-    /// (Stays local — these are instant, no-network nudges.) Advances a per-style
-    /// counter so each tap shuffles to a different phrasing.
-    func restyledStarter(_ style: HintLadder.PromptStyle) -> String {
-        let next = (styleVariant[style] ?? -1) + 1
-        styleVariant[style] = next
-        return HintLadder.starterPrompt(
-            pebbles: context.pebbles,
-            personal: context.personal,
-            style: style,
-            variant: next
+    /// Draws the next starter question, recording it so the following draw
+    /// (a re-roll, or the next time the composer opens) avoids repeating it.
+    func next() -> String {
+        let question = StarterQuestionPicker.pick(
+            profile: MemoryProfileService.shared.cachedProfile(for: userId),
+            recentIDs: StarterQuestionHistory.recentIDs(for: userId),
+            lastKind: lastKind
         )
+        lastKind = question.kind
+        StarterQuestionHistory.record(question.id, for: userId)
+        return question.text
+    }
+}
+
+// MARK: - History
+
+/// Tiny per-user "recently shown" ring buffer, kept in UserDefaults so it
+/// survives across composer opens without needing a Firestore round trip.
+enum StarterQuestionHistory {
+
+    private static let maxRemembered = 30
+    private static func key(for userId: String) -> String { "starterRecent-\(userId)" }
+
+    static func recentIDs(for userId: String) -> [String] {
+        (UserDefaults.standard.array(forKey: key(for: userId)) as? [String]) ?? []
+    }
+
+    static func record(_ id: String, for userId: String) {
+        var ids = recentIDs(for: userId)
+        ids.removeAll { $0 == id }
+        ids.append(id)
+        if ids.count > maxRemembered {
+            ids.removeFirst(ids.count - maxRemembered)
+        }
+        UserDefaults.standard.set(ids, forKey: key(for: userId))
     }
 }

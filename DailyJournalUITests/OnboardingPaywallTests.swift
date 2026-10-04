@@ -2,22 +2,40 @@
 //  OnboardingPaywallTests.swift
 //  DailyJournalUITests
 //
-//  "Every new user sees the Spilr Pro paywall right after onboarding" —
-//  and can always get past it without paying.
+//  "The app earns the Spilr Pro paywall first" — it only shows after a
+//  completed guided first entry, never on skip, and always only once.
 //
 
 import XCTest
 
 final class OnboardingPaywallTests: SpilrUITestCase {
 
-    /// Skip writing → land in the app → paywall → "Not yet" → Today tab.
-    func testSkippingTheFirstEntryStillEndsOnThePaywall() {
+    /// Skipping the guided first entry goes straight to Today — no paywall,
+    /// not even later. (The AI-limit and Profile paywall triggers are
+    /// untouched — this only covers the onboarding trigger.)
+    func testSkippingTheFirstEntryGoesHomeWithoutPaywall() {
         launch(as: .onboardingLater)
         walkOnboardingToFirstQuestion()
         tap("onboarding.later")
 
-        assertAppears("paywall.headline", timeout: 20)
-        XCTAssertTrue(app.staticTexts["It takes a few weeks to see a pattern."].exists)
+        assertInMainApp()
+        assertDoesNotAppear("paywall", within: 3)
+    }
+
+    /// The full guided-entry path: onboarding intake → guided first entry →
+    /// weave → save → Second look → paywall.
+    func testCompletingTheGuidedFirstEntryEndsOnSecondLookThenPaywall() {
+        launch(as: .onboardingChat)
+        walkOnboardingToFirstQuestion()
+        tap("onboarding.answer")
+
+        let secondLookContinue = completeGuidedFirstEntry(before: 7, after: 4)
+        XCTAssertTrue(secondLookContinue.waitForExistence(timeout: 20), "Second look never appeared")
+        // The delta eased (7 → 4), so the payoff's delta line should show.
+        XCTAssertTrue(app.staticTexts["You came in at 7, you're leaving at 4."].waitForExistence(timeout: 5))
+        secondLookContinue.tap()
+
+        assertAppears("paywall.headline", timeout: 25)
 
         // Real App Store Connect terms via the fixture store: monthly carries
         // the 2-week trial, so it's pre-selected and the CTA says so.
@@ -32,33 +50,49 @@ final class OnboardingPaywallTests: SpilrUITestCase {
         assertDoesNotAppear("paywall", within: 2)
     }
 
-    /// The full first-entry path: onboarding → Daily Chat (stubbed Spilr) →
-    /// weave → save → paywall.
-    func testFirstEntryThroughDailyChatEndsOnThePaywall() {
+    /// Declining AI during onboarding still completes: no "SPILR ASKS" label
+    /// backed by a model call, no AI bullets on Second look, but the entry
+    /// still saves and the delta line still shows (it's the user's own
+    /// numbers, not generated text).
+    func testLocalOnlyConsentStillCompletesTheGuidedEntry() {
+        launch(as: .onboardingChat)
+        walkOnboardingToFirstQuestion(declineAI: true)
+        tap("onboarding.answer")
+
+        let secondLookContinue = completeGuidedFirstEntry(before: 6, after: 2)
+        XCTAssertTrue(secondLookContinue.waitForExistence(timeout: 20), "Second look never appeared")
+        XCTAssertTrue(app.staticTexts["You came in at 6, you're leaving at 2."].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["WHAT YOU WROTE"].waitForExistence(timeout: 20),
+                      "Local-only consent should fall back to the user's own words, never generated bullets")
+        secondLookContinue.tap()
+
+        assertAppears("paywall.headline", timeout: 25)
+    }
+
+    /// Backing out of the guided entry without saving doesn't finish
+    /// onboarding — no paywall, and the first-entry card is still there.
+    func testExitingTheGuidedEntryWithoutSavingDoesNotQueueThePaywall() {
         launch(as: .onboardingChat)
         walkOnboardingToFirstQuestion()
         tap("onboarding.answer")
 
-        sendChatMessage("Work was loud today and I kept thinking about the move.")
-        // The emulator's Gemini stub always asks this back.
-        XCTAssertTrue(app.staticTexts["What part of that stayed with you most?"].waitForExistence(timeout: 20),
-                      "Spilr's reply never arrived — is SPILR_GEMINI_STUB=1 set on the emulator?")
-        sendChatMessage("Probably that I haven't told anyone yet.")
+        tap("scale.5")
+        // Exit immediately via the X button with an answer already given —
+        // triggers the confirm alert.
+        app.buttons.matching(NSPredicate(format: "label == 'Exit exercise'")).firstMatch.tap()
+        app.buttons["Discard answers"].tap()
 
-        tap("chat.wrapUp", timeout: 20)
-        tap("chat.review.save", timeout: 30)
-
-        assertAppears("paywall.headline", timeout: 25)
-        tap("paywall.notYet", timeout: 10)
-        assertInMainApp()
+        assertAppears("onboarding.later")
+        assertDoesNotAppear("paywall", within: 2)
     }
 
     /// The paywall shows once. A relaunch must not show it again.
     func testOnboardingPaywallShowsOnlyOnce() {
         launch(as: .onboardingLater)
         walkOnboardingToFirstQuestion()
-        tap("onboarding.later")
-        tap("paywall.notYet", timeout: 20)
+        tap("onboarding.answer")
+        completeGuidedFirstEntry().tap()
+        tap("paywall.notYet", timeout: 25)
         assertInMainApp()
 
         // Relaunch WITHOUT resetting state.

@@ -82,9 +82,12 @@ enum EntryEnrichment {
             service.updateEntryInsights(entryId: entryId, userId: userId, insights: insights)
         }
 
-        // Optional photo — upload to Storage, then patch the entry's photoURL.
-        // Best-effort and fully detached: a failed/slow upload never blocks the save.
+        // Optional photo — cache locally so list/collage can render it before
+        // the upload below finishes (see PhotoCacheService), then upload to
+        // Storage and patch the entry's photoURL. Upload is best-effort and
+        // fully detached: a failed/slow upload never blocks the save.
         if let photo {
+            PhotoCacheService.shared.store(photo, forEntryId: entryId)
             Task.detached(priority: .utility) {
                 if let url = await PhotoUploadService.shared.uploadEntryPhoto(photo, userId: userId, entryId: entryId) {
                     service.updateEntryPhotoURL(entryId: entryId, userId: userId, url: url)

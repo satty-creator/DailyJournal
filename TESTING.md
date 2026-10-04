@@ -1,5 +1,12 @@
 # Testing Spilr
 
+See `USER_SCENARIOS.md` for the full scenario catalogue — every user-visible
+flow, mapped to the test (if any) that covers it, with gaps and priorities
+marked. This file is about the four layers themselves; that one is about
+what's actually tested. `MIRROR_V3_TEST_CASES.md` covers a level below
+either: whether Mirror's generated *sentences* are worth reading, which no
+automated test can check.
+
 Four layers. The first three run on every push (`.github/workflows/ci.yml`);
 the fourth runs on `main`, nightly, and on PRs labelled `e2e`.
 
@@ -8,7 +15,7 @@ the fourth runs on `main`, nightly, and on PRs labelled `e2e`.
 | Server unit | `functions/test/*.test.js` | `cd functions && npm test` | Mirror pipeline, lint, prompts, **Spilr Pro access policy** (`entitlement.test.js`) |
 | Security rules | `tests/rules/` | `cd tests/rules && npm install && npm test` | Nobody can write `aiUsage`/`entitlements` (make themselves "paid") or read another user's journal |
 | iOS unit | `DailyJournalTests/` | Xcode → scheme **DailyJournal** → ⌘U | Paywall copy + App Review disclosure, owner bypass, crisis gate, Gemini parsing |
-| End-to-end UI | `DailyJournalUITests/` | `./scripts/run-e2e.sh` | Onboarding → paywall, first entry through Daily Chat, purchase, 402 → paywall, owner bypass |
+| End-to-end UI | `DailyJournalUITests/` | `./scripts/run-e2e.sh` | Onboarding intake → guided first entry → Second look → paywall, skip goes straight to Today with no paywall, Daily Chat entries, purchase, 402 → paywall, owner bypass |
 
 Also on every push: `scripts/check-firestore-schema.sh` (every collection the app writes is erased by account deletion).
 

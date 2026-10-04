@@ -235,6 +235,11 @@ struct TemplateReviewView: View {
 
     private var answersSection: some View {
         let answered = template.steps.compactMap { step -> (TemplateStep, TemplateAnswer)? in
+            // `.breathing` stores "done"/"skipped" purely so the runner's
+            // footer can tell answered from unanswered — it's a pause, never
+            // a real answer, so it never shows up here (see `AIService+Template`'s
+            // weave, which excludes it the same way).
+            if case .breathing = step.kind { return nil }
             guard let answer = vm.answer(for: step), answer.isAnswered else { return nil }
             return (step, answer)
         }
@@ -321,5 +326,6 @@ struct TemplateReviewView: View {
         }
         .buttonStyle(.plain)
         .disabled(trimmed.isEmpty || isSaving)
+        .accessibilityIdentifier("templateReview.save")
     }
 }

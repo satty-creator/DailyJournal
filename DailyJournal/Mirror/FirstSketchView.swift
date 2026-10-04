@@ -3,7 +3,9 @@
 //  DailyJournal
 //
 //  The unlock ceremony shown at 7 entries — "Spilr's first sketch of you."
-//  Presented as a sheet or full-screen cover from HomeView or MirrorView.
+//  Presented once as a full-screen cover from MirrorView, gated on the
+//  `.unlock` maturity level and a per-user "shown" flag (see MirrorView's
+//  `maybeShowFirstSketch()` / `firstSketchShownKey`).
 //
 
 import SwiftUI

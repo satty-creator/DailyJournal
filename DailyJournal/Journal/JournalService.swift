@@ -71,6 +71,9 @@ final class JournalService {
         entriesCollection(for: entry.userId)
             .document(entry.id)
             .delete(completion: nil)
+        // Also remove the entry's Storage photo, if any — otherwise deleting an
+        // entry orphans its `.jpg`. Best-effort / no-op when none exists.
+        PhotoUploadService.shared.deleteEntryPhoto(userId: entry.userId, entryId: entry.id)
         RollupService.shared.recordEntryDeleted(userId: entry.userId)
     }
 

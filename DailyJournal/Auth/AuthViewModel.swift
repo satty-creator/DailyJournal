@@ -266,8 +266,11 @@ final class AuthViewModel: ObservableObject {
         // code — apply it. Must come before the host check below, which would
         // otherwise swallow it as a plain "continue" link.
         guard let code = AuthService.verificationCode(in: url) else {
-            // Firebase's "Continue" button after verifying on the web.
-            if url.host == AuthService.returnHost {
+            // Firebase's "Continue" button after verifying on the web, or the
+            // "Open Spilr" button on public/auth/action.html (spilr://verified —
+            // a link to that page's own domain can't reopen the app itself, so
+            // it uses this custom scheme instead).
+            if url.host == AuthService.returnHost || url.scheme == "spilr" {
                 Task { await recheckVerificationSilently() }
                 return true
             }

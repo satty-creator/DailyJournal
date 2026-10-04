@@ -2,12 +2,10 @@
 //  MirrorView.swift
 //  DailyJournal
 //
-//  The Mirror tab. Shows the daily Line (one sentence, one payload, two
-//  feedback taps — see TodayMirrorCardView), the self-model sketch banner,
-//  a flat list of surfaceable patterns, and a link to the full self-model
-//  profile. Redesigned per rosebud-teardown-mirror-redesign-2026-09-09.md:
-//  the analysis stays a five-part formula; the display is three layers
-//  (Line / Card / Proof), each one tap apart.
+//  The Mirror tab. The living self-model profile (SelfModelView) is the tab:
+//  the Ask pill, the weekly-letter banner, and the self-model sections. The
+//  7-entry First Sketch ceremony (FirstSketchView) is presented once as a
+//  full-screen cover from here — see `maybeShowFirstSketch()`.
 //
 
 import SwiftUI
@@ -41,35 +39,19 @@ extension PatternType {
 
 // MARK: - ViewModel
 
-/// Where the daily Mirror card stands relative to `isLoading`.
-///
-/// The card is generated (or fetched) AFTER `isLoading` clears — see the note on
-/// `performLoad` — so the screen needs its own signal for "still coming" vs.
-/// "genuinely nothing today", distinct from `mirrorCard == nil` alone.
-enum MirrorCardLoadState: Equatable {
-    case idle      // maturity doesn't allow a daily card yet
-    case working   // fetch/generation in flight
-    case ready     // vm.mirrorCard is populated
-    /// Resolved, and there is no card to show — the silence state (§3.6).
-    /// `reason` drives MirrorSilenceCardView's copy: "no_hypotheses" |
-    /// "below_threshold" | "novelty_gate".
-    case empty(reason: String)
-}
-
 @MainActor
 final class MirrorViewModel: ObservableObject {
     @Published var selfModel: SelfModel = SelfModel.empty(userId: "")
     @Published var hypotheses: [PatternHypothesis] = []
-    @Published var mirrorCard: MirrorCard? = nil
-    @Published var cardLoadState: MirrorCardLoadState = .idle
+    /// 0–10 ratings for `MoodTrendCard` — onboarding's baseline plus every
+    /// guided entry's before/after. See `MoodLogService`.
+    @Published var moodPoints: [MoodLogPoint] = []
     @Published var totalEntries: Int = 0
     /// Starts TRUE. `hypotheses == []` and `totalEntries == 0` both read as "this
     /// user has nothing yet", so rendering before the load meant "nothing here yet"
     /// placeholders, then a full swap once the data landed.
     ///
-    /// Deliberately does NOT wait on the Mirror card any more — see `performLoad`.
-    /// It only covers the Firestore fan-out, which is fast and cache-first; the
-    /// card's own state is `cardLoadState`.
+    /// It only covers the Firestore fan-out, which is fast and cache-first.
     @Published var isLoading = true
     // `showFirstSketch` / `showSelfModel` are gone with the daily Mirror screen:
     // the first-sketch sheet had no trigger left, and the profile is no longer
@@ -89,6 +71,11 @@ final class MirrorViewModel: ObservableObject {
     @Published var personModelItems: [PersonModelItem] = []
     /// Mirror v3.1 — needs, open hypotheses, tonight's question.
     @Published var personModel: PersonModelAggregate = .empty
+    /// The 7-entry "First Sketch" ceremony card — `users/{uid}/derived/firstSeven`,
+    /// written by the nightly job when the user crosses 7 entries. Drives the
+    /// FirstSketchView ceremony (see MirrorView's `firstSketch` cover); nil
+    /// falls back to a SelfModel-derived sketch inside that view.
+    @Published var firstSevenCard: FirstSevenCard? = nil
     /// True when the derived layer's last read couldn't reach the server or a
     /// warm cache at all — distinct from `!facts.isFresh`, which means the
     /// docs genuinely don't exist yet. Mirrors `DerivedService.loadFailed`;
@@ -174,67 +161,6 @@ final class MirrorViewModel: ObservableObject {
             .sorted { MirrorScore.score(for: $0) > MirrorScore.score(for: $1) }
     }
 
-    // MARK: - Mirror card feedback
-
-    func onMirrorFeedback(_ feedback: MirrorFeedback, card: MirrorCard) {
-        guard let patternId = card.sourcePatternIds.first else { return }
-
-        let status: PatternCallbackStatus
-        switch feedback {
-        case .thisIsMe:    status = .shown
-        case .almost:      status = .shown
-        case .notMe:       status = .dismissed
-        case .tooIntense:  status = .dismissed
-        case .askTomorrow: status = .pending
-        }
-
-        if status == .dismissed {
-            AnalyticsManager.shared.trackPatternDismissed()
-        }
-
-        // Persist feedback on the hypothesis
-        MirrorGraphService.shared.recordFeedback(
-            hypothesisId: patternId,
-            userId: userId,
-            status: status
-        )
-        for i in hypotheses.indices where hypotheses[i].id == patternId {
-            hypotheses[i].status = status
-        }
-
-        // "This is me" was previously ALSO only .shown — mild agreement, no
-        // confidence bump. That made confirmation from the Today card a dead
-        // end: SelfModelHypothesis.userStatus (and therefore .confidenceBand
-        // == .yours, the decay exemption, and the confidence floor of 0.85 in
-        // functions/index.js's toSMHyp) could only ever be set from
-        // SelfModelView's "This is me" button — the Today card, the surface
-        // most people actually use, never reached it
-        // (mirror-v3-prd-2026-09-10.md, ordering risk #3). Route it through
-        // the same path SelfModelView uses so both surfaces agree.
-        if feedback == .thisIsMe {
-            SelfModelService.shared.markHypothesis(id: patternId, userStatus: .thisIsMe, userId: userId)
-        }
-
-        // Route into style learning (§3.9 StylePreferences) — "Too intense"
-        // lowers sharpness; two consecutive soft-negatives on the same
-        // patternType mute it for 14 days. This is what makes feedback
-        // visibly change behaviour instead of just logging a rating.
-        if let patternType = hypotheses.first(where: { $0.id == patternId })?.patternType {
-            StylePreferencesService.shared.recordFeedback(feedback, patternType: patternType.rawValue, userId: userId)
-        }
-
-        // Persist feedback on the mirror card itself. Keyed by hypothesis id,
-        // not by date — `mirrorCards/{hypothesisId}`, the server-generated deck
-        // (see functions/index.js `generateMirrorDeck`). `patternId` IS the
-        // card's document id under the new scheme; using it directly here
-        // (rather than `card.id`, which happens to equal it) keeps this write
-        // correct even if that coincidence ever stops holding.
-        Firestore.firestore()
-            .collection("users").document(userId)
-            .collection("mirrorCards").document(patternId)
-            .updateData(["userFeedback": feedback.rawValue]) { _ in }
-    }
-
     // MARK: - Load
 
     /// Serialising entry point: loads never run concurrently, but every caller still
@@ -316,6 +242,7 @@ final class MirrorViewModel: ObservableObject {
         async let lifeCtx = SelfModelService.shared.lifeContext(for: userId)
         async let stylePrefsLoad: Void = StylePreferencesService.shared.load(for: userId)
         async let letterLoad: Void = MirrorLetterService.shared.loadLatest(for: userId)
+        async let moodPointsLoad = MoodLogService.shared.fetch(userId: userId)
         // Mirror v3's derived layer: facts + threads + firstSeven, then
         // today's reading (in that order internally — the reading's date key
         // depends on `facts.timezone`, so DerivedService.load fetches facts
@@ -330,6 +257,7 @@ final class MirrorViewModel: ObservableObject {
         _ = await stylePrefsLoad
         _ = await letterLoad
         _ = await derivedLoad
+        moodPoints = await moodPointsLoad
         selfModel   = SelfModelService.shared.selfModel
         hypotheses  = MirrorGraphService.shared.hypotheses
         weeklyLetter = MirrorLetterService.shared.latest
@@ -337,6 +265,7 @@ final class MirrorViewModel: ObservableObject {
         reading     = DerivedService.shared.reading
         personModelItems = DerivedService.shared.personModelItems
         personModel = DerivedService.shared.personModel
+        firstSevenCard = DerivedService.shared.firstSeven
         derivedLoadFailed = DerivedService.shared.loadFailed
 
         AIService.cacheLifeContext(await lifeCtx)
@@ -350,14 +279,22 @@ final class MirrorViewModel: ObservableObject {
         }
 
         // Everything the SCREEN needs to render is resolved now — clear the
-        // spinner HERE. Neither step below makes an LLM call any more
-        // (`loadOrGenerateMirrorCard` only reads Firestore; `bootstrapMirror`
-        // is a rare, fire-and-forget server trigger for a brand-new user), but
-        // they're still sequenced after `isLoading` clears on principle: this
-        // screen must never again gate first paint on anything that used to be
-        // a 25s-timeout Gemini call.
+        // spinner HERE. The steps below make no LLM call (`bootstrapMirror` is
+        // a rare, fire-and-forget server trigger for a brand-new user;
+        // `refreshDerivedIfNeeded` is pure arithmetic), but they're still
+        // sequenced after `isLoading` clears on principle: this screen must
+        // never again gate first paint on anything that used to be a
+        // 25s-timeout Gemini call.
         isLoading = false
         hasLoaded = true
+
+        // Reconcile entries that were saved without a persisted analysis (AI
+        // was unavailable or failed at save time). The mine's maturity gate
+        // counts `entryAnalyses` docs, not raw entries, so without this a user
+        // can sit at 3+ entries with < 3 analyses and never unlock. Runs before
+        // the mine so the 3rd analysis exists when `runMiningIfNeeded`'s floor
+        // is evaluated. Post-paint, like the mine itself.
+        await EntryAnalysisBackfillService.shared.run(for: userId)
 
         // One-time bootstrap for a brand-new user the server hasn't mined yet.
         await runMiningIfNeeded()
@@ -376,9 +313,6 @@ final class MirrorViewModel: ObservableObject {
         if !facts.isFresh {
             await refreshDerivedIfNeeded()
         }
-
-        // Read today's card off the server-generated deck.
-        await loadOrGenerateMirrorCard()
     }
 
     /// Fallback for an account whose derived layer (facts/threads/readings)
@@ -408,6 +342,7 @@ final class MirrorViewModel: ObservableObject {
         reading     = DerivedService.shared.reading
         personModelItems = DerivedService.shared.personModelItems
         personModel = DerivedService.shared.personModel
+        firstSevenCard = DerivedService.shared.firstSeven
         derivedLoadFailed = DerivedService.shared.loadFailed
     }
 
@@ -509,12 +444,31 @@ final class MirrorViewModel: ObservableObject {
     private func runMiningIfNeeded() async {
         guard hypotheses.isEmpty, AIService.shared.isAIAvailable else { return }
 
+        // Maturity floor. The mine needs ≥ 3 entry analyses; below 3 entries it
+        // can only ever return `immature`. Attempting anyway was the root of the
+        // "sometimes it unlocks, sometimes not" bug: a user who opened Mirror at
+        // 1–2 entries spent the cooldown below on a guaranteed-immature attempt,
+        // and reaching 3 within the cooldown window then found the retry blocked
+        // — so they waited for the nightly cron while a user who happened NOT to
+        // open Mirror early got the immediate bootstrap. With this floor the
+        // cooldown can only ever be spent at/after 3 entries, when a mine can
+        // actually succeed. (Entry count, not analysis count: the backfill in
+        // `performLoad` runs first to close the gap between the two.)
+        guard totalEntries >= 3 else { return }
+
         // Local cooldown guards a failed/immature attempt from retrying on every
         // app open — NOT the source of truth for "has this user ever been
-        // mined", which is the server-side check below.
+        // mined", which is the server-side check below. Deliberately short: the
+        // real cost ceiling is server-side (`claimMirrorBootstrap`'s one-shot
+        // `lastMineRunAt` plus its 5-minute in-flight claim), so this only needs
+        // to prevent a tight per-session retry loop. It is short on purpose so
+        // that if a just-run backfill's analysis writes haven't propagated to
+        // the server yet — making this bootstrap see < 3 analyses and skip as
+        // immature — the next Mirror open retries within minutes rather than
+        // locking the unlock out for a day.
         let cooldownKey = "mirrorFirstMineAttempt_\(userId)"
         let lastAttempt = UserDefaults.standard.object(forKey: cooldownKey) as? Date
-        guard lastAttempt == nil || Date().timeIntervalSince(lastAttempt!) > 86_400.0 else { return }
+        guard lastAttempt == nil || Date().timeIntervalSince(lastAttempt!) > 15 * 60 else { return }
 
         guard await !serverHasMinedBefore() else { return }
 
@@ -557,66 +511,6 @@ final class MirrorViewModel: ObservableObject {
         return false
     }
 
-    /// Reads today's card off the server-generated deck
-    /// (`users/{uid}/mirrorCards/{hypothesisId}`) and walks the ranked
-    /// candidates until one clears the client's own novelty gate and has a
-    /// card that passed the server's lint.
-    ///
-    /// This used to stop at the single top-scoring hypothesis and give up if
-    /// THAT one had no card — even though the deck holds up to
-    /// MIRROR_DECK_SIZE (3) cards. A suppressed or not-yet-generated #1 meant
-    /// "no card today" even when #2 or #3 had a perfectly good one. Walking
-    /// the ranked list fixes that.
-    ///
-    /// The server already applied its own novelty gate (evidence-subset,
-    /// generateMirrorDeck) before writing the deck; this is the piece only
-    /// the client can see — the server writes up to 3 cards, but at most one
-    /// is ever actually shown, so only the client's own `mirrorShown` history
-    /// knows whether TODAY's candidate line repeats what was already shown.
-    ///
-    /// No AI call anywhere in this method. Prompts D and E (write, guard) run
-    /// once per mine cycle in `functions:mineUserInsights` /
-    /// `functions:bootstrapMirror` — see ai-cost-audit-2026-09-06.md cut #1.
-    /// This is a pure Firestore read, cache-first, so it can never be the
-    /// reason the spinner (or, now, `cardLoadState == .working`) lingers.
-    private func loadOrGenerateMirrorCard() async {
-        guard maturity.canShowDailyMirror else {
-            cardLoadState = .idle
-            return
-        }
-        let ranked = MirrorGraphService.shared.rankedCandidates(limit: 3)
-        guard !ranked.isEmpty else {
-            cardLoadState = .empty(reason: hypotheses.isEmpty ? "no_hypotheses" : "below_threshold")
-            return
-        }
-
-        cardLoadState = .working
-
-        let recentlyShown = await MirrorGraphService.shared.recentShownRecords(for: userId, days: 14)
-
-        for candidate in ranked {
-            guard let card = await AIService.shared.fetchMirrorCard(hypothesisId: candidate.id, userId: userId),
-                  card.lintPassed != false
-            else { continue }
-
-            let candidateWords = MirrorText.contentWords(card.displayLine)
-            let isRepeat = recentlyShown.contains { record in
-                MirrorText.jaccardSimilarity(candidateWords, Set(record.contentWords)) > 0.5
-            }
-            guard !isRepeat else { continue }
-
-            mirrorCard = card
-            MirrorGraphService.shared.markShown(
-                candidate.id, userId: userId,
-                line: card.displayLine,
-                evidenceEntryIds: candidate.evidence.map(\.entryId)
-            )
-            cardLoadState = .ready
-            return
-        }
-
-        cardLoadState = .empty(reason: "novelty_gate")
-    }
 }
 
 // MARK: - MirrorView
@@ -643,6 +537,11 @@ struct MirrorView: View {
     @EnvironmentObject private var router: AppRouter
     @State private var showAsk = false
     @State private var showLetter = false
+    /// The 7-entry "First Sketch" ceremony (FirstSketchView). Shown once, the
+    /// first time the user reaches the `.unlock` maturity level with something
+    /// to sketch. `maybeShowFirstSketch()` sets this; a per-user UserDefaults
+    /// flag keeps it once-only.
+    @State private var showFirstSketch = false
 
     init(userId: String, viewModel: MirrorViewModel? = nil) {
         vm = viewModel ?? MirrorViewModel(userId: userId)
@@ -662,12 +561,14 @@ struct MirrorView: View {
                     SelfModelView(
                         userId: vm.userId,
                         selfModel: vm.selfModel,
+                        totalEntries: vm.totalEntries,
                         onAsk: vm.totalEntries >= 5 ? {
                             showAsk = true
                             AnalyticsManager.shared.trackMirrorAskUsed()
                         } : nil,
                         weeklyLetter: vm.weeklyLetter,
-                        onOpenLetter: { openLetter(source: "banner") }
+                        onOpenLetter: { openLetter(source: "banner") },
+                        moodPoints: vm.moodPoints
                     )
                     .refreshable { await vm.load() }
                 }
@@ -678,6 +579,7 @@ struct MirrorView: View {
             .task {
                 await vm.loadIfStale()
                 AnalyticsManager.shared.logEvent(.mirrorGraphViewed)
+                maybeShowFirstSketch()
                 await consumePendingLetterOpen()
             }
             // Push tapped while the app is already running and on this tab (or
@@ -701,8 +603,37 @@ struct MirrorView: View {
                     WeeklyLetterView(letter: letter, onDismiss: { showLetter = false })
                 }
             }
+            .fullScreenCover(isPresented: $showFirstSketch, onDismiss: {
+                UserDefaults.standard.set(true, forKey: firstSketchShownKey)
+            }) {
+                FirstSketchView(
+                    selfModel: vm.selfModel,
+                    serverCard: vm.firstSevenCard,
+                    onDismiss: { showFirstSketch = false }
+                )
+            }
         }
         .trackScreen(.mirror)
+    }
+
+    /// Per-user key so a shared device doesn't suppress the ceremony for a
+    /// second account. Mirrors the `_\(userId)` convention the mining cooldowns
+    /// already use.
+    private var firstSketchShownKey: String { "mirrorFirstSketchShown_\(vm.userId)" }
+
+    /// Shows the First Sketch ceremony exactly once, the first time the user is
+    /// both at the `.unlock` maturity level (7 entries) AND has something to
+    /// sketch — either the server's counted `firstSeven` card or a surfaceable
+    /// self-model. Gating on real content avoids an empty ceremony (just a
+    /// title and ring) when the nightly derived job hasn't landed yet; the flag
+    /// stays unset in that case, so a later visit still gets the moment.
+    private func maybeShowFirstSketch() {
+        guard !UserDefaults.standard.bool(forKey: firstSketchShownKey),
+              vm.maturity.canShowFirstSketch,
+              vm.firstSevenCard != nil || vm.selfModel.isSurfaceable,
+              !showFirstSketch
+        else { return }
+        showFirstSketch = true
     }
 
     /// Opens the letter reader and marks it read. Marking happens on OPEN, not
@@ -750,12 +681,13 @@ struct MirrorView: View {
 // want" disclosure section all lived here and are gone with the tab rewrite
 // above. `askCard` moved to AskView.swift as `MirrorAskCard`.
 //
-// Their component files are still in the tree and now have no call site:
-// TodayReadingCardView.swift, ModelRowsSectionView.swift,
-// OpenQuestionsSectionView.swift, ProofSheetView.swift, FirstSketchView.swift,
-// TeachSpilrSheet.swift, and MirrorCardSkeletonView in TodayMirrorCardView.swift.
-// Deleting them is a separate call — several encode server contracts and
-// PRD-documented behaviour.
+// FirstSketchView.swift was in this stranded set but is now wired back in as
+// the 7-entry ceremony (see `maybeShowFirstSketch()` above). The rest of the
+// stranded component files have been deleted along with the client mirror-card
+// pipeline they belonged to: TodayMirrorCardView.swift, TodayReadingCardView.swift,
+// ModelRowsSectionView.swift, OpenQuestionsSectionView.swift, ProofSheetView.swift
+// and TeachSpilrSheet.swift. The legacy per-hypothesis deck is no longer written
+// server-side either (MIRROR_LEGACY_DECK = false; generateMirrorDeck removed).
 //
 // WeeklyLetterView.swift is the one exception: it and its WeeklyLetterBanner
 // were also stranded here, but the letter itself is generated and pushed

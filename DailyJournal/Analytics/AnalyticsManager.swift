@@ -36,6 +36,11 @@ enum AnalyticsEvent: String {
     case onboardingStarted = "onboarding_started"
     case onboardingCompleted = "onboarding_completed"
     case onboardingVibeSelected = "onboarding_vibe_selected"
+    case onboardingStepViewed = "onboarding_step_viewed"
+    case onboardingStruggleSelected = "onboarding_struggle_selected"
+    case onboardingPeopleCount = "onboarding_people_count"
+    case onboardingBaselineSet = "onboarding_baseline_set"
+    case onboardingFirstEntryDelta = "onboarding_first_entry_delta"
 
     // Entry creation
     case entryCompositionStarted = "entry_composition_started"
@@ -44,6 +49,10 @@ enum AnalyticsEvent: String {
     case entryDeleted = "entry_deleted"
     case entryDrafted = "entry_drafted"
     case entryDiscarded = "entry_discarded"
+
+    // Template box-breathing step (see `TemplateStep.Kind.breathing`)
+    case templateBreathingCompleted = "template_breathing_completed"
+    case templateBreathingSkipped = "template_breathing_skipped"
 
     // Entry features
     case moodLogged = "mood_logged"
@@ -250,8 +259,27 @@ final class AnalyticsManager {
         ])
     }
 
-    func trackVibeSelected(_ vibe: String) {
-        logEvent(.onboardingVibeSelected, parameters: ["vibe": vibe])
+    func trackOnboardingStepViewed(_ step: String) {
+        logEvent(.onboardingStepViewed, parameters: ["step": step])
+    }
+
+    func trackOnboardingStruggleSelected(option: String, hasDetail: Bool) {
+        logEvent(.onboardingStruggleSelected, parameters: ["option": option, "has_detail": hasDetail])
+    }
+
+    func trackOnboardingPeopleCount(_ count: Int) {
+        logEvent(.onboardingPeopleCount, parameters: ["count": count])
+    }
+
+    func trackOnboardingBaselineSet(_ value: Int) {
+        logEvent(.onboardingBaselineSet, parameters: ["value": value])
+    }
+
+    func trackOnboardingFirstEntryDelta(before: Int?, after: Int?) {
+        var params: [String: Any] = [:]
+        if let before { params["before"] = before }
+        if let after { params["after"] = after }
+        logEvent(.onboardingFirstEntryDelta, parameters: params)
     }
 
     // Entry creation
@@ -363,20 +391,8 @@ final class AnalyticsManager {
     }
 
     // Pattern
-    func trackPatternSurfaced(archetype: String, evidenceCount: Int, noveltyScore: Double) {
-        logEvent(.patternSurfaced, parameters: [
-            "archetype": archetype,
-            "evidence_count": evidenceCount,
-            "novelty_score": noveltyScore
-        ])
-    }
-
     func trackPatternDismissed() {
         logEvent(.patternDismissed)
-    }
-
-    func trackPatternExplored(archetype: String) {
-        logEvent(.patternExplored, parameters: ["archetype": archetype])
     }
 
     // Mirror v3.1
@@ -389,10 +405,6 @@ final class AnalyticsManager {
 
     func trackMirrorAskUsed() {
         logEvent(.mirrorAskUsed)
-    }
-
-    func trackMirrorOpenHypothesisTapped() {
-        logEvent(.mirrorOpenHypothesisTapped)
     }
 
     /// `source` is "banner" (in-app, tapped from the Mirror tab) or "push"

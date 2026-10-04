@@ -209,6 +209,29 @@ final class TemplateRunnerViewModel: ObservableObject {
         // render as a raw hashtag like "#after-a-hard-conversation" on the
         // journal card (see `JournalCardView`).
         var mergedTags = template.tags
+
+        // The emotions and thinking traps someone picked themselves are a
+        // stronger signal than anything `LocalAI` can infer from the prose —
+        // lowercased so they tag consistently with everything else, and
+        // added before the inferred topics below so an explicit pick never
+        // loses its slot to a guess. Feeds Patterns/Mirror the same way any
+        // other tag does; there's no dedicated UI for these yet.
+        for step in template.steps {
+            guard case .multiChoice(let options, _) = step.kind,
+                  let picked = answers[step.id]?.choiceValues else { continue }
+            // Only the step's own chips become tags — a free-text "Other"
+            // answer (not in `options`) is prose, not a label, and would
+            // otherwise turn into one long, ugly hashtag.
+            for item in picked where options.contains(item) && mergedTags.count < 5 {
+                // "Mind reading" → "mind-reading" — matches the single-word,
+                // lowercase shape every other tag here already has (see
+                // `LocalAI.extractTopics`), rather than a hashtag with a
+                // literal space in it on the journal card.
+                let slug = item.lowercased().replacingOccurrences(of: " ", with: "-")
+                if !mergedTags.contains(slug) { mergedTags.append(slug) }
+            }
+        }
+
         for topic in LocalAI.extractTopics(from: trimmed) where !mergedTags.contains(topic) && mergedTags.count < 5 {
             mergedTags.append(topic)
         }

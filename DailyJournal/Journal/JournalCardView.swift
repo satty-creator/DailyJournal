@@ -42,8 +42,17 @@ struct JournalCardView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             // Attached photo (if any) — not drawn in the 1e mockup, but silently
-            // dropping a real photo would lose data the user attached.
-            if let urlString = entry.photoURL, let url = URL(string: urlString) {
+            // dropping a real photo would lose data the user attached. Prefers
+            // the local cache (instant, warm as soon as save() runs) over the
+            // remote URL, which only exists once the background upload finishes.
+            if let localImage = PhotoCacheService.shared.image(forEntryId: entry.id) {
+                Image(uiImage: localImage)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(height: 120)
+                    .frame(maxWidth: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            } else if let urlString = entry.photoURL, let url = URL(string: urlString) {
                 AsyncImage(url: url) { phase in
                     switch phase {
                     case .success(let image):

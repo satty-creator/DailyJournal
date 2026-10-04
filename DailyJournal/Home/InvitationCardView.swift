@@ -32,6 +32,12 @@ struct InvitationCardView: View {
     /// redacted; the pill and rail always render live (a redacted-looking tap
     /// target that nonetheless works is worse than either state).
     let dayOne: Bool?
+    /// Whether Daily Chat (which sends text to Gemini) is usable at all — i.e.
+    /// signed in AND the user granted AI consent (`AIService.isAIAvailable`).
+    /// When false the chat pill is removed entirely and the hero stops posing an
+    /// AI-written opener it can't follow up on; the user still writes via the
+    /// blank page and templates. Honest beats a dead button.
+    let chatAvailable: Bool
     /// Pill body — Daily Chat, keyboard.
     let onWrite: () -> Void
     /// Mic — Daily Chat with dictation already running.
@@ -39,18 +45,15 @@ struct InvitationCardView: View {
     let onBlankPage: () -> Void
     let onTemplates: () -> Void
 
-    private var copy: (title: String, body: String) {
-        (dayOne ?? false)
-            ? (
-                "Want to spend a few minutes with yourself?",
-                "I\u{2019}ll ask one gentle question and take it from there \u{2014} you answer however much you like. No blank page, no timer."
-              )
-            : (
-                "Ready when you are.",
-                // Deliberately still one line rather than nothing: the card
-                // would otherwise change height the moment `dayOne` resolves.
-                "About two minutes, your call once we\u{2019}re in."
-              )
+    private var copy: (title: String, caption: String) {
+        if !chatAvailable {
+            // No Spilr voice here — plain UI chrome describing the ways in that
+            // don't need AI, never an opener question the chat can't answer.
+            return ("Today\u{2019}s entry", "Start a blank page, or pick a template.")
+        }
+        return (dayOne ?? false)
+            ? (AIService.chatOpener, "Type or talk, as much or as little as you like. I\u{2019}ll keep it for you.")
+            : (AIService.chatOpener, "about 2 minutes")
     }
 
     var body: some View {
@@ -65,20 +68,33 @@ struct InvitationCardView: View {
 
             Group {
                 Text(copy.title)
-                    .font(AppTheme.editorialDisplay(size: 23, weight: .heavy))
+                    .font(AppTheme.editorialDisplay(size: 21, weight: .heavy))
                     .foregroundStyle(AppTheme.cream)
                     .lineSpacing(2)
+                    .lineLimit(3)
                     .fixedSize(horizontal: false, vertical: true)
 
-                Text(copy.body)
-                    .font(AppTheme.editorialBody(size: 13))
-                    .foregroundStyle(AppTheme.cream.opacity(0.74))
-                    .lineSpacing(2)
-                    .fixedSize(horizontal: false, vertical: true)
+                if (dayOne ?? false) || !chatAvailable {
+                    Text(copy.caption)
+                        .font(AppTheme.editorialBody(size: 13))
+                        .foregroundStyle(AppTheme.cream.opacity(0.74))
+                        .lineSpacing(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    // A small mono tag rather than a full sentence for a
+                    // returning user — the question is doing the talking now.
+                    Text(copy.caption.uppercased())
+                        .font(AppTheme.mono(size: 10))
+                        .tracking(1.4)
+                        .foregroundStyle(AppTheme.cream.opacity(0.6))
+                }
             }
-            .redacted(reason: dayOne == nil ? .placeholder : [])
 
-            writePill
+            // Daily Chat is the only AI-dependent way in here; the blank page and
+            // templates still work, so drop just the pill when AI is unavailable.
+            if chatAvailable {
+                writePill
+            }
             modeRail
         }
         .padding(22)
@@ -100,7 +116,7 @@ struct InvitationCardView: View {
     private var writePill: some View {
         HStack(spacing: 8) {
             Button(action: onWrite) {
-                Text("Answer today\u{2019}s question\u{2026}")
+                Text("Type or talk\u{2026}")
                     .font(AppTheme.editorialBody(size: 15))
                     // No .opacity() here. inkSoft-on-cream is 4.73:1 in Bloom,
                     // the tightest palette; fading it drops that under AA.
@@ -113,7 +129,7 @@ struct InvitationCardView: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Answer today\u{2019}s question")
+            .accessibilityLabel("Type or talk")
             .accessibilityHint("Opens a conversation with Spilr.")
             .accessibilityIdentifier("home.startChat")
 

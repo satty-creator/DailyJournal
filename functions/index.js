@@ -15,6 +15,10 @@ const { onRequest } = require("firebase-functions/v2/https");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { onTaskDispatched } = require("firebase-functions/v2/tasks");
 const { defineSecret } = require("firebase-functions/params");
+// Structured logger — emits jsonPayload + severity to Cloud Logging, which is
+// what a log-based metric / alert policy filters on (see the Gemini-failure
+// alarm setup in functions/README-monitoring.md).
+const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
 const { getFunctions } = require("firebase-admin/functions");
 // Modular imports, not `Timestamp` etc.: the Functions
@@ -55,7 +59,7 @@ const {
   gateExceptionObservation, selectForToday,
 } = require("./lib/gate");
 const {
-  buildFormulationPrompt, buildNextQuestionPrompt, buildMirrorMPrompt, buildAskPrompt,
+  buildFormulationPrompt, buildMirrorMPrompt, buildAskPrompt,
 } = require("./lib/prompts");
 const {
   isOwnerToken, decideAccess, hasAIAccess, resolveAppUserId, entitlementUpdateFromEvent,
@@ -238,20 +242,17 @@ const GEMINI_KEY = defineSecret("GEMINI_KEY");
 const MODEL = "gemini-3.5-flash-lite";
 
 // Every `surface` tag any client call site actually sends today (see AIService.swift
-// / AIService+Chat.swift / AIService+Mirror.swift / AIService+Template.swift /
-// AIService+Read.swift). `surface` is client-controlled and keys the per-surface
-// budget bucket (SURFACE_SHARE_CAP below) — an unvalidated string lets a client mint
-// a fresh tag on every call to get a fresh bucket, defeating that cap entirely (the
-// global per-uid budget still applies either way). Anything not in this set collapses
-// to "unknown", same as an untagged call site.
+// / AIService+Chat.swift / AIService+Mirror.swift / AIService+Template.swift).
+// `surface` is client-controlled and keys the per-surface budget bucket
+// (SURFACE_SHARE_CAP below) — an unvalidated string lets a client mint a fresh tag
+// on every call to get a fresh bucket, defeating that cap entirely (the global
+// per-uid budget still applies either way). Anything not in this set collapses to
+// "unknown", same as an untagged call site.
 const KNOWN_SURFACES = new Set([
   "journal_insights", "echo_extraction",
-  "chat_turn", "chat_turn_cbt", "chat_weave_entry", "chat_weave_thought_journal",
+  "chat_turn_cbt", "chat_weave_thought_journal",
   "chat_session_state", "chat_model_ops",
-  "todays_read_client",
-  // "mirror_narrative" removed — Prompt F was deleted client-side in Mirror
-  // v3 (the weekly letter replaces it), so the tag can no longer be sent.
-  "mirror_ask", "mirror_analyze_entry",
+  "mirror_analyze_entry",
   "template_weave_entry",
   "unknown",
 ]);
@@ -263,6 +264,29 @@ const KNOWN_SURFACES = new Set([
 // 1024 comfortably covers the largest call today (chat_weave_entry at 700).
 const MAX_OUTPUT_TOKENS_CEILING = 1024;
 const MAX_CONTENTS_TURNS = 40;
+
+// Hard ceiling on the size of a single client payload, independent of turn
+// count. MAX_CONTENTS_TURNS caps how MANY turns a client sends; without a byte
+// cap a client could still send 40 enormous turns and blow the budget (and our
+// upstream cost) in one shot before the pre-call budget check — which runs
+// against the PRE-call state — can see it. ~120 KB comfortably covers the
+// largest real conversation; anything past it is abuse or a bug.
+const MAX_REQUEST_BYTES = 120 * 1024;
+
+// Cached input tokens are billed by Gemini at a fraction of a fresh prompt
+// token (implicit context cache). Charging the raw promptTokenCount therefore
+// over-counts every cached call against the user's budget. 0.25 is the
+// documented cached-input discount for the Flash-Lite line.
+const CACHE_RATE = 0.25;
+
+// What to actually charge the budget for the input side of one call: fresh
+// tokens at full rate, cached tokens at CACHE_RATE. Used by both geminiProxy
+// (client relay) and callGeminiJSON (server-side reflection) so the two agree.
+function billedInputTokens(usage) {
+  const inTok = (usage && usage.promptTokenCount) || 0;
+  const cachedTok = (usage && usage.cachedContentTokenCount) || 0;
+  return Math.round((inTok - cachedTok) + cachedTok * CACHE_RATE);
+}
 
 /* ──────────────────────────────────────────────────────────────────────────
  *  AI usage budgets (ai-cost-audit-2026-09-06.md §4 cut #13, §5.5).
@@ -304,7 +328,14 @@ function utcDayKey(d) {
  * first-ever use. Returns `decideAccess`'s `{ allowed, entitlement, reason,
  * ledger }`. Never calls Gemini — purely a Firestore check.
  */
-async function checkAIBudget(db, uid, surface, isOwner = false) {
+async function checkAIBudget(db, uid, surface, isOwner = false, opts = {}) {
+  // startPreview:false — used by the server-side reflection path
+  // (callGeminiJSON). A background job must never be what STARTS a user's free
+  // preview clock: that would quietly spend their 3 days before they've opened a
+  // single AI surface. In that mode a user with no aiUsage doc is simply allowed
+  // (their preview hasn't begun — same as hasAIAccess's start==null case) and no
+  // doc is written here; recordAIUsage still logs the spend afterwards.
+  const { startPreview = true } = opts;
   const ref = db.collection("aiUsage").doc(uid);
   const now = new Date();
   const today = utcDayKey(now);
@@ -312,6 +343,12 @@ async function checkAIBudget(db, uid, surface, isOwner = false) {
   return db.runTransaction(async (tx) => {
     const snap = await tx.get(ref);
     let data = snap.exists ? snap.data() : null;
+
+    if (!data && !startPreview) {
+      // No doc yet and we won't bootstrap one — treat as a not-yet-started
+      // preview (allowed) without writing anything.
+      return decideAccess({ entitlement: "free" }, now.getTime(), surface, isOwner);
+    }
 
     if (!data) {
       data = {
@@ -337,7 +374,7 @@ async function checkAIBudget(db, uid, surface, isOwner = false) {
       // on their first AI call after this deploy — see lib/entitlement.js.
       // Their old preview-token counters are reset too, so the preview is a
       // real one rather than already spent by August usage.
-      if (!data.previewStartedAt) {
+      if (startPreview && !data.previewStartedAt) {
         Object.assign(patch, {
           previewStartedAt: Timestamp.fromDate(now),
           trialInTok: 0, trialOutTok: 0, trialPerSurface: {},
@@ -353,16 +390,17 @@ async function checkAIBudget(db, uid, surface, isOwner = false) {
   });
 }
 
-/** Status-only gate for server-side AI work (see hasAIAccess). Fails OPEN on
- *  a read error, same trade as geminiProxy: an infra hiccup must not switch
- *  AI off for paying users. */
+/** Status-only gate for server-side AI work (see hasAIAccess). Fails CLOSED on
+ *  a read error: a cost-control check that can't run must not become a free
+ *  pass to spend. Server jobs have no user waiting and simply skip this pass,
+ *  retrying on the next nightly run, so denying on error is cheap here. */
 async function serverAIAllowed(db, uid) {
   try {
     const snap = await db.collection("aiUsage").doc(uid).get();
     return hasAIAccess(snap.exists ? snap.data() : null, Date.now());
   } catch (e) {
-    console.error("serverAIAllowed read failed, allowing", { uid, error: String(e) });
-    return true;
+    console.error("serverAIAllowed read failed, denying", { uid, error: String(e) });
+    return false;
   }
 }
 
@@ -450,6 +488,14 @@ exports.geminiProxy = onRequest(
       res.status(400).json({ error: `'contents' exceeds ${MAX_CONTENTS_TURNS} turns` });
       return;
     }
+    // Cap the total payload SIZE, not just the turn count — 40 enormous turns
+    // would otherwise sail through the check above and spend real money before
+    // the pre-call budget check (which sees only PRE-call state) can react.
+    const requestBytes = Buffer.byteLength(JSON.stringify(body.contents), "utf8");
+    if (requestBytes > MAX_REQUEST_BYTES) {
+      res.status(413).json({ error: "Request payload too large" });
+      return;
+    }
 
     // `surface` is a client-supplied cost-attribution tag (e.g. "chat_turn",
     // "mirror_card") — logged and budgeted below, never forwarded upstream
@@ -481,12 +527,15 @@ exports.geminiProxy = onRequest(
         return;
       }
     } catch (e) {
-      // Budget check itself failed (Firestore hiccup) — fail OPEN, not closed.
-      // A cost-control outage should degrade to "no enforcement this call," not
-      // "no AI for anyone." The upstream call still costs real money either way,
-      // so this is a deliberate trade: rare infra failures don't take the whole
-      // AI layer down with them.
-      console.error("AI budget check failed, proceeding without enforcement", { uid, surface, error: String(e) });
+      // Budget check itself failed (Firestore hiccup) — fail CLOSED. The
+      // previous trade (proceed unmetered) meant a Firestore outage turned into
+      // an uncapped spend window: every call during it bills real money with no
+      // enforcement at all. A cost-control check that can't run is not a licence
+      // to spend. Clients already degrade to their local engine on any non-2xx,
+      // so a 503 here is a soft, recoverable failure, not a dead AI layer.
+      console.error("AI budget check failed, denying call", { uid, surface, error: String(e) });
+      res.status(503).json({ error: "AI temporarily unavailable" });
+      return;
     }
 
     // 3. Forward to Gemini. Node 20 has global fetch.
@@ -594,9 +643,10 @@ exports.geminiProxy = onRequest(
             cachedContentTokenCount: usage.cachedContentTokenCount || 0,
             model: MODEL,
           });
-          // Charge the budget against what was actually spent. Best-effort: a
+          // Charge the budget against what was actually spent, discounting the
+          // cached portion of the input (see billedInputTokens). Best-effort: a
           // failure here must not affect the response already streaming back.
-          recordAIUsage(admin.firestore(), uid, surface, ledger, inTok, outTok)
+          recordAIUsage(admin.firestore(), uid, surface, ledger, billedInputTokens(usage), outTok)
             .catch((e) => console.error("recordAIUsage failed", { uid, surface, error: String(e) }));
         }
       } catch (e) {
@@ -611,7 +661,16 @@ exports.geminiProxy = onRequest(
     } catch (e) {
       clearTimeout(upstreamTimeout);
       const timedOut = e && e.name === "AbortError";
-      console.error("Gemini upstream error", { uid, surface, error: String(e), timedOut });
+      // Stable `event` field so a Cloud Monitoring log-based metric can count
+      // Gemini failures precisely (filter: jsonPayload.event="gemini_upstream_failure")
+      // and an alert policy can page on a spike, sliced by `surface` and
+      // `timedOut`. See functions/README-monitoring.md for the one-time setup.
+      logger.error("gemini_upstream_failure", {
+        event: "gemini_upstream_failure",
+        uid, surface, timedOut,
+        status: timedOut ? 504 : 502,
+        error: String(e),
+      });
       res.status(timedOut ? 504 : 502).json({ error: timedOut ? "Upstream Gemini timeout" : "Upstream Gemini error" });
     }
   }
@@ -631,8 +690,28 @@ function logAIUsage(uid, surface, usageMetadata) {
   });
 }
 
-/** One Gemini JSON call. Returns the parsed object from candidates[0]...text. */
+/** One Gemini JSON call. Returns the parsed object from candidates[0]...text.
+ *
+ *  THE ONE SHARED GATE for server-side reflection. Every reflection surface
+ *  (person model, pattern mining, reading, weekly letter, Ask) funnels through
+ *  here, so running the budget check and the ledger debit in this one place is
+ *  what guarantees none of them can spend past a user's budget and that server
+ *  spend is counted, not invisible. Previously these calls consulted only the
+ *  binary serverAIAllowed status (once per chain) and never debited the ledger,
+ *  so a user's whole nightly pass ran unmetered. The check throws on denial;
+ *  every caller already treats a thrown callGeminiJSON as "degrade / skip". */
 async function callGeminiJSON(prompt, { maxTokens, temperature }, uid, surface) {
+  const db = admin.firestore();
+  let ledger = "trial";
+  if (uid) {
+    // startPreview:false — a background job must not start a user's preview clock.
+    const budget = await checkAIBudget(db, uid, surface, false, { startPreview: false });
+    if (!budget.allowed) {
+      throw new Error(`AI budget exceeded (${surface}): ${budget.reason}`);
+    }
+    ledger = budget.ledger;
+  }
+
   const url =
     `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}` +
     `:generateContent?key=${GEMINI_KEY.value()}`;
@@ -651,6 +730,13 @@ async function callGeminiJSON(prompt, { maxTokens, temperature }, uid, surface) 
   if (!resp.ok) throw new Error(`Gemini HTTP ${resp.status}`);
   const json = await resp.json();
   logAIUsage(uid, surface, json?.usageMetadata);
+  // Debit the ledger the same way geminiProxy does, cached-discounted. Best-
+  // effort: a failed write must not fail the reflection we already paid for.
+  if (uid && json && json.usageMetadata) {
+    recordAIUsage(db, uid, surface, ledger,
+      billedInputTokens(json.usageMetadata), json.usageMetadata.candidatesTokenCount || 0)
+      .catch((e) => console.error("recordAIUsage (server) failed", { uid, surface, error: String(e) }));
+  }
   const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text) throw new Error("Empty Gemini response");
   return JSON.parse(text);
@@ -1929,7 +2015,11 @@ async function updateSelfModel(db, uid, entryCount, now) {
   let maturity = "seed";
   if (entryCount >= 30) maturity = "established";
   else if (entryCount >= 14) maturity = "growing";
-  else if (entryCount >= 7) maturity = "sprouting";
+  // "sprouting" from 3 entries, not 7: this is the moment the Mirror first
+  // unlocks its "First observations" section, so the maturity ring must not
+  // still read "Seed" while the screen is showing the user real content. The
+  // 7-entry First Sketch ceremony is a separate surface and keeps its own copy.
+  else if (entryCount >= 3) maturity = "sprouting";
 
   const sm = {
     userId: uid,
@@ -1954,33 +2044,6 @@ async function updateSelfModel(db, uid, entryCount, now) {
   };
   await smRef.set(sm, { merge: true });
 }
-
-/* ──────────────────────────────────────────────────────────────────────────
- *  Mirror card generation (server side) — Prompts D + E, mirror-write-v2 /
- *  mirror-guard-v1. Ported from DailyJournal/Mirror/AIService+Mirror.swift.
- *
- *  Generation moves here so the Mirror tab never makes an LLM call at all:
- *  the client used to run this on open, and `loadOrGenerateMirrorCard` could
- *  chain two sequential Gemini calls (write, then guard) behind the tab's
- *  loading spinner. It now only reads what this code already wrote.
- *
- *  A DECK, not one card — MIRROR_DECK_SIZE hypotheses, not just the top one.
- *  MirrorScore's repetition-fatigue term (MirrorScore.swift) means the
- *  top-scoring hypothesis can change from one day to the next WITHOUT a new
- *  mine, purely because `shownAt` ages. Pre-generating the top few lets the
- *  client's existing local ranking (unchanged) pick whichever one is actually
- *  on top today and almost always find a card already written for it.
- *
- *  PRIVACY: exactly like buildMinePrompt above, this reasons over
- *  entryAnalyses / patternHypotheses fields only — never raw entry text,
- *  which the server couldn't read anyway (entries.content is encrypted
- *  client-side with a device-local key).
- * ────────────────────────────────────────────────────────────────────────── */
-const MIRROR_WRITE_PROMPT_VERSION = "mirror-line-v1";
-const MIRROR_DECK_SIZE = 3;             // must be >1 to survive a fatigue-driven rotation.
-const MIRROR_CARD_ANALYSES_LIMIT = 14;  // matches MirrorGraphService.loadRecentAnalyses's caller.
-const MIRROR_HYPOTHESES_LIMIT = 20;     // matches MirrorGraphService.loadHypotheses.
-
 /** Deterministic sentence-case pass. Port of SpilrVoice.sentenceCased
  *  (DailyJournal/Home/SpilrVoice.swift) — keep in sync for the same reason
  *  SAFETY_RULES above is kept in sync with SpilrVoice.safetyRules: this is
@@ -1988,17 +2051,6 @@ const MIRROR_HYPOTHESES_LIMIT = 20;     // matches MirrorGraphService.loadHypoth
  *  this file is now a second writer of the same kind of user-facing text. */
 // `sentenceCased` comes from ./lib/text (with `deShout`, which fixes the
 // ALL-CAPS case this function structurally cannot).
-
-/** Port of MirrorMaturity.current(totalEntries:) — MirrorMaturity.swift. */
-function mirrorMaturityFor(totalEntries) {
-  if (totalEntries < 1) return "seed";
-  if (totalEntries < 3) return "first";
-  if (totalEntries < 7) return "soft";
-  if (totalEntries < 14) return "unlock";
-  if (totalEntries < 30) return "deeper";
-  if (totalEntries < 90) return "monthly";
-  return "rhythm";
-}
 
 /** The true entry count, cheaply. Prefers `rollups/stats` (DailyJournal
  *  RollupStats.swift) — a single small-doc read; falls back to a Firestore
@@ -2012,29 +2064,6 @@ async function totalEntryCountFor(db, uid) {
   const countSnap = await db.collection("users").doc(uid)
     .collection("entries").count().get();
   return num(countSnap.data().count, 0);
-}
-
-/** Port of the `depthInstruction` switch inside the (retired) client
- *  buildMirrorWritePrompt. Reworded for mirror-line-v1 (Phase 3): the old
- *  copy instructed the model in terms of "mirrorSentence" by name, a field
- *  that no longer exists in the schema — every branch now talks about "the
- *  line" instead. */
-function mirrorDepthInstruction(maturity) {
-  if (maturity === "seed" || maturity === "first") {
-    return `DEPTH: Early days — only 1-2 entries. The line should be ONE simple
-observation, heavily hedged. Do NOT claim a pattern — say what you noticed,
-nothing more.`;
-  }
-  if (maturity === "soft") {
-    return `DEPTH: Few entries (3-6). The line may name something that MIGHT be
-a pattern, but hedge it — "this might be...", "twice now..." — never certain.`;
-  }
-  if (maturity === "unlock" || maturity === "deeper") {
-    return `DEPTH: Enough data (7-30 entries) to name a pattern with evidence.
-Lean on it directly — you don't need to hedge as hard as the early stages.`;
-  }
-  return `DEPTH: Rich data (30+ entries). You may be specific about trajectory —
-when this started, whether it's shifting — but the line is still one sentence.`;
 }
 
 /** Port of MirrorScore.score(for:) — MirrorScore.swift. `h` is a raw
@@ -2059,8 +2088,8 @@ function mirrorRepetitionFatigue(h, now) {
 
 /* ──────────────────────────────────────────────────────────────────────────
  *  MIRROR LINT — deterministic quality gate (rosebud-teardown-mirror-
- *  redesign-2026-09-09.md §3.7 Stage 3), extending the banned-term/label
- *  short-circuit that already existed in writeMirrorCardFor.
+ *  redesign-2026-09-09.md §3.7 Stage 3). The banned-term/label lint here is
+ *  shared by the reading, letter and thread writers.
  *
  *  Scoped to `mirrorSentence` today — the field MirrorCard.displayLine falls
  *  back to (DailyJournal/Mirror/MirrorCard.swift) until Phase 3's `line`
@@ -2076,9 +2105,9 @@ function mirrorRepetitionFatigue(h, now) {
 
 // Small, deliberately generic — this is a client-independent, best-effort
 // paraphrase check against an EntryAnalysis summary, not a cross-language
-// parity point with the Swift side (unlike mirrorScore/mirrorMaturityFor,
-// which MUST match DailyJournal/Mirror/MirrorScore.swift byte-for-byte
-// because the client picks from cards this file wrote).
+// parity point with the Swift side (unlike mirrorScore, which MUST match
+// DailyJournal/Mirror/MirrorScore.swift byte-for-byte because the client picks
+// from cards this file wrote).
 // MIRROR_STOPWORDS / contentWords / jaccard come from ./lib/text.
 
 // `hasVerbatimOverlap` comes from ./lib/text.
@@ -2086,493 +2115,6 @@ function mirrorRepetitionFatigue(h, now) {
 // `lintMirrorLine` now delegates to ./lib/lint's `lintCopy`, which adds the
 // §6 rules (specificity, reading level, metaphor, ends-negative) on top of
 // the original seven and is shared with the reading/letter/thread surfaces.
-
-/* ──────────────────────────────────────────────────────────────────────────
- *  MIRROR LINE — Stage 1 (Select, deterministic) + Stage 2 (Write, LLM) of
- *  rosebud-teardown-mirror-redesign-2026-09-09.md §3.7. Replaces the old
- *  12-field mirror-write-v2 card writer with one that asks for a single
- *  sentence and is told, not asked, which shape and which receipt(s) to use.
- * ────────────────────────────────────────────────────────────────────────── */
-
-/** Port of MirrorShape.for(_:) — DailyJournal/Mirror/MirrorShape.swift.
- *  Deterministic — the model is TOLD the shape, never asked to pick one.
- *  Soft parity only: `card.shape` (this function's output) is authoritative
- *  once written; the Swift copy exists to render legacy cards and to derive
- *  a shape client-side before this field exists on a given card. */
-function mirrorShapeFor(h) {
-  if (h.patternType === "exception") return "softened";
-  if (h.patternType === "avoided_subject" || num(h.timesSeen, 1) < 3) {
-    return h.callbackQuestion ? "ask" : "notice";
-  }
-  const recurring = ["vocabulary_fingerprint", "time_rhythm", "absence"].includes(h.patternType)
-    || num(h.timesSeen, 1) >= 5;
-  if (recurring) {
-    return hasWeekApartEvidence(h) ? "thenNow" : "notice";
-  }
-  return "notice";
-}
-
-function hasWeekApartEvidence(h) {
-  const dates = (h.evidence || [])
-    .map((e) => (e.entryCreatedAt && e.entryCreatedAt.toDate ? e.entryCreatedAt.toDate().getTime() : null))
-    .filter((t) => t !== null);
-  if (dates.length < 2) return false;
-  return (Math.max(...dates) - Math.min(...dates)) >= 7 * 86400000;
-}
-
-/** Stage 1 — Select. The writer never chooses or rewrites evidence; this
- *  picks it before the prompt is even built. `notice`/`ask` get the newest
- *  receipt (why this came up NOW); `thenNow` gets oldest + newest;
- *  `softened` gets the newest receipt plus `hypothesis.counterEvidence[0]`
- *  (rendered separately in the prompt as "what was different"). */
-function selectReceiptsForShape(h, shape) {
-  const byDate = (h.evidence || []).slice().sort((a, b) => {
-    const ad = a.entryCreatedAt && a.entryCreatedAt.toDate ? a.entryCreatedAt.toDate().getTime() : 0;
-    const bd = b.entryCreatedAt && b.entryCreatedAt.toDate ? b.entryCreatedAt.toDate().getTime() : 0;
-    return ad - bd; // oldest first
-  });
-  if (byDate.length === 0) return [];
-  if (shape === "thenNow" && byDate.length >= 2) {
-    return [byDate[0], byDate[byDate.length - 1]];
-  }
-  return [byDate[byDate.length - 1]]; // newest
-}
-
-const MIRROR_SHAPE_INSTRUCTIONS = {
-  notice: "SHAPE: Notice — name the pattern, leaning on the single receipt above. No question.",
-  ask: "SHAPE: Ask — name what's being circled in the line; the \"question\" field carries the rest. Keep the line itself short even without a concrete receipt to quote.",
-  thenNow: "SHAPE: Then/Now — contrast the OLDEST receipt above with the NEWEST — what changed between them.",
-  softened: "SHAPE: Softened — name the exception: the time this did NOT hold, using the receipt above and what was different below. This is good news, not a gotcha — do not undercut it.",
-};
-
-/** Stage 2 — Write. `hypothesis` is a raw patternHypotheses doc; `receipts`
- *  is Stage 1's deterministic selection (selectReceiptsForShape); `shape` is
- *  mirrorShapeFor's output. No raw entry text anywhere in this prompt — only
- *  the hypothesis's own mined fields and the selected receipt quotes. */
-/** §3.9 StylePreferences — feedback that changes HOW Spilr writes, not what
- *  it writes about. `stylePrefs` is the raw users/{uid}/stylePreferences/
- *  current doc (may be null/absent — most users have never given this kind
- *  of feedback, and that must render as "no block", not an error).
- *
- *  `notes` is free text the USER wrote, stored client-side, now entering a
- *  prompt server-side — a real injection surface. Each note is capped to 120
- *  chars and dropped entirely if it trips the same banned-term/crisis gates
- *  any other user-facing text does, rather than rendered verbatim. */
-function styleRulesBlock(stylePrefs) {
-  if (!stylePrefs) return "";
-  const lines = [];
-
-  const sharpness = num(stylePrefs.sharpness, 0);
-  if (sharpness < 0) {
-    lines.push(sharpness <= -2
-      ? "This person has said more than once that recent lines felt too intense. Go noticeably softer than usual — hedge more, avoid anything that could land as confrontational."
-      : "This person recently said a line felt too intense. Go a little softer than usual.");
-  }
-
-  const rawNotes = Array.isArray(stylePrefs.notes) ? stylePrefs.notes : [];
-  const safeNotes = rawNotes
-    .map((n) => String(n || "").slice(0, 120).trim())
-    .filter((n) => n && !containsCrisisSignal(n) && !tripsBannedLint(n) && !tripsLabelLint(n))
-    .slice(0, 5);
-  safeNotes.forEach((n) => lines.push(`- "${n}"`));
-
-  if (lines.length === 0) return "";
-  return `\nSTYLE PREFERENCES (from this person's own feedback — follow this):\n${lines.join("\n")}\n`;
-}
-
-function buildMirrorLinePrompt(hypothesis, receipts, shape, maturity, now, stylePrefs) {
-  const receiptsRendered = receipts.map((r, idx) => {
-    const d = r.entryCreatedAt && r.entryCreatedAt.toDate ? r.entryCreatedAt.toDate() : now;
-    const daysAgo = Math.max(0, Math.round((now.getTime() - d.getTime()) / 86400000));
-    const label = daysAgo === 0 ? "today" : daysAgo === 1 ? "yesterday" : `${daysAgo} days ago`;
-    return `${idx + 1}. "${r.quote}" (${label})`;
-  }).join("\n");
-
-  const firstSeen = hypothesis.firstSeenAt && hypothesis.firstSeenAt.toDate
-    ? hypothesis.firstSeenAt.toDate() : now;
-  const daysSinceFirst = Math.max(0, Math.round((now.getTime() - firstSeen.getTime()) / 86400000));
-
-  const exceptionNote = shape === "softened" && hypothesis.counterEvidence && hypothesis.counterEvidence[0]
-    ? `\nWHAT WAS DIFFERENT (the exception, in their words): "${hypothesis.counterEvidence[0]}"`
-    : "";
-
-  return `${SAFETY_RULES}
-
-VOICE: A sharp, warm friend who noticed something specific — not a therapist,
-not a self-help book. Plain English, 8th-grade reading level, no metaphor, no
-"journey" or "holding space". Standard sentence case.
-${styleRulesBlock(stylePrefs)}
-${mirrorDepthInstruction(maturity)}
-
-THE HYPOTHESIS (already mined and verified — do not soften, expand, or add to
-it; your only job is to write ONE line that surfaces it):
-${hypothesis.coreHypothesis}
-Seen ${num(hypothesis.timesSeen, 1)}× since ${daysSinceFirst} days ago.
-
-THE RECEIPT(S) YOU MUST USE (quote them, or reuse their exact nouns — do not
-paraphrase into abstractions):
-${receiptsRendered || "(no receipts available)"}${exceptionNote}
-
-${MIRROR_SHAPE_INSTRUCTIONS[shape] || MIRROR_SHAPE_INSTRUCTIONS.notice}
-
-MOVE — declare exactly one, whichever the receipt actually supports:
-- TENSION: name the pull between what they want and what they're doing.
-- UNDERNEATH: say what the entry keeps reaching for beneath the surface words.
-- ABSENCE: notice what's conspicuously missing.
-- REFRAME: re-describe it precisely — not positively, precisely.
-- PATTERN: connect it to something that recurs. Only with evidence above.
-
-RULES:
-- "line": at most 140 characters. One sentence. One idea. At most one of:
-  may / might / seems.
-- Must contain a phrase from the receipt verbatim, or reuse its exact nouns.
-- RE-READ TEST: if "line" could be written just by re-reading the receipt, it
-  is a summary, not an insight — return "" instead.
-- HOROSCOPE TEST: swapping this person for a stranger must break the
-  sentence. If it wouldn't, return "" instead.
-- 8th-grade vocabulary. No metaphor. Never "journey", "space", "navigate",
-  "honour", "show up".
-- State, not trait: "this week", "on the days you wrote X" — never "you are
-  someone who".
-- "question": only when SHAPE is Ask — one open question, <= 20 words, that
-  the person already knows the answer to. Otherwise null.
-- "possibleRead": one gentler alternative interpretation, <= 20 words, or
-  null if nothing fits.
-
-EXAMPLE (the difference between a summary, a horoscope, and a line):
-HYPOTHESIS: When plans are cancelled on her, she immediately fills the slot
-with work and describes the evening as "productive".
-RECEIPT: "Maya bailed so I just cleared my inbox, honestly a productive
-night" — 2 days ago
-
-BAD (summary):    "When plans get cancelled you tend to fill the time with
-                   work and call it productive." — re-read test fails.
-BAD (horoscope):  "You may be using busyness to avoid sitting with
-                   disappointment." — no phrase, could be anyone.
-GOOD:             "'Honestly a productive night' is the third time a
-                   cancelled plan has ended in your inbox." — verbatim
-                   phrase, specific, one idea.
-
-Return ONLY valid JSON:
-{
-  "line": "...",
-  "move": "TENSION" | "UNDERNEATH" | "ABSENCE" | "REFRAME" | "PATTERN",
-  "question": null,
-  "possibleRead": null,
-  "confidence": 0.0
-}`;
-}
-
-/** Port of AIService+Mirror.buildMirrorGuardPrompt, shrunk to mirror-guard-v2
- *  (safety + scope-language + grounding ONLY) now that lintMirrorLine covers
- *  length, hedging, trait phrasing, receipt anchoring, and paraphrase
- *  deterministically and for free. What's left is the one thing a regex
- *  genuinely can't verify: does the receipt actually support what the line
- *  claims, plus the safety checks SAFETY_RULES itself doesn't phrase as
- *  reviewer instructions (shame, a therapy-replacement claim, a third-party
- *  verdict on someone the user mentioned). */
-function buildMirrorGuardPrompt(line, receiptQuote) {
-  return `SAFETY + GROUNDING REVIEW — you are the final gate before a Mirror
-line is shown to a user. Read the line below and decide: approve, rewrite,
-or suppress.
-
-${SAFETY_RULES}
-
-SUPPRESS if the line breaks any rule above, OR:
-- Amplifies shame or self-criticism
-- Claims to replace or supplement therapy
-- Characterises a third party the user mentioned ("your sister is toxic")
-- Asserts a fixed trait rather than a state ("you are someone who...")
-- GROUNDING CHECK: the line claims something the receipt below doesn't actually support
-
-REWRITE if the line is mostly safe but crosses one of the above in a way a
-smaller change fixes. Rewrite the line only — make it MORE specific, not less.
-
-APPROVE if none of the above apply and the receipt plausibly supports the line.
-
-Line to review: ${line}
-Receipt it should be grounded in: "${receiptQuote || ""}"
-
-Return ONLY valid JSON:
-{
-  "decision": "approve" | "rewrite" | "suppress",
-  "safer_line": "rewritten line (only when decision is rewrite)",
-  "reason": "one sentence explaining why"
-}`;
-}
-
-/** Builds and safety-guards one Mirror LINE for `hypothesis`. Returns the
- *  Firestore-ready doc, or null to suppress — mirrors the client's fail-closed
- *  contract: a timeout, a parse failure, or a guard "suppress" all produce
- *  null, never a half-written card. Stage 1 (select) runs here before any
- *  model call; Stage 2 (write) is the one LLM call; Stage 3 (lint) and the
- *  guard run after. */
-async function writeMirrorCardFor(uid, hypothesis, recentAnalyses, maturity, now, stylePrefs) {
-  const shape = mirrorShapeFor(hypothesis);
-  const receipts = selectReceiptsForShape(hypothesis, shape);
-  const primaryReceipt = receipts[receipts.length - 1] || null; // newest
-
-  let gen;
-  try {
-    gen = await callGeminiJSON(
-      buildMirrorLinePrompt(hypothesis, receipts, shape, maturity, now, stylePrefs),
-      { maxTokens: 260, temperature: 0.4 },
-      uid, "mirror_card");
-  } catch (e) {
-    return null;
-  }
-  if (!gen) return null;
-
-  const line = sentenceCased(String(gen.line || ""));
-  if (!line) return null;
-
-  const VALID_MOVES = ["TENSION", "UNDERNEATH", "ABSENCE", "REFRAME", "PATTERN"];
-  const move = VALID_MOVES.includes(gen.move) ? gen.move : null;
-  const question = shape === "ask" && gen.question ? sentenceCased(String(gen.question)) : null;
-  const possibleRead = gen.possibleRead ? sentenceCased(String(gen.possibleRead)) : null;
-  const receiptsForDoc = receipts.map((r) => ({ quote: String(r.quote), whyItMatters: "" }));
-
-  const draft = {
-    id: hypothesis.id,
-    userId: uid,
-    localDate: Timestamp.fromDate(now),
-    // Legacy DailyRead-family fields — MirrorCard.init?(from:) still requires
-    // readText/replyPrompt/tone, and a pre-Phase-3 client build renders
-    // headline/mirrorSentence, not `line`. Kept for one release so that
-    // build still shows something coherent while its next mine catches up.
-    readText: line,
-    receiptChips: [],
-    replyPrompt: question || line,
-    shareSafeText: line,
-    notificationCopy: "",
-    tone: "direct",
-    sharpnessLevel: "direct",
-    safetyLevel: "none",
-    confidence: clamp01(num(gen.confidence, 0.5)),
-    shouldShow: true,
-    sourceEntryIds: [],
-    sourcePatternIds: [hypothesis.id],
-    sourceRiverMarkIds: [],
-    modelProvider: "google",
-    modelName: MODEL,
-    promptVersion: MIRROR_WRITE_PROMPT_VERSION,
-    createdAt: Timestamp.fromDate(now),
-    headline: hypothesis.userFacingTitle,
-    mirrorSentence: line,
-    whyThisCameUp: "",
-    patternName: hypothesis.userFacingTitle,
-    receipts: receiptsForDoc,
-    possibleRead,
-    tinyExperiment: hypothesis.tinyExperiment || null,
-    tomorrowCallbackQuestion: question,
-    shareSafeSummary: line,
-    components: null,
-    temporalAnchor: null,
-    // L0/L1 fields (Phase 3) — see DailyJournal/Mirror/MirrorCard.swift.
-    line,
-    move,
-    shape,
-    question,
-  };
-
-  // Deterministic pre-guard — same short-circuit as the client's
-  // SpilrVoice.tripsLint check before Prompt E: a trip means the vocabulary
-  // is already known-bad, so suppress without paying for the guard call.
-  const lintText = [line, possibleRead].filter(Boolean).join("\n");
-  if (tripsBannedLint(lintText) || tripsLabelLint(lintText)) {
-    console.log("mirrorLintReject", {
-      uid, hypothesisId: hypothesis.id, reason: "banned_term_or_label",
-      promptVersion: MIRROR_WRITE_PROMPT_VERSION,
-    });
-    return null;
-  }
-
-  // Line-quality lint (§3.7 Stage 3) — length, hedge count, trait phrasing,
-  // receipt anchoring, paraphrase-vs-source.
-  const primaryEvidence = (hypothesis.evidence || [])[0];
-  const sourceAnalysis = primaryEvidence
-    ? recentAnalyses.find((a) => a.entryId === primaryEvidence.entryId)
-    : null;
-  const lint = lintMirrorLine(line, {
-    receiptQuote: primaryReceipt ? primaryReceipt.quote : (primaryEvidence ? primaryEvidence.quote : null),
-    sourceSummary: sourceAnalysis ? sourceAnalysis.surfaceSummary : null,
-  });
-  if (!lint.ok) {
-    console.log("mirrorLintReject", {
-      uid, hypothesisId: hypothesis.id, reason: lint.reason,
-      promptVersion: MIRROR_WRITE_PROMPT_VERSION,
-    });
-    return null;
-  }
-  draft.lintPassed = true;
-
-  let guardGen;
-  try {
-    guardGen = await callGeminiJSON(
-      buildMirrorGuardPrompt(line, primaryReceipt ? primaryReceipt.quote : null),
-      { maxTokens: 200, temperature: 0.0 },
-      uid, "mirror_guard");
-  } catch (e) {
-    console.log("mirrorGuardDecision", { uid, hypothesisId: hypothesis.id, decision: "error", reason: String(e) });
-    return null; // fail closed — same as the client's guard-timeout behaviour.
-  }
-  if (!guardGen || typeof guardGen.decision !== "string") {
-    console.log("mirrorGuardDecision", { uid, hypothesisId: hypothesis.id, decision: "invalid", reason: null });
-    return null;
-  }
-
-  // Previously the guard's `reason` was parsed and then discarded — every
-  // suppression was silent. This is the prompt-quality dashboard §3.11 asks for.
-  console.log("mirrorGuardDecision", {
-    uid, hypothesisId: hypothesis.id, decision: guardGen.decision, reason: guardGen.reason || null,
-  });
-
-  if (guardGen.decision === "approve") return draft;
-  // "rewrite" used to return `safer_line` straight from the guard call with no
-  // re-lint — a decision made by the SAME call that is supposed to be
-  // catching problems could reintroduce a banned term or trip
-  // lintMirrorLine and ship anyway. Treat it the same as "suppress": the
-  // hypothesis is skipped this run rather than shown with unverified text
-  // (mirror-v3-prd-2026-09-10.md §6 — "not softened and retried").
-  return null; // "rewrite", "suppress", or anything unrecognised.
-}
-
-/**
- * Generates the daily Mirror deck: cards for the top MIRROR_DECK_SIZE
- * surfaceable hypotheses, written to users/{uid}/mirrorCards/{hypothesisId}.
- *
- * Called from mineUserInsights after a successful mine, and from
- * bootstrapMirror for a brand-new user's very first mine. Independent of
- * both — it re-reads hypotheses fresh rather than taking them as a
- * parameter, so it produces the same result regardless of caller.
- *
- * One failed card must never sink the others: each hypothesis's generation
- * is wrapped individually, and a failure is logged and skipped, matching the
- * fail-closed-per-card contract the client used to enforce alone.
- */
-// How far back generateMirrorDeck looks for "already shown" evidence when
-// applying the novelty gate below. Matches DailyJournal/Mirror's client-side
-// mirrorShown history — see MirrorGraphService.markShown.
-const MIRROR_SHOWN_LOOKBACK_DAYS = 7;
-const MIRROR_RECENT_EVIDENCE_HOURS = 48;
-
-/** True if EVERY evidence entry a candidate cites was also cited by a card
- *  already shown in the last MIRROR_SHOWN_LOOKBACK_DAYS days — i.e. this
- *  would be the same receipt with new wording, not new evidence. A candidate
- *  with no evidence at all is never rejected on this rule (nothing to
- *  compare, so nothing to call a repeat). */
-function isEvidenceRepeat(h, recentEvidenceUnion) {
-  const ids = (h.evidence || []).map((e) => e.entryId).filter(Boolean);
-  if (ids.length === 0) return false;
-  return ids.every((id) => recentEvidenceUnion.has(id));
-}
-
-/** True if any evidence entry is within the last 48h — "why this came up
- *  today" is then true by construction (§3.8). */
-function hasRecentEvidence(h, now) {
-  return (h.evidence || []).some((e) => {
-    const d = e.entryCreatedAt && e.entryCreatedAt.toDate ? e.entryCreatedAt.toDate() : null;
-    return d && (now.getTime() - d.getTime()) <= MIRROR_RECENT_EVIDENCE_HOURS * 3600000;
-  });
-}
-
-async function generateMirrorDeck(db, uid, now) {
-  const totalEntries = await totalEntryCountFor(db, uid);
-  // canShowDailyMirror == maturity >= .first, i.e. totalEntries >= 1. Below
-  // that there is nothing yet to ground a card in.
-  if (mirrorMaturityFor(totalEntries) === "seed") return { written: 0, reason: "no_entries" };
-  const maturity = mirrorMaturityFor(totalEntries);
-
-  const hypCol = db.collection("users").doc(uid).collection("patternHypotheses");
-  const hypSnap = await hypCol.orderBy("salienceScore", "desc")
-    .limit(MIRROR_HYPOTHESES_LIMIT).get();
-  const surfaceable = hypSnap.docs.map((d) => d.data())
-    .filter((h) => h && h.status === "pending" && h.stability !== "retired");
-  if (surfaceable.length === 0) return { written: 0, reason: "no_hypotheses" };
-
-  // StylePreferences (§3.9) — read once. `mutedTypes` drops a patternType the
-  // user has told us twice not to show, for 14 days; `stylePrefs` itself is
-  // threaded into the writer for the sharpness instruction.
-  const stylePrefsSnap = await db.collection("users").doc(uid)
-    .collection("stylePreferences").doc("current").get();
-  const stylePrefs = stylePrefsSnap.exists ? stylePrefsSnap.data() : null;
-  const mutedTypes = new Set(
-    Object.entries((stylePrefs && stylePrefs.mutedTypes) || {})
-      .filter(([, until]) => until && until.toDate && until.toDate().getTime() > now.getTime())
-      .map(([type]) => type)
-  );
-  const eligible = mutedTypes.size ? surfaceable.filter((h) => !mutedTypes.has(h.patternType)) : surfaceable;
-  if (eligible.length === 0) return { written: 0, reason: "no_hypotheses" };
-
-  let ranked = eligible
-    .map((h) => ({ h, score: mirrorScore(h, now) }))
-    .filter((x) => x.score > 0.5);
-  if (ranked.length === 0) return { written: 0, reason: "below_threshold" };
-
-  // Novelty gate (§3.8) — a filter applied AFTER scoring, never a score
-  // term, so mirrorScore stays byte-identical to MirrorScore.swift. Reads
-  // the last MIRROR_SHOWN_LOOKBACK_DAYS days of `mirrorShown` — the
-  // client-written record of what was actually DISPLAYED (this function
-  // writes up to MIRROR_DECK_SIZE cards; at most one of them is ever shown).
-  const lookback = new Date(now.getTime() - MIRROR_SHOWN_LOOKBACK_DAYS * 86400000);
-  const shownSnap = await db.collection("users").doc(uid)
-    .collection("mirrorShown")
-    .where("shownAt", ">=", Timestamp.fromDate(lookback))
-    .get();
-  const recentEvidenceUnion = new Set();
-  shownSnap.docs.forEach((d) => {
-    (d.data().evidenceEntryIds || []).forEach((id) => recentEvidenceUnion.add(id));
-  });
-
-  const beforeGate = ranked.length;
-  ranked = ranked.filter((x) => {
-    const repeat = isEvidenceRepeat(x.h, recentEvidenceUnion);
-    if (repeat) {
-      console.log("mirrorNoveltyReject", { uid, hypothesisId: x.h.id, reason: "evidence_repeat" });
-    }
-    return !repeat;
-  });
-  if (ranked.length === 0) {
-    return { written: 0, reason: beforeGate === 0 ? "below_threshold" : "novelty_gate" };
-  }
-
-  // Reorder survivors — prefer an exception (the highest-learning, least
-  // accusatory signal available) and evidence from the last 48h — WITHOUT
-  // touching the score itself. A stable secondary sort, not a score term.
-  ranked = ranked
-    .map((x) => ({
-      ...x,
-      bias: (x.h.patternType === "exception" ? 2 : 0) + (hasRecentEvidence(x.h, now) ? 1 : 0),
-    }))
-    .sort((a, b) => (b.bias - a.bias) || (b.score - a.score))
-    .slice(0, MIRROR_DECK_SIZE);
-
-  const analysesSnap = await db.collection("users").doc(uid)
-    .collection("entryAnalyses")
-    .orderBy("createdAt", "desc").limit(MIRROR_CARD_ANALYSES_LIMIT).get();
-  const recentAnalyses = analysesSnap.docs.map((d) => d.data());
-
-  const cardCol = db.collection("users").doc(uid).collection("mirrorCards");
-  let written = 0;
-  for (let i = 0; i < ranked.length; i++) {
-    const { h } = ranked[i];
-    try {
-      const card = await writeMirrorCardFor(uid, h, recentAnalyses, maturity, now, stylePrefs);
-      if (card) {
-        card.deckRank = i;
-        // merge:true — the client patches `userFeedback` onto this same doc
-        // (MirrorView.onMirrorFeedback), and a full overwrite on the next
-        // mine would silently erase it.
-        await cardCol.doc(h.id).set(card, { merge: true });
-        written++;
-      }
-    } catch (e) {
-      console.error("generateMirrorDeck: card failed", { uid, hypothesisId: h.id, error: String(e) });
-    }
-  }
-  console.log("mirrorDeck", { uid, ranked: ranked.length, written, beforeGate });
-  return { written };
-}
 
 /* ──────────────────────────────────────────────────────────────────────────
  *  WEEKLY MIRROR LETTER (§3.10) — the density the daily line gives up now
@@ -3035,12 +2577,12 @@ const DOT_STRIP_DAYS = 30;
 const FIRST_SEVEN_AT = 7;
 const UNLOCK_NUDGE_DAYS = 14;       // rate limit on the "here's what's next" push
 
-// Keep writing the legacy per-hypothesis `mirrorCards` deck for ONE release,
-// so a client that predates `readings/{date}` still has something to render.
-// Flipping this to false is where §8's promised cost reduction actually lands:
-// MIRROR_DECK_SIZE write calls + the same number of guard calls collapse to
-// one reading call.
-const MIRROR_LEGACY_DECK = true;
+// The legacy per-hypothesis `mirrorCards` deck (generateMirrorDeck +
+// writeMirrorCardFor and their prompt builders) has been removed entirely: no
+// shipping client renders it, and the client-side pipeline that fetched it
+// (loadOrGenerateMirrorCard / fetchMirrorCard / TodayMirrorCardView) is gone.
+// Mirror now surfaces through the self-model, the daily reading and the weekly
+// letter — this is also where §8's promised per-mine cost reduction lands.
 
 /** Render `lifeContext/current` into a prompt block. The client has its own
  *  copy of this for the surfaces it still builds prompts for
@@ -3312,7 +2854,9 @@ async function decayHypothesesFor(db, uid, now) {
 /* ── ThreadsJob (Tier 3) ─────────────────────────────────────────────────── */
 
 /**
- * Rebuild `users/{uid}/derived/threads` — at most three.
+ * Compute this user's threads — at most three. Returns them in-process for
+ * `buildFirstSevenFor`; the result is no longer persisted (see the note where
+ * the old `derived/threads` write used to be).
  *
  * A thread is a hypothesis that RECURRED (>= 3 distinct entries), has a
  * contrast set, and survived the counter-evidence audit — or that the user
@@ -3410,17 +2954,12 @@ async function buildThreadsFor(db, uid, now, facts, observations) {
     };
   });
 
-  const doc = {
-    schemaVersion: 1,
-    userId: uid,
-    computedAt: Timestamp.fromDate(now),
-    count: threads.length,
-    threads,
-    emptyReason: threads.length === 0
-      ? (hyps.length === 0 ? "no_hypotheses" : "needs_three_days")
-      : null,
-  };
-  await db.collection("users").doc(uid).collection("derived").doc("threads").set(doc);
+  // The `derived/threads` document used to be persisted here, but nothing ever
+  // read it back — not the client (DerivedService decodes only
+  // facts/firstSeven/personModel) and not the server (which re-derives threads
+  // in-process each run). The only consumer is the return value below, which
+  // `buildFirstSevenFor` uses to build the 7-entry First Sketch card. So the
+  // persisted doc was pure dead output; the transient value stays.
   console.log("threadsJob", {
     uid, threads: threads.length, eligible: eligible.length, candidates: hyps.length,
   });
@@ -3451,7 +2990,7 @@ function threadTitleFor(h) {
  * 15-35%: a surface that always has something to say is a surface that is
  * making things up.
  */
-async function selectTodayFor(db, uid, now, facts, observations, tz, opts = {}) {
+async function selectTodayFor(db, uid, now, facts, observations, tz) {
   const userRef = db.collection("users").doc(uid);
   const todayKey = localDateParts(now, tz).dateKey;
   const isNewToday = (o) => {
@@ -3515,22 +3054,11 @@ async function selectTodayFor(db, uid, now, facts, observations, tz, opts = {}) 
     return doc;
   }
 
-  // Tier 2 — the one model call. Skipped entirely when the caller has no key
-  // (the deterministic worker), which is what makes step 4 the normal path on
-  // that worker and step 3 the normal path on the mining worker.
-  let line = null;
-  let move = null;
-  let question = null;
-  let lintReason = null;
-  if (opts.allowModel) {
-    const written = await writeReadingFor(uid, chosen, now, opts.lifeContext, opts.stylePrefs);
-    if (written && written.ok) {
-      line = written.line; move = written.move; question = written.question;
-      step = 3;
-    } else if (written) {
-      lintReason = written.reason;
-    }
-  }
+  // The one model "reading" call (writeReadingFor) was removed — it was paid
+  // for here and then overwritten by the Person Model's
+  // `selectAndWriteMirrorLineForUser` (Prompt M) whenever that passed lint, and
+  // covered by this deterministic observation line when it did not. The daily
+  // doc now always uses the observation's own sentence; Prompt M extends it.
 
   const quotes = (chosen.quotes || []).filter((q) => q && q.text);
   const receipt = quotes.length ? {
@@ -3550,11 +3078,11 @@ async function selectTodayFor(db, uid, now, facts, observations, tz, opts = {}) 
     // wrong, and §6's rule is that a failed line is not retried, it is replaced
     // by the observation.
     templateText: chosen.templateText,
-    line: line || chosen.templateText,
-    move: move || null,
-    question: question || null,
-    lintPassed: !!line,
-    lintReason,
+    line: chosen.templateText,
+    move: null,
+    question: null,
+    lintPassed: false,
+    lintReason: null,
     receipt,
     proof: {
       n: chosen.n, m: chosen.m, k: chosen.k, j: chosen.j,
@@ -3581,111 +3109,9 @@ async function selectTodayFor(db, uid, now, facts, observations, tz, opts = {}) 
   await userRef.collection("readings").doc(todayKey).set(doc, { merge: true });
   console.log("readingSelect", {
     uid, step, observationId: chosen.id, type: chosen.type,
-    score: chosen.score, lintPassed: !!line, lintReason,
+    score: chosen.score, lintPassed: false,
   });
   return doc;
-}
-
-const READING_PROMPT_VERSION = "mirror-reading-v1";
-
-/**
- * Tier 2 — the ONE model call. One sentence, on top of one observation.
- *
- * The model receives the observation's numbers and quotes, the user's
- * LifeContext and StylePreferences — and nothing else. Not the raw entries,
- * not the hypothesis list. It cannot invent a fact because it is not given the
- * material to invent one from; its whole job is phrasing something already
- * true.
- */
-async function writeReadingFor(uid, observation, now, lifeContext, stylePrefs) {
-  const quotes = (observation.quotes || []).filter((q) => q && q.text).slice(0, 3);
-  const quotesRendered = quotes.map((q, i) =>
-    `${i + 1}. "${q.text}" (${q.date ? shortDate(q.date) : "recently"})`).join("\n");
-
-  const prompt = `${SAFETY_RULES}
-${SPILR_VOICE}
-${styleRulesBlock(stylePrefs)}${lifeContext || ""}
-
-TASK: Write ONE sentence on top of the observation below.
-
-The observation is already TRUE — it was computed from this person's own
-entries by counting, not by guessing. You are not being asked whether it is
-right, or to find a different one. You are being asked to say it in a way that
-sounds like a person noticed it.
-
-THE OBSERVATION
-${observation.templateText}
-
-THE NUMBERS BEHIND IT (do not contradict these, do not invent others)
-n=${observation.n} m=${observation.m} k=${observation.k} j=${observation.j}
-
-THEIR OWN WORDS (quote one of these verbatim if you can)
-${quotesRendered || "(none available)"}
-
-HARD RULES
-- ONE sentence. At most 140 characters.
-- It must contain either a number from above or a verbatim phrase from their
-  own words. A sentence that could be about anyone is a failure.
-- Observational voice: "on the days you wrote...", never "you are someone
-  who", never "you always", never "you tend to".
-- At most one hedge word (may / might / seems / perhaps).
-- Plain words. 8th-grade reading level. NO metaphor — no armor, no terror, no
-  ledger, no landscape, no journey, no nervous system.
-- Do not end on the bad half. Finish on the comparison, the exception, or a
-  question.
-
-Return ONLY valid JSON:
-{
-  "line": "the one sentence",
-  "move": "TENSION" | "UNDERNEATH" | "ABSENCE" | "REFRAME" | "PATTERN",
-  "question": "one short question, or null"
-}`;
-
-  let gen;
-  try {
-    gen = await callGeminiJSON(prompt, { maxTokens: 200, temperature: 0.4 },
-      uid, "mirror_reading");
-  } catch (e) {
-    console.log("mirrorLintReject", {
-      uid, surface: "reading", rule: "generation_failed",
-      observationType: observation.type, promptVersion: READING_PROMPT_VERSION,
-    });
-    return { ok: false, reason: "generation_failed" };
-  }
-  if (!gen || !gen.line) return { ok: false, reason: "empty" };
-
-  // deShout BEFORE sentenceCased: sentenceCased only ever raises case, so an
-  // ALL-CAPS line survives it untouched.
-  const line = sentenceCased(deShout(String(gen.line).trim()));
-  const lint = lintCopy(line, {
-    kind: "reading",
-    observation,
-    // "Never end on the negative" ships log-only for one week — it is the
-    // fuzziest rule in §6 and will produce false rejects. Flip this to true
-    // once the reject histogram says the rate is acceptable.
-    enforceEndsNegative: false,
-  });
-  if (!lint.ok) {
-    console.log("mirrorLintReject", {
-      uid, surface: "reading", rule: lint.reason, term: lint.term || null,
-      observationType: observation.type, promptVersion: READING_PROMPT_VERSION,
-    });
-    return { ok: false, reason: lint.reason };
-  }
-  if (lint.endsNegative) {
-    console.log("mirrorLintObserve", {
-      uid, surface: "reading", rule: "ends_negative", enforced: false,
-      observationType: observation.type,
-    });
-  }
-
-  const question = gen.question ? sentenceCased(String(gen.question).trim()) : null;
-  return {
-    ok: true,
-    line,
-    move: typeof gen.move === "string" ? gen.move.toUpperCase() : null,
-    question: question && question.endsWith("?") ? question : null,
-  };
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -3700,7 +3126,6 @@ Return ONLY valid JSON:
  * ══════════════════════════════════════════════════════════════════════════ */
 
 const FORMULATE_PROMPT_VERSION = "mirror-formulate-v1";
-const QUESTION_PROMPT_VERSION = "mirror-question-v1";
 const MIRROR_LINE_V31_PROMPT_VERSION = "mirror-line-v2";
 const ASK_V31_PROMPT_VERSION = "mirror-ask-v1";
 
@@ -3708,7 +3133,6 @@ const FORMULATE_MIN_NEW_ANALYSES = 3;   // same cadence shape as MIN_NEW_ANALYSE
 const FORMULATE_MAX_STALENESS_HOURS = 72;
 const FORMULATE_ANALYSIS_LOOKBACK = 20; // most-recent N analyses handed to Prompt F
 const PERSON_MODEL_ITEM_LIMIT = 60;     // bounded read, same reasoning as patternHypotheses reads
-const ASKED_HYPOTHESES_KEEP = 20;
 const ASK_DAILY_CAP = 20;               // mirrorAsk's cost ceiling — see claimAskCall
 
 /** Prompt F's SIGNALS block — the most recent entries, with verbatim quotes
@@ -4175,78 +3599,7 @@ async function selectAndWriteMirrorLineForUser(db, uid, now, tz, facts, observat
 }
 
 /**
- * Prompt Q — picks tomorrow's question from openHypotheses, skipping
- * anything asked in the last 7 days. Feeds Mirror Seeds (not yet wired into
- * the journaling-prompt surface — see the build plan) and the Mirror tab's
- * "What it doesn't know yet" row.
- */
-async function writeNextQuestionForUser(db, uid, now) {
-  const userRef = db.collection("users").doc(uid);
-  const aggSnap = await userRef.collection("derived").doc("personModel").get();
-  if (!aggSnap.exists) return { written: false, reason: "no_model" };
-  const agg = aggSnap.data();
-  const openHypotheses = agg.openHypotheses || [];
-  if (!openHypotheses.length) return { written: false, reason: "no_open_hypotheses" };
-
-  const askedRecently = (agg.askedHypotheses || []).filter((a) => {
-    const at = toDate(a.askedAt);
-    return at && (now.getTime() - at.getTime()) / 86400000 < 7;
-  });
-  const askedIds = new Set(askedRecently.map((a) => a.hypothesisId));
-  const candidates = openHypotheses.filter((h) => !askedIds.has(h.id));
-  if (!candidates.length) return { written: false, reason: "all_asked_recently" };
-
-  const openBlock = JSON.stringify(candidates.slice(0, 8).map((h) => ({
-    hypothesisId: h.id, hypothesis: h.hypothesis,
-    would_confirm: h.wouldConfirm, would_reject: h.wouldReject, value: h.value,
-  })), null, 2);
-  const askedBlock = askedRecently.map((a) => `- ${a.hypothesisId}`).join("\n");
-
-  const prompt = buildNextQuestionPrompt({
-    safetyRules: SAFETY_RULES, openHypothesesBlock: openBlock, askedRecentlyBlock: askedBlock,
-  });
-
-  let output;
-  try {
-    output = await callGeminiJSON(prompt, { maxTokens: 220, temperature: 0.5 }, uid, "mirror_question");
-  } catch (e) {
-    return { written: false, reason: "generation_failed" };
-  }
-  if (!output || !output.question) return { written: false, reason: "empty" };
-
-  const question = sentenceCased(String(output.question).trim());
-  const lint = lintCopy(question, { kind: "mirrorQuestion" });
-  if (!lint.ok) {
-    console.log("mirrorLintReject", { uid, surface: "mirror_question", rule: null, reason: lint.reason });
-    return { written: false, reason: lint.reason };
-  }
-  // Never a hallucinated id — fall back to the top candidate we actually offered.
-  const hypothesisId = candidates.some((h) => h.id === output.hypothesisId)
-    ? output.hypothesisId : candidates[0].id;
-
-  const nextAsked = [
-    ...(agg.askedHypotheses || []),
-    { hypothesisId, askedAt: Timestamp.fromDate(now) },
-  ].slice(-ASKED_HYPOTHESES_KEEP);
-
-  await userRef.collection("derived").doc("personModel").set({
-    nextQuestion: {
-      question, hypothesisId,
-      scoring: output.scoring || null,
-      seedLabel: output.seed_label || null,
-      createdAt: Timestamp.fromDate(now),
-    },
-    askedHypotheses: nextAsked,
-    questionPromptVersion: QUESTION_PROMPT_VERSION,
-  }, { merge: true });
-
-  console.log("mirrorQuestion", { uid, hypothesisId, question });
-  return { written: true, question, hypothesisId };
-}
-
-/**
- * The whole v3.1 pass for one user: formulate (F), write today's line (M),
- * pick tomorrow's question (Q).
+ * The whole v3.1 pass for one user: formulate (F), write today's line (M).
  *
  * DELIBERATELY INDEPENDENT of the v2 miner's cadence gate. The first version
  * of this nested the three calls inside `mineUserInsights`'s
@@ -4306,20 +3659,18 @@ async function runPersonModelForUser(db, uid, now) {
   const formulated = await formulatePersonModelForUser(
     db, uid, now, facts, analyses, lifeContextStr, stylePrefsObj, corrections.exclusions);
 
-  // M and Q run whether or not F did. F is "nightly, when >= 3 new analyses";
+  // M runs whether or not F did. F is "nightly, when >= 3 new analyses";
   // M is "daily, one" — gating the line on the formulation having run is what
   // would make today's Mirror go stale on every quiet day.
   const line = await selectAndWriteMirrorLineForUser(
     db, uid, now, tz, facts, observations, analyses, lifeContextStr, stylePrefsObj);
-  const question = await writeNextQuestionForUser(db, uid, now);
 
   console.log("personModelPass", {
     uid,
     formulate: formulated.skipped ? `skipped:${formulated.reason}` : `written:${formulated.written}`,
     line: line.written ? `written:${line.shape}` : `skipped:${line.reason}`,
-    question: question.written ? "written" : `skipped:${question.reason}`,
   });
-  return { formulated, line, question };
+  return { formulated, line };
 }
 
 /** mirrorAsk's cost ceiling: a plain daily cap, not the full token-budget
@@ -4328,7 +3679,11 @@ async function runPersonModelForUser(db, uid, now) {
  *  wiring a new surface into the client-relay budget system that only
  *  geminiProxy uses. */
 async function claimAskCall(db, uid, now) {
-  const ref = db.collection("users").doc(uid);
+  // Counters live on aiUsage/{uid} (Admin-SDK-only, deny-all in firestore.rules),
+  // NOT on users/{uid}: that doc is client-writable, so a user could reset
+  // askCallCount to 0 and bypass the daily cap entirely — making the cap a
+  // client-side suggestion. aiUsage is the real enforcement boundary.
+  const ref = db.collection("aiUsage").doc(uid);
   const today = utcDayKey(now);
   return db.runTransaction(async (tx) => {
     const snap = await tx.get(ref);
@@ -4421,9 +3776,27 @@ exports.mirrorAsk = onRequest(
 
       const prompt = buildAskPrompt({ safetyRules: SAFETY_RULES, question, modelBlock });
       const output = await callGeminiJSON(prompt, { maxTokens: 400, temperature: 0.2 }, uid, "mirror_ask_v31");
+
+      // Ground the receipts before showing them. The analytical ANSWER is the
+      // product here and passes through untouched — but each citation is
+      // rendered under a "FROM YOUR ENTRIES" header, i.e. attributed to the
+      // user's own words, so an invented one puts words in their mouth. The Ask
+      // prompt is handed only each item's text (buildCurrentModelBlockForFormulation
+      // → displayTitleFor), so a citation is trustworthy only when it (a) names a
+      // real, non-retired item that was actually in the prompt and (b) quotes
+      // text that verbatim-overlaps that item. Anything else is dropped; if none
+      // survive we send [], and the client renders no receipts rather than fake
+      // ones. Mirrors the daily-reading grounding (hasVerbatimOverlap).
+      const itemTextById = new Map(items.map((it) => [it.id, displayTitleFor(it)]));
+      const rawCitations = Array.isArray(output && output.citations) ? output.citations : [];
+      const citations = rawCitations
+        .filter((c) => c && c.itemId && itemTextById.has(c.itemId) && c.quote &&
+          hasVerbatimOverlap(itemTextById.get(c.itemId), String(c.quote), 3))
+        .slice(0, 3);
+
       res.status(200).json({
         answer: (output && output.answer) || "",
-        citations: Array.isArray(output && output.citations) ? output.citations.slice(0, 3) : [],
+        citations,
         promptVersion: ASK_V31_PROMPT_VERSION,
       });
     } catch (e) {
@@ -4518,8 +3891,7 @@ async function runDerivedForUser(db, uid, now) {
   const observations = await computeObservationsForUser(db, uid, now, facts, analyses, tz);
   await decayHypothesesFor(db, uid, now);
   const threads = await buildThreadsFor(db, uid, now, facts, observations);
-  const reading = await selectTodayFor(db, uid, now, facts, observations, tz,
-    { allowModel: false });
+  const reading = await selectTodayFor(db, uid, now, facts, observations, tz);
   await buildFirstSevenFor(db, uid, now, facts, threads, observations);
   return { facts, observations, threads, reading, tz, analyses };
 }
@@ -4873,9 +4245,10 @@ exports.mineUserInsights = onTaskDispatched(
       }
 
       // The hypotheses just changed, so the threads view and today's pick are
-      // both stale. Recompute the deterministic layers over the new corpus and
-      // then — and only then — spend ONE model call phrasing the single
-      // observation that won. This is Tier 2: at most one reading per day.
+      // both stale. Recompute the deterministic layers over the new corpus —
+      // this writes today's reading from the single observation that won. (The
+      // old paid model "reading" call that ran here was removed; Prompt M below
+      // extends the doc when it passes lint.)
       //
       // Own try/catch throughout: none of this may make Cloud Tasks retry the
       // mine, whose hypotheses are already committed.
@@ -4883,17 +4256,7 @@ exports.mineUserInsights = onTaskDispatched(
       if (!r.skipped) {
         try {
           const derived = await runDerivedForUser(db, uid, now);
-          const [lifeCtxSnap, styleSnap] = await Promise.all([
-            db.collection("users").doc(uid).collection("lifeContext").doc("current").get(),
-            db.collection("users").doc(uid).collection("stylePreferences").doc("current").get(),
-          ]);
-          const reading = await selectTodayFor(
-            db, uid, now, derived.facts, derived.observations, derived.tz,
-            {
-              allowModel: true,
-              lifeContext: lifeCtxSnap.exists ? lifeContextBlock(lifeCtxSnap.data()) : "",
-              stylePrefs: styleSnap.exists ? styleSnap.data() : null,
-            });
+          const reading = derived.reading;
           readingStep = reading.silence ? "silence" : (reading.lintPassed ? "reading" : "observation");
         } catch (e) {
           console.error("mineUserInsights: derived/reading failed", { uid, error: String(e) });
@@ -4915,21 +4278,7 @@ exports.mineUserInsights = onTaskDispatched(
         console.error("mineUserInsights: person model failed", { uid, error: String(e) });
       }
 
-      // The legacy per-hypothesis card deck. Still written for ONE release so a
-      // pre-v3 client (which reads `mirrorCards/{hypothesisId}`, not
-      // `readings/{date}`) keeps rendering — the same one-release rule this
-      // file already applies to the legacy card fields. Delete both once the
-      // v3 build is the floor.
-      let cardsWritten = 0;
-      if (!r.skipped && MIRROR_LEGACY_DECK) {
-        try {
-          cardsWritten = (await generateMirrorDeck(db, uid, now)).written;
-        } catch (e) {
-          console.error("mineUserInsights: deck generation failed", { uid, error: String(e) });
-        }
-      }
-
-      console.log("mineUserInsights", { uid, ...r, cardsWritten, readingStep, personModelStep });
+      console.log("mineUserInsights", { uid, ...r, readingStep, personModelStep });
     } catch (e) {
       // Rethrow so Cloud Tasks retries with backoff. Swallowing here would
       // reproduce the old behaviour: a silent per-user failure nobody notices.
@@ -4973,18 +4322,25 @@ exports.mineUserInsights = onTaskDispatched(
  *      attempts is the CLIENT's 24h UserDefaults cooldown, so this only
  *      needs to survive one in-flight request, not model a longer cadence. */
 async function claimMirrorBootstrap(db, uid) {
-  const ref = db.collection("users").doc(uid);
+  // `lastMineRunAt` stays on users/{uid} — the client reads it directly to
+  // decide whether to even attempt bootstrap (MirrorView). But the CLAIM
+  // (`mirrorBootstrapClaimedAt`) moves to aiUsage/{uid} (deny-all), so a client
+  // can't clear it to fire concurrent bootstrap passes inside the in-flight
+  // window. A two-doc transaction reads the gate from users and the claim from
+  // aiUsage, then writes only the claim.
+  const userRef = db.collection("users").doc(uid);
+  const usageRef = db.collection("aiUsage").doc(uid);
   return db.runTransaction(async (tx) => {
-    const snap = await tx.get(ref);
-    if (!snap.exists) return false;
-    const data = snap.data();
-    if (data.lastMineRunAt) return false;
-    const claimedAt = data.mirrorBootstrapClaimedAt;
+    const userSnap = await tx.get(userRef);
+    if (!userSnap.exists) return false;
+    if (userSnap.data().lastMineRunAt) return false;
+    const usageSnap = await tx.get(usageRef);
+    const claimedAt = usageSnap.exists ? usageSnap.data().mirrorBootstrapClaimedAt : null;
     if (claimedAt && claimedAt.toDate &&
         (Date.now() - claimedAt.toDate().getTime()) < 5 * 60 * 1000) {
       return false;
     }
-    tx.set(ref, {
+    tx.set(usageRef, {
       mirrorBootstrapClaimedAt: FieldValue.serverTimestamp(),
     }, { merge: true });
     return true;
@@ -4997,8 +4353,8 @@ exports.bootstrapMirror = onRequest(
     secrets: [GEMINI_KEY],
     cors: true,
     // Chains one mine call (plus up to AUDIT_MAX_PER_RUN disconfirmation
-    // calls) and up to MIRROR_DECK_SIZE card generations — materially longer
-    // than geminiProxy's single round trip.
+    // calls) and the derived/person-model passes — materially longer than
+    // geminiProxy's single round trip.
     timeoutSeconds: 180,
     memory: "512MiB",
     maxInstances: 10,
@@ -5084,17 +4440,8 @@ exports.bootstrapMirror = onRequest(
         console.error("bootstrapMirror: person model failed", { uid, error: String(e) });
       }
 
-      let cardsWritten = 0;
-      if (!r.skipped && MIRROR_LEGACY_DECK) {
-        try {
-          cardsWritten = (await generateMirrorDeck(db, uid, now)).written;
-        } catch (e) {
-          console.error("bootstrapMirror: deck generation failed", { uid, error: String(e) });
-        }
-      }
-
-      console.log("bootstrapMirror", { uid, ...r, cardsWritten, derivedOk, personModelStep });
-      res.status(200).json({ ran: true, written: r.written || 0, cardsWritten });
+      console.log("bootstrapMirror", { uid, ...r, derivedOk, personModelStep });
+      res.status(200).json({ ran: true, written: r.written || 0 });
     } catch (e) {
       console.error("bootstrapMirror error", { uid, error: String(e) });
       res.status(500).json({ error: "Bootstrap failed" });
@@ -5454,14 +4801,36 @@ exports.revenueCatWebhook = onRequest(
 );
 
 /* ──────────────────────────────────────────────────────────────────────────
- *  sendTestPush — OWNERS ONLY. Sends a push to the caller's own devices and
- *  returns what FCM said for each token, so "is push working?" is one tap in
- *  Profile → Developer instead of waiting for 8am and reading logs.
+ *  sendTestPush — ANY signed-in, non-anonymous account. Sends a push to the
+ *  CALLER'S OWN devices only and returns what FCM said for each token, so "is
+ *  push working?" is one tap in Profile → Developer instead of waiting for
+ *  8am and reading logs.
  *
- *  POST, Bearer <Firebase ID token>. 403 for anyone not in OWNER_EMAILS /
- *  OWNER_UIDS (lib/entitlement.js), so it can't be used to spam.
+ *  Used to be owner-only, but that only ever protected against spamming
+ *  someone else's devices — which it can't do anyway, since it always targets
+ *  the caller's own uid. A per-uid rate limit (same pattern as
+ *  takeAuthEmailSlot) guards against abuse instead, so any account can check
+ *  its own push setup.
+ *
+ *  POST, Bearer <Firebase ID token>. 429 `throttled` inside
+ *  TEST_PUSH_MIN_GAP_MS of a caller's last call.
  *  Response: { tokens, sent, failed: [{ tokenSuffix, code }], pruned }
  * ────────────────────────────────────────────────────────────────────────── */
+const TEST_PUSH_MIN_GAP_MS = 30 * 1000;
+
+/** Returns true if this uid may send now (and records it), false if throttled. */
+async function takeTestPushSlot(uid) {
+  const ref = admin.firestore().collection("testPushThrottle").doc(uid);
+  const now = Date.now();
+  return admin.firestore().runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const lastSentAt = snap.exists ? snap.data().lastSentAt : 0;
+    if (lastSentAt && now - lastSentAt < TEST_PUSH_MIN_GAP_MS) return false;
+    tx.set(ref, { lastSentAt: now });
+    return true;
+  });
+}
+
 exports.sendTestPush = onRequest(
   {
     region: REGION,
@@ -5488,8 +4857,12 @@ exports.sendTestPush = onRequest(
       res.status(401).json({ error: "Invalid or expired token" });
       return;
     }
-    if (!isOwnerToken(decoded)) {
-      res.status(403).json({ error: "Owners only" });
+    if (decoded.firebase && decoded.firebase.sign_in_provider === "anonymous") {
+      res.status(403).json({ error: "Sign in with a real account first" });
+      return;
+    }
+    if (!(await takeTestPushSlot(decoded.uid))) {
+      res.status(429).json({ error: "throttled" });
       return;
     }
     const result = await sendPushToUser(admin.firestore(), decoded.uid, {
@@ -5653,10 +5026,7 @@ exports.runNightlyForUser = onRequest(
         stylePrefsObj = styleSnap.exists ? styleSnap.data() : null;
       }
       if (stages.includes("reading") && facts) {
-        const reading = await selectTodayFor(db, uid, now, facts, observations, tz, {
-          allowModel: body.dryRun !== true,
-          lifeContext: lifeContextStr, stylePrefs: stylePrefsObj,
-        });
+        const reading = await selectTodayFor(db, uid, now, facts, observations, tz);
         out.reading = {
           date: reading.date, silence: reading.silence, reason: reading.reason,
           line: reading.line, templateText: reading.templateText,
@@ -5693,10 +5063,6 @@ exports.runNightlyForUser = onRequest(
         out.line = await selectAndWriteMirrorLineForUser(
           db, uid, now, tz, facts, observations, analyses, lifeContextStr, stylePrefsObj);
         out.ran.push("line");
-      }
-      if (stages.includes("question")) {
-        out.question = await writeNextQuestionForUser(db, uid, now);
-        out.ran.push("question");
       }
       // The whole v3.1 pass in one stage, exactly as the nightly worker runs
       // it — reads the persisted derived layer, so it needs `facts` to have

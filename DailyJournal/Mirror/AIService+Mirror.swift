@@ -255,30 +255,6 @@ extension AIService {
         return MirrorAskResult(answer: answer, citations: citations)
     }
 
-    // MARK: - Fetch a card from the server-generated deck
-
-    /// Reads one card from `users/{uid}/mirrorCards/{hypothesisId}` — the deck
-    /// `functions:mineUserInsights` / `functions:bootstrapMirror` write to.
-    /// Returns nil if this hypothesis hasn't earned a card yet (it wasn't in
-    /// the last mine's top-scoring set, or its card was suppressed by the
-    /// server-side guard). No AI call — this is a pure Firestore read.
-    ///
-    /// Cache-first: the deck only changes when a mine runs (at most every few
-    /// days per `MIN_NEW_ANALYSES_TO_MINE`/`MINE_MAX_STALENESS_HOURS`), so
-    /// there's no reason to pay a server round-trip on every Mirror open the
-    /// way the old per-date `mirrors/{yyyy-MM-dd}` read did.
-    func fetchMirrorCard(hypothesisId: String, userId: String) async -> MirrorCard? {
-        guard let snapshot = try? await FirestoreCacheFirst.document(
-            Firestore.firestore()
-                .collection("users").document(userId)
-                .collection("mirrorCards").document(hypothesisId),
-            key: "mirrorCard.\(userId).\(hypothesisId)"
-        ), let data = snapshot.data()
-        else { return nil }
-
-        return MirrorCard(from: data)
-    }
-
     // MARK: - Narrative synthesis (Prompt F, mirror-narrative-v1)
 
     /// Generates a 3-4 sentence psychological sketch from the top hypotheses.
@@ -320,13 +296,16 @@ extension AIService {
     /// Call once at load time to cache the rendered life context block.
     static func cacheLifeContext(_ ctx: LifeContext) {
         UserDefaults.standard.set(ctx.sensitiveTopicsDisabled, forKey: "cachedSensitiveTopicsDisabled")
-        guard ctx.currentSeason != nil || !ctx.primaryFocus.isEmpty else {
+        guard ctx.currentSeason != nil || !ctx.primaryFocus.isEmpty || !ctx.peopleLikelyToAppear.isEmpty else {
             UserDefaults.standard.removeObject(forKey: "cachedLifeContextBlock")
             return
         }
         var lines: [String] = []
         if let season = ctx.currentSeason { lines.append("Life season: \(season.rawValue.replacingOccurrences(of: "_", with: " "))") }
         if !ctx.primaryFocus.isEmpty { lines.append("Focus areas: \(ctx.primaryFocus.joined(separator: ", "))") }
+        if !ctx.peopleLikelyToAppear.isEmpty {
+            lines.append("People in their life: \(ctx.peopleLikelyToAppear.joined(separator: ", "))")
+        }
         if !ctx.sensitiveTopicsDisabled.isEmpty {
             lines.append("DO NOT surface patterns about: \(ctx.sensitiveTopicsDisabled.joined(separator: ", "))")
         }

@@ -21,15 +21,6 @@ struct RootView: View {
     /// was added (aiConsentGranted key is absent in their UserDefaults).
     @State private var showRetroConsentSheet = false
 
-    /// True when the returning-user calendar-connect sheet should be shown.
-    /// DISABLED for now — nothing sets this to true — because the Google
-    /// Calendar OAuth app is unverified and connecting doesn't actually work
-    /// for real users yet. To revive once verification clears: in `onAppear`
-    /// below, show it when `!UserDefaults.standard.calendarConsentAsked`
-    /// (chained after the AI consent sheet's `onDismiss`, as before, so only
-    /// one sheet shows per launch).
-    @State private var showRetroCalendarSheet = false
-
     var body: some View {
         Group {
             switch authViewModel.authState {
@@ -43,18 +34,11 @@ struct RootView: View {
                         .sheet(isPresented: $showRetroConsentSheet) {
                             RetroAIConsentSheet(isPresented: $showRetroConsentSheet)
                         }
-                        // Wiring kept, just never triggered below — see the
-                        // disabled-calendar-connect note on `showRetroCalendarSheet`.
-                        .sheet(isPresented: $showRetroCalendarSheet) {
-                            RetroCalendarConnectSheet(isPresented: $showRetroCalendarSheet)
-                        }
                         .onAppear {
                             // Show once for users who never saw the consent screen.
                             if UserDefaults.standard.aiConsentGranted == nil {
                                 showRetroConsentSheet = true
                             }
-                            // Calendar retro-prompt intentionally not triggered —
-                            // see the note on `showRetroCalendarSheet` above.
                         }
                 } else {
                     OnboardingView {
@@ -205,86 +189,6 @@ struct RetroAIConsentSheet: View {
             Text(value)
                 .font(AppTheme.editorialBody(size: 13))
                 .foregroundStyle(AppTheme.ink)
-        }
-    }
-}
-
-// MARK: - Retro calendar-connect sheet (returning users)
-//
-// Same one-time-ask shape as RetroAIConsentSheet, for users who completed
-// onboarding before the Google Calendar step existed. View-only, optional —
-// declining just dismisses, no AI features are gated on this.
-struct RetroCalendarConnectSheet: View {
-    @Binding var isPresented: Bool
-    @State private var isConnecting = false
-
-    var body: some View {
-        ZStack {
-            AppTheme.paper.ignoresSafeArea()
-            VStack(alignment: .leading, spacing: 28) {
-                Text("See your day\nalongside Spilr.")
-                    .font(AppTheme.editorialDisplay(size: 30))
-                    .foregroundStyle(AppTheme.ink)
-                    .padding(.top, 8)
-
-                VStack(alignment: .leading, spacing: 12) {
-                    Image(systemName: "calendar")
-                        .font(.system(size: 28))
-                        .foregroundStyle(AppTheme.terracotta)
-                    Text("Connect Google Calendar to view your events right inside Spilr. Read-only \u{2014} we never edit or create anything. You can connect or disconnect any time from Profile.")
-                        .font(AppTheme.editorialBody(size: 15))
-                        .foregroundStyle(AppTheme.inkSoft)
-                        .lineSpacing(4)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(18)
-                .background(AppTheme.cream.opacity(0.7))
-                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-
-                Spacer(minLength: 20)
-
-                VStack(spacing: 12) {
-                    Button {
-                        isConnecting = true
-                        Task {
-                            await CalendarService.shared.connect()
-                            UserDefaults.standard.calendarConsentAsked = true
-                            isConnecting = false
-                            isPresented = false
-                        }
-                    } label: {
-                        Text(isConnecting ? "Connecting\u{2026}" : "Connect Google Calendar")
-                            .font(.system(size: 17, weight: .semibold))
-                            .foregroundStyle(AppTheme.cream)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 17)
-                            .background(LinearGradient(colors: [AppTheme.terracotta, AppTheme.terracottaDeep],
-                                                       startPoint: .leading, endPoint: .trailing))
-                            .clipShape(Capsule())
-                            .shadow(color: AppTheme.terracotta.opacity(0.35), radius: 14, x: 0, y: 7)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(isConnecting)
-
-                    Button {
-                        UserDefaults.standard.calendarConsentAsked = true
-                        isPresented = false
-                    } label: {
-                        Text("Not now")
-                            .font(.system(size: 15, weight: .medium))
-                            .foregroundStyle(AppTheme.inkSoft)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 14)
-                            .background(AppTheme.cream.opacity(0.8))
-                            .clipShape(Capsule())
-                            .overlay(Capsule().stroke(AppTheme.inkSoft.opacity(0.2), lineWidth: 1))
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(isConnecting)
-                }
-            }
-            .padding(.horizontal, 24)
-            .padding(.top, 16)
         }
     }
 }
@@ -687,7 +591,7 @@ struct ProfileView: View {
                     Section {
                         Button {
                             AnalyticsManager.shared.logEvent(.feedbackSent)
-                            if let url = URL(string: "mailto:support@spilr.app?subject=Spilr%20Feedback") {
+                            if let url = URL(string: "mailto:support@getspilr.com?subject=Spilr%20Feedback") {
                                 UIApplication.shared.open(url)
                             }
                         } label: {
@@ -717,8 +621,9 @@ struct ProfileView: View {
                     // MARK: Developer (owners + debug builds)
                     //
                     // Push and paywall diagnostics that work on TestFlight and
-                    // App Store builds too, but only for OwnerAccess accounts —
-                    // `sendTestPush` is owner-only server-side as well.
+                    // App Store builds too, but the section itself is still
+                    // gated to OwnerAccess accounts here — `sendTestPush` is
+                    // rate-limited but not owner-only server-side.
                     if entitlements.isOwner || TestLaunchConfig.debugBuildBypassesPaywall {
                         DeveloperSection(showPaywall: $showPaywall)
                     }

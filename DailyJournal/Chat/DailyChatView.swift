@@ -101,28 +101,25 @@ final class DailyChatViewModel: ObservableObject {
     /// "Not covered this time" for missing fields, and below its own 8-word floor
     /// the local transcript stitch takes over.
     ///
-    /// Onboarding's first-ever session keeps a slightly higher floor (≥2 turns and
-    /// ≥12 words) because there the inline "ready to close" card is driven by this
-    /// too — see `isOnboarding` and `DailyChatView.showsWeaveCard`.
     var canWeave: Bool {
-        if isOnboarding {
-            return readyToWeave || (userTurnCount >= 2 && userWordCount >= 12)
-        }
-        return readyToWeave || hasUserContent
+        readyToWeave || hasUserContent
     }
 
-    var seedContext: String?
-    /// True for onboarding's first-ever session — lowers `canWeave`'s floor and
-    /// suppresses the one-time Thought Journal education sheet, which would
-    /// otherwise stack over the onboarding cover. See `OnboardingView`.
-    let isOnboarding: Bool
+    /// A past entry's text, when this session was opened via "Continue with
+    /// Spilr" from the entry editor (see `JournalEditorView.micBottomBar`).
+    let continueEntryText: String?
 
-    init(userId: String, seedContext: String? = nil, isOnboarding: Bool = false) {
+    /// The continue-entry seed makes this a deliberate, already-directed
+    /// conversation — the plain-fresh-open behaviors below (Prompt Q's opener
+    /// swap, "resume where you left off?") only apply when it is not set.
+    private var isSeeded: Bool { continueEntryText != nil }
+
+    init(userId: String, continueEntryText: String? = nil) {
         self.userId = userId
-        self.seedContext = seedContext
-        self.isOnboarding = isOnboarding
-        if let seed = seedContext {
-            messages = [ChatMessage(role: .spilr, text: "Your mirror flagged something: \(seed)\n\nDoes that track? What's going on with that?")]
+        self.continueEntryText = continueEntryText
+        if let entryText = continueEntryText {
+            let excerpt = entryText.count > 200 ? entryText.prefix(200) + "\u{2026}" : Substring(entryText)
+            messages = [ChatMessage(role: .spilr, text: "Picking up on what you wrote: \u{201C}\(excerpt)\u{201D}\n\nWhat's on your mind now?")]
         } else {
             messages = [ChatMessage(role: .spilr, text: AIService.chatOpener)]
         }
@@ -145,33 +142,15 @@ final class DailyChatViewModel: ObservableObject {
         }
         // Same for the Person Model layer — DerivedService is otherwise only
         // loaded by the Mirror tab, so a user who opens chat straight from Home
-        // would get neither the model context `nextChatTurn` now reads nor a
-        // live opener without this. A plain fresh open (no seed, nothing sent
-        // yet) SWAPS IN Prompt Q's own pick for tonight — the discriminating
-        // question the Person Model most wants answered — in place of the
-        // static opener, once it resolves. Guarded tight: only replaces the
-        // placeholder while the session is still exactly that, a placeholder,
-        // and only after the deterministic topic gate clears it.
-        if seedContext == nil {
-            Task { [weak self, userId] in
-                await DerivedService.shared.load(for: userId)
-                guard let self, self.userTurnCount == 0, self.seedContext == nil,
-                      let question = DerivedService.shared.personModel.nextQuestion,
-                      !PersonModelChatContext.isDisabled(
-                        question.question,
-                        sensitiveTopicsDisabled: AIService.shared.sensitiveTopicsDisabledCached())
-                else { return }
-                self.messages = [ChatMessage(role: .spilr, text: question.question)]
-            }
-        } else {
-            Task { [userId] in await DerivedService.shared.load(for: userId) }
-        }
+        // would get the model context `nextChatTurn` reads. The opener itself is
+        // the static `AIService.chatOpener` set above, same on every surface.
+        Task { [userId] in await DerivedService.shared.load(for: userId) }
 
         // Offer to resume a same-day, un-woven session — but only for a plain
-        // fresh open. A `seedContext` open is a deliberate NEW conversation Mirror
-        // just started; interrupting it with an unrelated resume prompt would be
-        // confusing, not helpful.
-        if seedContext == nil {
+        // fresh open. A seeded open (Mirror, or "Continue with Spilr") is a
+        // deliberate NEW conversation; interrupting it with an unrelated
+        // resume prompt would be confusing, not helpful.
+        if !isSeeded {
             Task { [weak self] in
                 guard let self,
                       let found = await ChatSessionService.shared.fetchMostRecent(userId: userId),
@@ -246,11 +225,10 @@ final class DailyChatViewModel: ObservableObject {
         ))
     }
 
-    /// Shows the one-time education sheet the first time the user opens a chat —
-    /// skipped during onboarding, which would otherwise stack it over the
-    /// onboarding cover (see `isOnboarding`). No-op afterwards.
+    /// Shows the one-time education sheet the first time the user opens a chat.
+    /// No-op afterwards.
     func maybeShowThoughtJournalEducation() {
-        guard !isOnboarding, !ThoughtJournalEducation.hasSeen else { return }
+        guard !ThoughtJournalEducation.hasSeen else { return }
         ThoughtJournalEducation.hasSeen = true
         showThoughtJournalEducation = true
     }
@@ -317,7 +295,7 @@ final class DailyChatViewModel: ObservableObject {
             } catch AIError.blockedBySafety {
                 if Task.isCancelled { return }
                 await self.revealReply(
-                    "I can't go there — but I'm still here. What else is on your mind?",
+                    "I can't go there, but I'm still here. What else is on your mind?",
                     ready: false
                 )
             } catch AIError.budgetExceeded {
@@ -326,7 +304,7 @@ final class DailyChatViewModel: ObservableObject {
                     // Covers both a finished free preview (AIService also opens
                     // the Spilr Pro paywall for that) and a paying user's daily
                     // cap, so it promises nothing about when replies return.
-                    "I can't reply right now \u{2014} keep writing, and you can still wrap this up as an entry.",
+                    "I can't reply right now. Keep writing, and you can still wrap this up as an entry.",
                     ready: self.userTurnCount >= 2
                 )
             } catch {
@@ -419,9 +397,10 @@ final class DailyChatViewModel: ObservableObject {
     // then enrich via the shared EntryEnrichment tail. The only difference is
     // sessionType == .cbtReframe.
 
-    func save(entryText: String) {
+    @discardableResult
+    func save(entryText: String) -> JournalEntry? {
         let trimmed = entryText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else { return nil }
 
         // Sentiment and tags are derived data and stay local. Reflection is
         // AI-only — `EntryEnrichment` patches it in when Gemini answers. This is
@@ -479,16 +458,62 @@ final class DailyChatViewModel: ObservableObject {
         // AIService+Chat.extractModelOps). Fire-and-forget: a user who saves
         // and leaves must not wait on this.
         let historySnapshot = messages
-        let sid = sessionId
         let uid = userId
         Task.detached(priority: .utility) {
             guard let ops = try? await AIService.shared.extractModelOps(history: historySnapshot),
                   !ops.isEmpty
             else { return }
             await MainActor.run {
-                DailyChatViewModel.applyModelOps(ops, sessionId: sid, userId: uid)
+                DailyChatViewModel.applyModelOps(ops, userId: uid)
             }
         }
+
+        return entry
+    }
+
+    // MARK: - Auto-save on leave
+    //
+    // The manual path (weave() → preview sheet → save(entryText:)) asks the user
+    // to read the snapshot before it's saved. Leaving the chat outright shouldn't
+    // ask anything — losing a real conversation is worse than saving one the user
+    // didn't explicitly review, and `save(entryText:)` still returns the entry so
+    // the caller can offer "Undo".
+
+    /// Enough of the user's own words to be worth saving automatically on exit.
+    /// Deliberately stricter than `canWeave` (which is true from the first reply,
+    /// to keep the header Save button available early) — a stray one-word reply
+    /// shouldn't silently become a journal entry just because the user tapped X.
+    var hasEnoughToAutoSave: Bool {
+        userTurnCount >= 1 && userWordCount >= 12
+    }
+
+    /// Weaves and saves without the manual preview step. Called when the user
+    /// leaves the chat with unsaved content — see `DailyChatView`'s close button.
+    /// Always produces something: `weaveThoughtJournalSummary` falls back to
+    /// `localWeaveEntry`, same as the manual path.
+    @discardableResult
+    func saveOnLeave() async -> JournalEntry? {
+        guard !isWeaving, !isThinking, !isRevealing, hasEnoughToAutoSave else { return nil }
+        let history = messages
+        let woven = (try? await AIService.shared.weaveThoughtJournalSummary(from: history))
+            ?? AIService.shared.localWeaveEntry(from: history)
+        return save(entryText: woven)
+    }
+
+    /// Reverses `saveOnLeave()` — deletes the entry it created and clears the
+    /// session's link back to it, so a fresh chat open still offers "Resume
+    /// where you left off?" for this conversation instead of treating it as
+    /// already woven.
+    func undoAutoSave(_ entry: JournalEntry) {
+        service.deleteEntry(entry)
+        ChatSessionService.shared.save(ChatSession(
+            id: sessionId,
+            userId: userId,
+            messages: messages,
+            startedAt: sessionStartedAt,
+            updatedAt: Date(),
+            wovenEntryId: nil
+        ))
     }
 
     /// Applies chat-derived model writes (see `AIService+Chat.extractModelOps`).
@@ -499,7 +524,7 @@ final class DailyChatViewModel: ObservableObject {
     /// `PersonModelChatContext` handed the model) — a lite model can propose a
     /// plausible-looking id that was never shown, and that must never reach a
     /// real document.
-    private static func applyModelOps(_ ops: [AIService.ParsedModelOp], sessionId: String, userId: String) {
+    private static func applyModelOps(_ ops: [AIService.ParsedModelOp], userId: String) {
         guard !userId.isEmpty else { return }
         let knownItemIds = Set(DerivedService.shared.personModelItems.map(\.id))
 
@@ -550,12 +575,6 @@ final class DailyChatViewModel: ObservableObject {
                     }
                 }
             }
-
-            SelfModelService.shared.recordModelOp(
-                ModelOp(op: parsed.op, targetItemId: parsed.targetItemId,
-                        subject: parsed.subject, quote: parsed.quote, sessionId: sessionId),
-                userId: userId
-            )
         }
     }
 }
@@ -565,6 +584,14 @@ final class DailyChatViewModel: ObservableObject {
 struct DailyChatView: View {
 
     let onSave: () -> Void
+    /// Called after the close button auto-saves an unreviewed conversation (see
+    /// the header's close action and `DailyChatViewModel.saveOnLeave()`) — the
+    /// caller uses this to offer "Undo". The second parameter reverses the save
+    /// (`DailyChatViewModel.undoAutoSave`); it's handed out rather than done here
+    /// because by the time the person taps Undo, this view is already gone.
+    /// Not called for onboarding, which keeps its own explicit save/discard
+    /// choice on close.
+    let onAutoSave: (JournalEntry, @escaping () -> Void) -> Void
     /// Set when reached via the home invitation card's mic — opens the chat in
     /// voice-first mode (see `isVoiceMode`) with the mic already listening.
     let startWithDictation: Bool
@@ -591,7 +618,6 @@ struct DailyChatView: View {
     /// live, since the last Spilr message mutates word-by-word while
     /// `revealReply` is still typing it out.
     @State private var answeringQuestion = ""
-    @State private var showDiscardAlert = false
     @State private var hasStartedDictation = false
     /// "Keep talking" hides the "ready to close" card for the rest of the
     /// session. It used to reset on every new user message, which re-popped the
@@ -599,20 +625,20 @@ struct DailyChatView: View {
     /// always there anyway, so once dismissed it stays dismissed.
     @State private var dismissedWeaveCard = false
 
-    /// - Parameter isOnboarding: onboarding's first-ever session — lowers the save
-    ///   floor and suppresses the one-time education sheet. See
-    ///   `DailyChatViewModel.isOnboarding`.
     init(
         userId: String,
-        seedContext: String? = nil,
+        continueEntryText: String? = nil,
         startWithDictation: Bool = false,
-        isOnboarding: Bool = false,
-        onSave: @escaping () -> Void
+        onSave: @escaping () -> Void,
+        onAutoSave: @escaping (JournalEntry, @escaping () -> Void) -> Void = { _, _ in }
     ) {
         self.onSave = onSave
+        self.onAutoSave = onAutoSave
         self.startWithDictation = startWithDictation
         _isVoiceMode = State(initialValue: startWithDictation)
-        _vm = StateObject(wrappedValue: DailyChatViewModel(userId: userId, seedContext: seedContext, isOnboarding: isOnboarding))
+        _vm = StateObject(wrappedValue: DailyChatViewModel(
+            userId: userId, continueEntryText: continueEntryText
+        ))
     }
 
     var body: some View {
@@ -635,6 +661,7 @@ struct DailyChatView: View {
                 ExpandedComposeView(
                     draft: $vm.draft,
                     focused: $expandedFocused,
+                    messages: vm.messages,
                     answeringQuestion: answeringQuestion,
                     isWaitingOnSpilr: vm.isThinking || vm.isRevealing,
                     isRecording: speech.isRecording,
@@ -680,18 +707,6 @@ struct DailyChatView: View {
         // equal it, so they never trip this.
         .onChange(of: vm.draft) { _, new in
             if speech.isRecording && new != speech.liveText { speech.stop() }
-        }
-        .alert("Leave this conversation?", isPresented: $showDiscardAlert) {
-            if vm.canWeave {
-                Button("Save as entry") { vm.weave() }
-            }
-            Button("Discard", role: .destructive) {
-                vm.discardSession()
-                dismiss()
-            }
-            Button("Keep chatting", role: .cancel) {}
-        } message: {
-            Text("Your conversation won't be saved unless you turn it into an entry first.")
         }
         .alert("Resume where you left off?", isPresented: Binding(
             get: { vm.resumableSession != nil },
@@ -739,12 +754,7 @@ struct DailyChatView: View {
     private var header: some View {
         HStack(spacing: 12) {
             Button {
-                // If the user has written at least one reply, confirm before discarding.
-                if vm.hasUserContent {
-                    showDiscardAlert = true
-                } else {
-                    dismiss()
-                }
+                closeChat()
             } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 13, weight: .bold))
@@ -763,7 +773,7 @@ struct DailyChatView: View {
                 Text("Today with Spilr")
                     .font(AppTheme.editorialDisplay(size: 20))
                     .foregroundStyle(AppTheme.ink)
-                Text("nothing saved until you choose")
+                Text("saves to your Journal when you leave")
                     .font(AppTheme.editorialBody(size: 12))
                     .foregroundStyle(AppTheme.inkSoft)
             }
@@ -922,7 +932,7 @@ struct DailyChatView: View {
                     .tracking(1.6)
                     .foregroundStyle(AppTheme.inkSoft)
 
-                Text("Keep this as an entry?")
+                Text("Save this to your Journal?")
                     .font(AppTheme.editorialDisplay(size: 19))
                     .foregroundStyle(AppTheme.ink)
 
@@ -938,7 +948,7 @@ struct DailyChatView: View {
                             Text("Weaving your entry…")
                         } else {
                             Image(systemName: "wand.and.stars").font(.system(size: 14))
-                            Text("Wrap up & save")
+                            Text("Save to Journal")
                         }
                     }
                     .font(.system(size: 15, weight: .semibold))
@@ -956,24 +966,25 @@ struct DailyChatView: View {
                 .accessibilityIdentifier("chat.wrapUp")
                 .disabled(vm.isWeaving)
 
-                HStack {
-                    Spacer()
-                    Button("Keep talking") {
-                        withAnimation(.easeOut(duration: 0.2)) { dismissedWeaveCard = true }
-                    }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(AppTheme.inkSoft)
-
-                    Text("·").foregroundStyle(AppTheme.inkSoft.opacity(0.4))
-
-                    Button("Discard — save nothing") { showDiscardAlert = true }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(AppTheme.inkSoft.opacity(0.6))
-                    Spacer()
+                // A real second button, not a text link beside "Discard" — the
+                // two used to sit on one line and read as a single control.
+                // Discard lives in the close button's flow instead (see
+                // `DailyChatView.closeChat()`); this card is only ever asking
+                // to save, never to delete.
+                Button {
+                    withAnimation(.easeOut(duration: 0.2)) { dismissedWeaveCard = true }
+                } label: {
+                    Text("Keep talking")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(AppTheme.ink)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(AppTheme.cream)
+                        .overlay(Capsule().stroke(AppTheme.inkSoft.opacity(0.2), lineWidth: 1))
+                        .clipShape(Capsule())
                 }
-                .padding(.top, 2)
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("chat.keepTalking")
             }
             .padding(18)
             .background(AppTheme.cream)
@@ -987,7 +998,7 @@ struct DailyChatView: View {
 
     private var showsWeaveCard: Bool {
         guard !dismissedWeaveCard else { return false }
-        return vm.isOnboarding ? vm.canWeave : vm.readyToWeave
+        return vm.readyToWeave
     }
 
     /// A rounded, approximate duration — "~3 MIN", never "~3.2 MIN". Read live
@@ -1034,8 +1045,8 @@ struct DailyChatView: View {
     // MARK: - Input bar
     //
     // Composer sizing follows iMessage / WhatsApp / Day One: ONE line at rest,
-    // growing only as the person actually types, capped at six lines before it
-    // scrolls internally.
+    // growing only as the person actually types, capped at three lines before
+    // it stops growing.
     //
     // What was wrong before: `TextEditor` is greedy vertically, so
     // `.frame(minHeight: 22, maxHeight: 110)` didn't mean "grow from 22 to 110" —
@@ -1044,12 +1055,12 @@ struct DailyChatView: View {
     // before a single character was typed, eating roughly a fifth of the screen and
     // pushing Spilr's newest reply up out of view.
     //
-    // Three changes: `TextField(axis: .vertical)` with `lineLimit(1...6)` auto-grows
-    // natively (and brings a real placeholder, so the overlaid-Text hack is gone);
-    // the two buttons sit side by side on the baseline instead of stacked; and mic
-    // and send swap in place rather than both being permanently present — the
-    // familiar pattern where the mic becomes a send button once there's something
-    // to send.
+    // A `Capsule()` clip also broke on a multi-line draft: at 6 lines the
+    // capsule's corner radius is half its ~150pt height, so the curved ends
+    // sliced into the first and last lines. `composerPreview` fixes both
+    // problems by showing the draft's TAIL instead of growing to show all of
+    // it — a fixed-radius `RoundedRectangle`, capped at 3 lines, always shows
+    // the newest words, which is what matters mid-dictation.
     private var inputBar: some View {
         HStack(alignment: .bottom, spacing: 8) {
             // Renders `vm.draft` (including live dictation) but takes no
@@ -1058,18 +1069,14 @@ struct DailyChatView: View {
             // at the moment of that hand-off (down here, comes up once in the
             // expanded editor), so there's no dismiss/re-present flicker to
             // engineer around, and no second focus target to keep in sync.
-            TextField("Answer however much you like\u{2026}", text: $vm.draft, axis: .vertical)
-                .font(AppTheme.editorialBody(size: 16))
-                .foregroundStyle(AppTheme.ink)
-                .tint(AppTheme.terracotta)
-                .lineLimit(1...6)
-                .allowsHitTesting(false)
+            composerPreview
                 .padding(.horizontal, 18)
                 .padding(.vertical, 12)
                 .background(AppTheme.cream.opacity(0.8))
-                .clipShape(Capsule())
-                .overlay(Capsule().stroke(AppTheme.inkSoft.opacity(0.15), lineWidth: 1))
-                .contentShape(Capsule())
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .stroke(AppTheme.inkSoft.opacity(0.15), lineWidth: 1))
+                .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
                 .onTapGesture { expandCompose() }
                 .accessibilityAddTraits(.isButton)
                 .accessibilityHint("Opens the full writing view")
@@ -1123,6 +1130,32 @@ struct DailyChatView: View {
         .background(AppTheme.paper)
     }
 
+    /// The at-rest composer's content: the placeholder, or — capped to 3
+    /// lines — the draft's TAIL rather than its head. This never takes
+    /// direct input (see `inputBar`'s tap gesture), so there's no cursor to
+    /// keep on screen; showing the newest characters is what matters, since
+    /// dictation only ever appends.
+    private var composerPreview: some View {
+        Group {
+            if vm.draft.isEmpty {
+                Text("Answer however much you like\u{2026}")
+                    .foregroundStyle(AppTheme.inkSoft.opacity(0.6))
+            } else if vm.draft.count > composerPreviewTailLength {
+                Text("\u{2026}" + vm.draft.suffix(composerPreviewTailLength))
+                    .foregroundStyle(AppTheme.ink)
+            } else {
+                Text(vm.draft)
+                    .foregroundStyle(AppTheme.ink)
+            }
+        }
+        .font(AppTheme.editorialBody(size: 16))
+        .lineLimit(3)
+        .multilineTextAlignment(.leading)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var composerPreviewTailLength: Int { 180 }
+
     /// Shared circular button face for the composer's mic / send control
     /// (`size: 38`, the default) and the expanded surface's send button
     /// (`size: 40`).
@@ -1165,12 +1198,25 @@ struct DailyChatView: View {
     private var voicePanel: some View {
         VStack(spacing: 10) {
             if hasDraft {
-                ScrollView {
-                    Text(vm.draft)
-                        .font(AppTheme.editorialBody(size: 16))
-                        .foregroundStyle(AppTheme.ink)
-                        .lineSpacing(3)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                // Auto-scrolls to the newest words as `vm.draft` grows during
+                // dictation — without `ScrollViewReader`, a transcript longer
+                // than 110pt just sat with its start pinned in view and every
+                // new word landing below the visible area.
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        Text(vm.draft)
+                            .font(AppTheme.editorialBody(size: 16))
+                            .foregroundStyle(AppTheme.ink)
+                            .lineSpacing(3)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Color.clear.frame(height: 1).id("bottom")
+                    }
+                    .onChange(of: vm.draft) { _, _ in
+                        proxy.scrollTo("bottom", anchor: .bottom)
+                    }
+                    .onAppear {
+                        proxy.scrollTo("bottom", anchor: .bottom)
+                    }
                 }
                 .frame(maxHeight: 110)
                 .padding(.horizontal, 16)
@@ -1331,6 +1377,30 @@ struct DailyChatView: View {
         vm.send()
         collapseCompose()
     }
+
+    /// The header's close button. Onboarding keeps the explicit "Save as
+    /// entry / Discard / Keep chatting" choice, since its first-ever save is
+    /// what finishes onboarding. Everywhere else, closing with real content
+    /// auto-saves silently (see `DailyChatViewModel.saveOnLeave()`) rather
+    /// than asking — `onAutoSave` is how the caller offers "Undo" for that.
+    /// Below the auto-save floor there's nothing worth asking about: the
+    /// session stays resumable either way.
+    private func closeChat() {
+        guard vm.hasUserContent else {
+            dismiss()
+            return
+        }
+        guard vm.hasEnoughToAutoSave else {
+            dismiss()
+            return
+        }
+        Task {
+            if let entry = await vm.saveOnLeave() {
+                onAutoSave(entry) { vm.undoAutoSave(entry) }
+            }
+            dismiss()
+        }
+    }
 }
 
 // MARK: - Expanded compose surface
@@ -1344,6 +1414,9 @@ struct DailyChatView: View {
 private struct ExpandedComposeView: View {
     @Binding var draft: String
     var focused: FocusState<Bool>.Binding
+    /// The live thread, so the context strip can show more than just the
+    /// question being answered — see `contextStrip` and `showsFullContext`.
+    let messages: [ChatMessage]
     /// Snapshotted at expand time by the caller — see `expandCompose()`.
     let answeringQuestion: String
     let isWaitingOnSpilr: Bool
@@ -1352,6 +1425,11 @@ private struct ExpandedComposeView: View {
     let onMic: () -> Void
     let onDone: () -> Void
     let onSend: () -> Void
+
+    /// Tapping the context strip reveals the last few turns of the actual
+    /// conversation instead of just the one message being answered — testers
+    /// on the single-message strip asked to see the chat before this point.
+    @State private var showsFullContext = false
 
     private var wordCount: Int {
         draft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1414,24 +1492,47 @@ private struct ExpandedComposeView: View {
         .background(AppTheme.paper)
     }
 
-    /// The question being answered, pinned for context. `AppTheme.lavWash`,
-    /// not `AppTheme.lav` — `lav` collapses onto `terracotta` in the Moon
+    /// Collapsed: the question being answered, pinned for context, plus a
+    /// chevron hinting there's more. Tapping it reveals `fullContextPeek`
+    /// instead — the last few turns of the actual conversation, scrolled to
+    /// the bottom — so leaving this full-screen writing surface isn't the
+    /// only way to see what came before. `AppTheme.lavWash`, not
+    /// `AppTheme.lav` — `lav` collapses onto `terracotta` in the Moon
     /// palette, which would make this strip read as an accent surface rather
     /// than a quiet aside on that theme.
     private var contextStrip: some View {
-        HStack(alignment: .top, spacing: 9) {
-            Text("ANSWERING")
-                .font(AppTheme.mono(size: 9))
-                .tracking(1.4)
-                .foregroundStyle(AppTheme.lavDeep)
-            Text(answeringQuestion)
-                .font(.system(size: 13, weight: .bold, design: .rounded))
-                .foregroundStyle(AppTheme.ink)
-                .lineLimit(3)
+        VStack(spacing: 0) {
+            Button {
+                withAnimation(.easeOut(duration: 0.2)) { showsFullContext.toggle() }
+            } label: {
+                HStack(alignment: .top, spacing: 9) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("ANSWERING")
+                            .font(AppTheme.mono(size: 9))
+                            .tracking(1.4)
+                            .foregroundStyle(AppTheme.lavDeep)
+                        Text(answeringQuestion)
+                            .font(.system(size: 13, weight: .bold, design: .rounded))
+                            .foregroundStyle(AppTheme.ink)
+                            .lineLimit(showsFullContext ? nil : 3)
+                    }
+                    Spacer(minLength: 8)
+                    Image(systemName: showsFullContext ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(AppTheme.lavDeep.opacity(0.7))
+                        .padding(.top, 3)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(showsFullContext ? "Hide the conversation so far" : "Show the conversation so far")
+
+            if showsFullContext {
+                fullContextPeek
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 20)
-        .padding(.vertical, 12)
         .background(AppTheme.lavWash.opacity(0.5))
         .overlay(
             Rectangle().fill(AppTheme.lavDeep.opacity(0.22)).frame(height: 1),
@@ -1439,9 +1540,57 @@ private struct ExpandedComposeView: View {
         )
     }
 
+    /// The last few turns, most-recent at the bottom — a light read-only echo
+    /// of `DailyChatView.bubble(_:)`, kept separate rather than shared
+    /// because that method lives on the other view and this peek is
+    /// deliberately smaller (no tail spacers, no typing indicator).
+    private var fullContextPeek: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(messages.suffix(6)) { message in
+                        miniBubble(message).id(message.id)
+                    }
+                    Color.clear.frame(height: 1).id("peek-bottom")
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
+            }
+            .onAppear { proxy.scrollTo("peek-bottom", anchor: .bottom) }
+        }
+        .frame(maxHeight: UIScreen.main.bounds.height * 0.4)
+        .background(AppTheme.paper.opacity(0.6))
+    }
+
+    @ViewBuilder
+    private func miniBubble(_ message: ChatMessage) -> some View {
+        let isSpilr = message.role == .spilr
+        HStack {
+            if !isSpilr { Spacer(minLength: 32) }
+            Text(message.text)
+                .font(.system(size: 13, design: .rounded))
+                .foregroundStyle(isSpilr ? AppTheme.ink : AppTheme.cream)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(isSpilr ? AppTheme.cream.opacity(0.9) : AppTheme.terracotta)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            if isSpilr { Spacer(minLength: 32) }
+        }
+        .frame(maxWidth: .infinity, alignment: isSpilr ? .leading : .trailing)
+    }
+
     // `TextEditor` carries its own ~5pt text-container inset, so 15pt of
     // external padding here lands text at ~20pt — matching `contextStrip`'s
     // 20pt padding above it, rather than the two misaligning.
+    //
+    // While recording, the `TextEditor` is swapped for a scrolling `Text` that
+    // follows the transcript to its end. `expandCompose(dictate:)` and
+    // `toggleExpandedDictation()` both drop focus before dictation starts, so
+    // there's no caret to preserve here — but `TextEditor` also doesn't
+    // auto-scroll to keep newly-appended text visible, which is exactly the
+    // long-dictation case this state needs to handle. Typing (see
+    // `DailyChatView`'s `.onChange(of: vm.draft)`) stops any live recording,
+    // so the two never fight over the same field.
     private var editor: some View {
         ZStack(alignment: .topLeading) {
             if draft.isEmpty {
@@ -1452,16 +1601,35 @@ private struct ExpandedComposeView: View {
                     .padding(.top, 8)
                     .allowsHitTesting(false)
             }
-            TextEditor(text: $draft)
-                .font(.system(size: 17, design: .rounded))
-                .foregroundStyle(AppTheme.ink)
-                .lineSpacing(4)
-                .tint(AppTheme.terracotta)
-                .scrollContentBackground(.hidden)
-                .scrollDismissesKeyboard(.never)
-                .padding(.horizontal, 15)
-                .focused(focused)
-                .accessibilityIdentifier("chat.editor")
+            if isRecording {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(spacing: 0) {
+                            Text(draft)
+                                .font(.system(size: 17, design: .rounded))
+                                .foregroundStyle(AppTheme.ink)
+                                .lineSpacing(4)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Color.clear.frame(height: 1).id("dictation-bottom")
+                        }
+                        .padding(.horizontal, 15)
+                    }
+                    .onChange(of: draft) { _, _ in
+                        proxy.scrollTo("dictation-bottom", anchor: .bottom)
+                    }
+                }
+            } else {
+                TextEditor(text: $draft)
+                    .font(.system(size: 17, design: .rounded))
+                    .foregroundStyle(AppTheme.ink)
+                    .lineSpacing(4)
+                    .tint(AppTheme.terracotta)
+                    .scrollContentBackground(.hidden)
+                    .scrollDismissesKeyboard(.never)
+                    .padding(.horizontal, 15)
+                    .focused(focused)
+                    .accessibilityIdentifier("chat.editor")
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(.top, 8)
@@ -1635,9 +1803,9 @@ private struct WovenEntryPreviewSheet: View {
 
 // MARK: - Thought Journal education (one-time)
 //
-// Shown the first time the user opens a chat (outside onboarding — see
-// `isOnboarding`). Plain, warm language answering the two questions a
-// first-timer has: what is this, and how does it help? No clinical vocabulary.
+// Shown the first time the user opens a chat. Plain, warm language answering the
+// two questions a first-timer has: what is this, and how does it help? No
+// clinical vocabulary.
 // Persistence of the "seen" flag lives in `ThoughtJournalEducation` below.
 
 private struct ThoughtJournalEducationView: View {

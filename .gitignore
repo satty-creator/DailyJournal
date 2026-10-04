@@ -56,3 +56,14 @@ ui-debug.log
 
 # Local scratch / marketing assets, not project source
 Claude outputs/
+
+# Editor/backup leftovers
+*.bak
+
+# Local HTML design previews (not shipped; `public/` is the real hosting dir)
+/*preview*.html
+/spilr_first_run.html
+
+# Strategy decks / docs — kept locally, not tracked (move to Drive)
+Rosebud_Teardown_Spilr.pptx
+Spilr_Product_AI_Strategy.pdf

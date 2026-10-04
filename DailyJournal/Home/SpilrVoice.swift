@@ -227,12 +227,23 @@ enum SpilrVoice {
         let goals = OnboardingIntent.selectedGoals
         guard !goals.isEmpty else { return "" }
         let goalLine = goals.map(\.rawValue).sorted().joined(separator: ", ")
-        return """
+        var block = """
 
         ### WHY THIS PERSON IS HERE — from their own onboarding choice. Use it to shape what you ask and how, never repeat it back to them verbatim.
         They said they came here to: \(goalLine).
         Preferred register: \(OnboardingIntent.tone.promptDescription).
         """
+        // Optional — only set once the struggle step is answered (not everyone
+        // who completed the original 3-tap flow before this step existed has one).
+        if let struggle = OnboardingIntent.struggle {
+            var line = "Right now what feels hardest: \(struggle)"
+            if let detail = OnboardingIntent.struggleDetail?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !detail.isEmpty {
+                line += " — in their own words: \"\(detail)\""
+            }
+            block += "\n\(line)."
+        }
+        return block
     }
 
     // MARK: - The personality (shared system prompt fragment)

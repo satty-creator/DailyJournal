@@ -272,6 +272,13 @@ final class AuthService {
 
     /// Reloads the current user from the server and returns whether their email
     /// is now verified. Used after the user taps the link in their inbox.
+    ///
+    /// `user.reload()` only refreshes the `User` object (so `isEmailVerified`
+    /// flips here), not the cached ID token JWT — that keeps its stale
+    /// `email_verified: false` claim for up to an hour otherwise. Every
+    /// server-side check that reads the claim (owner status, AI access) would
+    /// see the old value until the token's natural refresh, so force one the
+    /// moment verification lands.
     @discardableResult
     func reloadEmailVerified() async throws -> Bool {
         guard let user = Auth.auth().currentUser else { return false }
@@ -279,6 +286,9 @@ final class AuthService {
             try await user.reload()
         } catch let error as NSError {
             throw mapFirebaseError(error)
+        }
+        if user.isEmailVerified {
+            _ = try? await user.getIDToken(forcingRefresh: true)
         }
         return user.isEmailVerified
     }

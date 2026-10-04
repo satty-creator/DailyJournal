@@ -11,15 +11,25 @@
 //  published frameworks — see `TemplateContent.swift` for the content and
 //  `TemplateEvidence` for what's actually cited.
 //
-//  Integrity note: only `after-a-hard-conversation`, `untangle-a-decision`,
-//  `gratitude-gently` and `best-possible-self` carry a `.clinical` evidence
-//  claim, each backed by a real source in `TemplateEvidenceLibrary` (the
-//  Best Possible Self citation was checked directly against the PubMed
-//  abstract, not just carried over from the source prototype — see
-//  `TemplateEvidenceLibrary.bestPossibleSelfMetaAnalysis`). `morning-pages`
-//  and `wind-down` are `.practice` — no clinical trial supports either
-//  format, and their copy says so. Never move a template to `.clinical`
-//  without a source to put in its `TemplateEvidence`.
+//  Integrity note: only `work-through-a-thought`, `after-a-hard-conversation`,
+//  `untangle-a-decision`, `gratitude-gently` and `best-possible-self` carry a
+//  `.clinical` evidence claim, each backed by a real source in
+//  `TemplateEvidenceLibrary` (the Best Possible Self citation was checked
+//  directly against the PubMed abstract, not just carried over from the
+//  source prototype — see `TemplateEvidenceLibrary.bestPossibleSelfMetaAnalysis`).
+//  `morning-pages` and `wind-down` are `.practice` — no clinical trial
+//  supports either format, and their copy says so. Never move a template to
+//  `.clinical` without a source to put in its `TemplateEvidence`.
+//
+//  `work-through-a-thought` is the full NHS CBT thought record (situation,
+//  thoughts, feelings, evidence for/against, alternative thought, feelings
+//  after), plus a thinking-traps step, a body/behaviour pair from the
+//  five-areas model, and an optional box-breathing pause
+//  (`Components/BoxBreathingView`) — none of which borrow copy or design from
+//  any other app; only the underlying CBT structure, which is public (NHS,
+//  "five areas" model). `untangle-a-decision` and `onboarding-first-entry`
+//  gained `emotions`/`traps` steps for the same reason: both already cited
+//  `nhsThoughtRecord`'s "feelings" step without ever asking for feelings.
 //
 
 import SwiftUI
@@ -35,10 +45,24 @@ struct TemplateStep: Identifiable, Hashable {
     enum Kind: Hashable {
         case text(placeholder: String)
         case choice(options: [String])
-        /// A 0–10 self-rating, rendered as six buttons (0,2,4,6,8,10) like the
-        /// prototype. `role` is how the review screen finds the before/after
-        /// pair to build a delta — see `JournalTemplate.scaleDelta`.
-        case scale(role: ScaleRole)
+        /// Multi-select chips — any number of `options` can be on at once.
+        /// Used for emotion and thinking-trap steps, where real answers are
+        /// rarely just one word. `allowsOther` adds a free-text chip at the
+        /// end that opens a one-line text field instead of toggling on its own.
+        case multiChoice(options: [String], allowsOther: Bool = false)
+        /// A 0–10 self-rating. `role` is how the review screen finds the
+        /// before/after pair to build a delta — see `JournalTemplate.scaleDelta`.
+        /// `values` is which numbers get their own button — every existing
+        /// template uses the original six-button prototype spacing
+        /// (0,2,4,6,8,10); onboarding's guided first entry uses the full
+        /// 0...10 range instead (see `ZeroToTenScale`).
+        case scale(role: ScaleRole, values: [Int] = [0, 2, 4, 6, 8, 10])
+        /// A skippable box-breathing pause, `cycles` times around a 4-4-4-4
+        /// inhale/hold/exhale/hold square (see `Components/BoxBreathingView`).
+        /// Stores no real answer — `TemplateRunnerView` records `.choice("done")`
+        /// or `.choice("skipped")` purely so `currentIsAnswered` can tell them
+        /// apart; neither value is ever shown or woven.
+        case breathing(cycles: Int = 4)
     }
 
     /// Stable key into `TemplateRunnerViewModel.answers` — NOT the array index,
@@ -55,14 +79,29 @@ struct TemplateStep: Identifiable, Hashable {
     /// citation shown once on the review screen. `nil` means the step shows no
     /// card, even on a `.clinical` template; most steps leave this unset.
     let whyThis: String?
+    /// One-line definition per `multiChoice` option, shown under a chip once
+    /// it's selected — e.g. what "Mind reading" means. Keyed by the option's
+    /// exact string. Empty for steps that don't need it (emotions are
+    /// self-explanatory; thinking traps aren't).
+    let chipHelp: [String: String]
+    /// Sample answers shown under a `.text` step's helper — a quiet "FOR
+    /// EXAMPLE" block that shows what a real answer looks like without putting
+    /// words in the user's mouth. Empty = no examples (most steps). Only the
+    /// text steps use it; chips/scale/breathing are self-evident.
+    let examples: [String]
 
-    init(id: String, label: String, question: String, helper: String, kind: Kind, whyThis: String? = nil) {
+    init(
+        id: String, label: String, question: String, helper: String, kind: Kind,
+        whyThis: String? = nil, chipHelp: [String: String] = [:], examples: [String] = []
+    ) {
         self.id = id
         self.label = label
         self.question = question
         self.helper = helper
         self.kind = kind
         self.whyThis = whyThis
+        self.chipHelp = chipHelp
+        self.examples = examples
     }
 }
 
@@ -78,20 +117,24 @@ enum TemplateAnswer: Equatable, Codable {
     case text(String)
     case choice(String)
     case scale(Int)
+    /// Multi-select chip picks — order is preserve­d as tapped, which is also
+    /// the order the weave prompt and `localWeaveTemplateEntry` see them in.
+    case choices([String])
 
     private enum CodingKeys: String, CodingKey {
         case kind, value
     }
     private enum Kind: String, Codable {
-        case text, choice, scale
+        case text, choice, scale, choices
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         switch try container.decode(Kind.self, forKey: .kind) {
-        case .text:   self = .text(try container.decode(String.self, forKey: .value))
-        case .choice: self = .choice(try container.decode(String.self, forKey: .value))
-        case .scale:  self = .scale(try container.decode(Int.self, forKey: .value))
+        case .text:    self = .text(try container.decode(String.self, forKey: .value))
+        case .choice:  self = .choice(try container.decode(String.self, forKey: .value))
+        case .scale:   self = .scale(try container.decode(Int.self, forKey: .value))
+        case .choices: self = .choices(try container.decode([String].self, forKey: .value))
         }
     }
 
@@ -107,6 +150,9 @@ enum TemplateAnswer: Equatable, Codable {
         case .scale(let n):
             try container.encode(Kind.scale, forKey: .kind)
             try container.encode(n, forKey: .value)
+        case .choices(let items):
+            try container.encode(Kind.choices, forKey: .kind)
+            try container.encode(items, forKey: .value)
         }
     }
 
@@ -114,6 +160,7 @@ enum TemplateAnswer: Equatable, Codable {
         switch self {
         case .text(let s), .choice(let s): return s
         case .scale(let n):                return "\(n)"
+        case .choices(let items):          return items.joined(separator: ", ")
         }
     }
 
@@ -123,11 +170,18 @@ enum TemplateAnswer: Equatable, Codable {
             return !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         case .choice, .scale:
             return true
+        case .choices(let items):
+            return !items.isEmpty
         }
     }
 
     var scaleValue: Int? {
         if case .scale(let n) = self { return n }
+        return nil
+    }
+
+    var choiceValues: [String]? {
+        if case .choices(let items) = self { return items }
         return nil
     }
 }
@@ -193,7 +247,7 @@ struct JournalTemplate: Identifiable {
 
     private func scaleStep(_ role: TemplateStep.ScaleRole) -> TemplateStep? {
         steps.first {
-            if case .scale(let r) = $0.kind { return r == role }
+            if case .scale(let r, _) = $0.kind { return r == role }
             return false
         }
     }
@@ -210,13 +264,24 @@ extension JournalTemplate {
     /// new (see `TemplateContent.swift`).
     static let all: [JournalTemplate] = [
         JournalTemplate(
+            id: "work-through-a-thought",
+            title: "Work through a thought",
+            blurb: "Situation, feelings, thinking traps, evidence \u{2014} the whole thought record.",
+            minutes: 8,
+            tags: ["clarity", "calm"],
+            accent: \.lav,
+            isFeatured: true,
+            steps: TemplateContent.workThroughAThought,
+            evidence: TemplateEvidenceLibrary.nhsThoughtRecord
+        ),
+        JournalTemplate(
             id: "after-a-hard-conversation",
             title: "After a hard conversation",
             blurb: "Process what was said \u{2014} and what wasn\u{2019}t.",
             minutes: 5,
             tags: ["clarity"],
             accent: \.rose,
-            isFeatured: true,
+            isFeatured: false,
             steps: TemplateContent.afterAHardConversation,
             evidence: TemplateEvidenceLibrary.neffSelfCompassion
         ),
@@ -246,7 +311,7 @@ extension JournalTemplate {
             id: "untangle-a-decision",
             title: "Untangle a decision",
             blurb: "Weigh a choice you keep circling.",
-            minutes: 7,
+            minutes: 8,
             tags: ["clarity"],
             accent: \.lav,
             isFeatured: false,
@@ -276,4 +341,28 @@ extension JournalTemplate {
             evidence: TemplateEvidenceLibrary.bestPossibleSelfMetaAnalysis
         )
     ]
+
+    /// Onboarding's guided first entry — the same NHS thought-record framework
+    /// as "Untangle a decision", reworded to whatever's weighing on the person
+    /// rather than a decision specifically. `openingQuestion` is a fixed line
+    /// (`OnboardingView.openingQuestion`) passed in rather than hardcoded
+    /// here, so this function still takes a parameter even though every
+    /// caller today passes the same string — it used to be AI-written and
+    /// per-user; see that constant's doc comment for why that was dropped.
+    ///
+    /// Deliberately NOT in `all` above: it never appears in the templates
+    /// gallery, only run once from `OnboardingView`.
+    static func onboardingFirstEntry(openingQuestion: String) -> JournalTemplate {
+        JournalTemplate(
+            id: "onboarding-first-entry",
+            title: "Your first entry",
+            blurb: "A short guided look at what's on your mind.",
+            minutes: 6,
+            tags: ["clarity"],
+            accent: \.lav,
+            isFeatured: false,
+            steps: TemplateContent.onboardingFirstEntry(openingQuestion: openingQuestion),
+            evidence: TemplateEvidenceLibrary.nhsThoughtRecord
+        )
+    }
 }

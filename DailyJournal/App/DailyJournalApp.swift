@@ -72,6 +72,7 @@ struct DailyJournalApp: App {
     @StateObject private var authViewModel = AuthViewModel()
     @StateObject private var themeManager = ThemeManager.shared
     @StateObject private var sessionManager = SessionManager.shared
+    @Environment(\.scenePhase) private var scenePhase
 
     init() {
         AppCheck.setAppCheckProviderFactory(NinetyAppCheckProviderFactory())
@@ -123,6 +124,21 @@ struct DailyJournalApp: App {
                     // Completes the Google Sign-In redirect — required for the
                     // GIDSignIn flow started in AuthService to ever return.
                     GIDSignIn.sharedInstance.handle(url)
+                }
+                .onChange(of: scenePhase) { _, phase in
+                    // Pre-warm the entry-analysis backfill when the app comes to
+                    // the foreground, so analyses that were skipped at save time
+                    // (AI unavailable / failed) get reconciled and propagate to
+                    // the server BEFORE the user opens Mirror — letting the first
+                    // Mirror open mine and unlock immediately rather than racing
+                    // an in-flight write. Self-gated (AI availability + a 10-min
+                    // cooldown), so firing on every foreground is cheap.
+                    guard phase == .active,
+                          let uid = authViewModel.currentUser?.id, !uid.isEmpty
+                    else { return }
+                    Task.detached(priority: .utility) {
+                        await EntryAnalysisBackfillService.shared.run(for: uid)
+                    }
                 }
         }
     }

@@ -19,7 +19,7 @@ enum CollageTileKind {
     case stone
 
     static func kind(for entry: JournalEntry) -> CollageTileKind {
-        if entry.photoURL != nil { return .photo }
+        if entry.photoURL != nil || PhotoCacheService.shared.hasImage(forEntryId: entry.id) { return .photo }
         if entry.sessionType == .dailyChat || entry.sessionType == .cbtReframe || entry.sessionType == .template { return .quote }
         if entry.wordCount < 20 { return .stone }
         if entry.wordCount >= 50 && entry.mood != nil { return .mood }
@@ -145,18 +145,25 @@ struct CollageTileView: View {
 
     private var photoTile: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if let urlString = entry.photoURL, let url = URL(string: urlString) {
-                AsyncImage(url: url) { phase in
-                    switch phase {
-                    case .success(let image): image.resizable().scaledToFill()
-                    case .failure:            AppTheme.paperWarm
-                    default:                  AppTheme.paperWarm
+            Group {
+                if let localImage = PhotoCacheService.shared.image(forEntryId: entry.id) {
+                    // Local copy — shown instantly, before/without a finished upload.
+                    Image(uiImage: localImage).resizable().scaledToFill()
+                } else if let urlString = entry.photoURL, let url = URL(string: urlString) {
+                    AsyncImage(url: url) { phase in
+                        switch phase {
+                        case .success(let image): image.resizable().scaledToFill()
+                        case .failure:            AppTheme.paperWarm
+                        default:                  AppTheme.paperWarm
+                        }
                     }
+                } else {
+                    AppTheme.paperWarm
                 }
-                .frame(height: 112)
-                .frame(maxWidth: .infinity)
-                .clipped()
             }
+            .frame(height: 112)
+            .frame(maxWidth: .infinity)
+            .clipped()
             VStack(alignment: .leading, spacing: 6) {
                 Text(entry.shortFormattedDate.uppercased())
                     .font(AppTheme.mono(size: 10))

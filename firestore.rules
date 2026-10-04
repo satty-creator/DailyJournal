@@ -2,12 +2,6 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Rate-limit counters — written only by the geminiProxy Cloud Function via
-    // Admin SDK. Clients must never read or write these directly.
-    match /rateLimits/{uid} {
-      allow read, write: if false;
-    }
-
     // AI entitlement + usage budget (ai-cost-audit-2026-09-06.md Phase 4/5).
     // Written only by geminiProxy (usage counters) and the RevenueCat webhook
     // (entitlement), both via the Admin SDK.
@@ -17,8 +11,8 @@ service cloud.firestore {
     // own doc and everything beneath it, so an `entitlement` field living
     // there would be client-writable — any signed-in user could set
     // themselves to "paid". Keeping this collection outside that recursive
-    // rule, alongside `rateLimits` above, is what makes it a real
-    // enforcement boundary instead of a client-side suggestion.
+    // rule is what makes it a real enforcement boundary instead of a
+    // client-side suggestion.
     match /aiUsage/{uid} {
       allow read, write: if false;
     }
@@ -88,7 +82,6 @@ service cloud.firestore {
       match /pushTokens/{docId}          { allow write: if isOwner(userId); }
       match /rollups/{docId}             { allow write: if isOwner(userId); }
       match /chatSessions/{docId}        { allow write: if isOwner(userId); }
-      match /patternCallbacks/{docId}    { allow write: if isOwner(userId); }
       // Retired collections. Still writable so an older client build cannot
       // start failing mid-session, and still readable/deletable so account
       // deletion keeps erasing them.

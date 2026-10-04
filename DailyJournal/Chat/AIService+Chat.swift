@@ -103,12 +103,11 @@ struct ChatSessionState: Codable, Equatable {
 
 extension AIService {
 
-    /// A warm, local-instant opener so the chat never waits on the network to start.
-    /// Opens on Step 1 of the Thought Journal flow (the trigger). This is the fallback
-    /// — `DailyChatViewModel` prefers Prompt Q's `nextQuestion` (the Person Model's own
-    /// pick for tonight's discriminating question) when one is available and passes
-    /// the safety gate; see `PersonModelChatContext` and `seedContext`.
-    static let chatOpener = "What's on your mind today? Tell me what we're working through — a worry, a task you're stuck on, a decision, or just a brain dump — and I'll follow your lead."
+    /// The warm, static opener every entry point into Daily Chat uses — the
+    /// home invitation card's headline and the chat's own first message. Local
+    /// and instant: the chat never waits on the network to start, and the
+    /// headline never poses a question the chat itself doesn't go on to ask.
+    static let chatOpener = "What's on your mind today? Tell me what we're working through: a worry, a task you're stuck on, a decision, or just a brain dump. I'll follow your lead."
 
     /// Strips the hidden Thought Journal state tags from a reply and returns the visible
     /// text plus the completion flag.
@@ -160,6 +159,15 @@ extension AIService {
                                   options: .regularExpression)
             // Collapse the blank lines the removals leave behind.
             .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
+            // The prompt tells the model never to use an em or en dash, but a lite
+            // model still slips one in sometimes — swap it for a comma rather than
+            // let it through. Requires surrounding space so a genuine hyphenated or
+            // negative-number use (rare here, but not this character anyway) is
+            // never touched.
+            .replacingOccurrences(of: #"\s*[—–]\s*"#, with: ", ", options: .regularExpression)
+            // A comma right before closing punctuation, left over from the swap
+            // above landing at the end of a sentence.
+            .replacingOccurrences(of: #",\s*([.?!])"#, with: "$1", options: .regularExpression)
 
         clean = clean.trimmingCharacters(in: .whitespacesAndNewlines)
         return (clean, complete)

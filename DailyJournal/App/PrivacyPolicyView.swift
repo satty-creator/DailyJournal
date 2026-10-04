@@ -34,7 +34,7 @@ struct PrivacyPolicyView: View {
 
     /// Update whenever the substance changes. Shown to the user so they can tell
     /// which version they read.
-    static let lastUpdated = "18 September 2026"
+    static let lastUpdated = "27 September 2026"
 
     var body: some View {
         ZStack {
@@ -94,6 +94,12 @@ struct PrivacyPolicyView: View {
                         Calendar view, and only stays in memory on your device. You can disconnect at \
                         any time from Settings, or revoke access entirely from your Google Account's \
                         permissions page.
+
+                        Spilr's use and transfer of information received from Google APIs adheres to \
+                        the Google API Services User Data Policy, including the Limited Use \
+                        requirements. We use Google Calendar data only to show your events to you in \
+                        the app. We do not transfer it to anyone, use it for advertising, or use it to \
+                        train AI models, and no person at Spilr reads it.
 
                         That is the whole list. We do not collect your contacts, your location \
                         (beyond what you've chosen to put in a connected calendar event), your \
@@ -155,7 +161,7 @@ struct PrivacyPolicyView: View {
                         recoverable — there is no restore.
 
                         If you want a copy of your data, or want specific entries removed rather than \
-                        all of them, email support@spilr.app and we will do it by hand. There is no \
+                        all of them, email support@getspilr.com and we will do it by hand. There is no \
                         self-service export in the app yet.
                         """
                     )
@@ -182,7 +188,7 @@ struct PrivacyPolicyView: View {
                     section(
                         "Contact",
                         """
-                        Questions, deletion requests, or a copy of your data: support@spilr.app.
+                        Questions, deletion requests, or a copy of your data: support@getspilr.com.
 
                         If you are in the UK or EU, journal content counts as special-category data, \
                         and you have rights of access, correction, erasure and objection. Email us and \
@@ -190,8 +196,8 @@ struct PrivacyPolicyView: View {
                         """
                     )
 
-                    Link(destination: URL(string: "mailto:support@spilr.app?subject=Privacy%20question")!) {
-                        Text("Email support@spilr.app")
+                    Link(destination: URL(string: "mailto:support@getspilr.com?subject=Privacy%20question")!) {
+                        Text("Email support@getspilr.com")
                             .font(AppTheme.mono(size: 12))
                             .foregroundStyle(AppTheme.terracotta)
                     }

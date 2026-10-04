@@ -1,6 +1,6 @@
 # Spilr — Privacy Policy
 
-**Last updated: 18 September 2026**
+**Last updated: 27 September 2026**
 
 > **Maintainers:** this is the hostable copy of the text in
 > `DailyJournal/App/PrivacyPolicyView.swift`. App Store Connect requires a publicly
@@ -46,6 +46,12 @@ This data is not stored on our servers and not sent to any AI — it's fetched l
 Google each time you open the Calendar view, and only stays in memory on your device.
 You can disconnect at any time from Settings, or revoke access entirely from your Google
 Account's permissions page.
+
+Spilr's use and transfer of information received from Google APIs adheres to the
+[Google API Services User Data Policy](https://developers.google.com/terms/api-services-user-data-policy),
+including the Limited Use requirements. We use Google Calendar data only to show your
+events to you in the app. We do not transfer it to anyone, use it for advertising, or
+use it to train AI models, and no person at Spilr reads it.
 
 That is the whole list. We do not collect your contacts, your location (beyond what
 you've chosen to put in a connected calendar event), your health data, or your activity
@@ -100,7 +106,7 @@ them, your photos, and your account itself. It is immediate and it is not recove
 there is no restore.
 
 If you want a copy of your data, or want specific entries removed rather than all of
-them, email support@spilr.app and we will do it by hand. There is no self-service export
+them, email support@getspilr.com and we will do it by hand. There is no self-service export
 in the app yet.
 
 ---
@@ -137,7 +143,7 @@ and surface a notice in the app rather than relying on you to re-read it.
 
 ## Contact
 
-Questions, deletion requests, or a copy of your data: **support@spilr.app**
+Questions, deletion requests, or a copy of your data: **support@getspilr.com**
 
 If you are in the UK or EU, journal content counts as special-category data under
 UK-GDPR / GDPR Article 9, and you have rights of access, correction, erasure and

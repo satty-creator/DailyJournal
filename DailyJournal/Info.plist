@@ -12,11 +12,31 @@
 				<string>com.googleusercontent.apps.659209406442-fu92rrpn93169af9nd8ian6loti7si13</string>
 			</array>
 		</dict>
+		<dict>
+			<!-- "Open Spilr" button on public/auth/action.html — a link back to
+			     spilr-100f7.web.app itself won't open the app (iOS doesn't treat a
+			     universal link as one when it's opened from a page on that same
+			     domain), so the page uses this custom scheme instead. -->
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>spilr</string>
+			</array>
+		</dict>
 	</array>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>CFBundleDisplayName</key>
-	<string>spilr</string>
+	<string>Spilr</string>
+	<!-- Xcode's GENERATE_INFOPLIST_FILE merge derives CFBundleName from
+	     PRODUCT_NAME (= TARGET_NAME = "DailyJournal") unless it's pinned here.
+	     CFBundleName, not CFBundleDisplayName, is what system dialogs like
+	     Google Sign-In's "X Wants to Use accounts.google.com" consent sheet
+	     read, so without this override they show "DailyJournal" instead of
+	     the app's real name. -->
+	<key>CFBundleName</key>
+	<string>Spilr</string>
 	<key>CFBundleIconName</key>
 	<string>AppIcon</string>
 	<key>CFBundleVersion</key>
@@ -24,9 +44,9 @@
 	<key>CFBundleShortVersionString</key>
 	<string>1.0</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>spilr uses your microphone so you can speak your journal entry instead of typing.</string>
+	<string>Spilr uses your microphone so you can speak your journal entry instead of typing.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>spilr transcribes your voice into text so you can journal hands-free.</string>
+	<string>Spilr transcribes your voice into text so you can journal hands-free.</string>
 	<!-- Firebase's automatic screen reporting names screens after the UIKit
 	     view controller on top. In a SwiftUI app every real screen is the same
 	     hosting controller, so the only rows it ever produced were system

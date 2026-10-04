@@ -260,11 +260,6 @@ struct HomeView: View {
     @State private var echoPendingWrite: Echo?
     @State private var echoResponse = ""
 
-    /// The starter prompt passed into the Spill write screen. Empty when
-    /// reached via the invitation card's "Blank page" chip — SpillWriteView
-    /// already handles an empty prompt by picking its own starter.
-    @State private var spillPrompt = ""
-
     // ── Templates ───────────────────────────────────────────────────────
     /// The gallery, opened by the invitation card's "Templates" chip.
     @State private var showingTemplates = false
@@ -280,6 +275,14 @@ struct HomeView: View {
     /// talked once, every later tap on the card's primary action reopened the
     /// chat with the mic already hot.
     @State private var startChatWithDictation = false
+    /// Set when closing Daily Chat auto-saves an unreviewed conversation (see
+    /// `DailyChatView.closeChat()`) — drives the "Saved to your Journal · Undo"
+    /// toast. `autoSaveUndo` is `DailyChatViewModel.undoAutoSave` bound to that
+    /// entry; `autoSaveToastToken` changes on every new toast so a stale
+    /// auto-hide `Task` from a previous one never closes the new one early.
+    @State private var autoSavedEntry: JournalEntry?
+    @State private var autoSaveUndo: (() -> Void)?
+    @State private var autoSaveToastToken: UUID?
     /// The template whose guided runner is currently presented. `nil` = no
     /// runner on screen. Set from the gallery sheet's `onDismiss`;
     /// `JournalTemplate`'s `Identifiable` id lets this drive
@@ -347,6 +350,7 @@ struct HomeView: View {
                                 .transition(.move(edge: .top).combined(with: .opacity))
                         }
                         heroSection
+                        workThroughCard
                         weekRow
                         if let entry = vm.todayEntry {
                             writtenTodayRow(entry: entry)
@@ -358,10 +362,24 @@ struct HomeView: View {
                     }
                 }
                 .refreshable { await vm.load() }
+
+                autoSaveToastOverlay
             }
             .navigationBarHidden(true)
             .task {
                 await vm.load()
+                // First-entry celebration on the FIRST entry, wherever it was
+                // written. The Home write flows below fire this from their own
+                // onDismiss/onSave, but an entry written inside the onboarding
+                // chat lands the user straight on Home with no such callback —
+                // so the celebration never fired for it. Running the same
+                // guarded check here on tab appearance covers that path too.
+                // The guards (`!firstEntryCelebrationShown`, exactly one entry,
+                // `celebrationEntry == nil`) plus the flag persisted on dismiss
+                // keep it strictly once-only, so the Home-write callbacks
+                // remain harmless duplicates.
+                await checkFirstEntryFast()
+                checkFirstEntry()
                 // Push permission is NEVER requested cold. We only ask once the
                 // user already has at least one entry — asking a brand-new user
                 // before they've written anything tanks the opt-in rate. The
@@ -384,7 +402,7 @@ struct HomeView: View {
                 }
             }) {
                 // The Spilr-style write screen ("forget 90" — no countdown).
-                SpillWriteView(userId: vm.userId, prompt: spillPrompt) {
+                SpillWriteView(userId: vm.userId) {
                     Task {
                         async let fast: () = checkFirstEntryFast()
                         async let reload: () = vm.load()
@@ -402,14 +420,23 @@ struct HomeView: View {
                 }
             }) {
                 // Day One-style interactive journaling — chat, then weave an entry.
-                DailyChatView(userId: vm.userId, startWithDictation: startChatWithDictation) {
-                    Task {
-                        async let fast: () = checkFirstEntryFast()
-                        async let reload: () = vm.load()
-                        await (fast, reload)
-                        checkFirstEntry()
+                DailyChatView(
+                    userId: vm.userId,
+                    startWithDictation: startChatWithDictation,
+                    onSave: {
+                        Task {
+                            async let fast: () = checkFirstEntryFast()
+                            async let reload: () = vm.load()
+                            await (fast, reload)
+                            checkFirstEntry()
+                        }
+                    },
+                    onAutoSave: { entry, undo in
+                        autoSavedEntry = entry
+                        autoSaveUndo = undo
+                        autoSaveToastToken = UUID()
                     }
-                }
+                )
             }
             .sheet(isPresented: $showingTemplates, onDismiss: {
                 // A fullScreenCover can't be presented while this sheet is
@@ -552,6 +579,59 @@ struct HomeView: View {
         vm.entriesLoaded && (vm.recentEntries.isEmpty || vm.statsLoaded)
     }
 
+    // MARK: - Auto-save toast
+    //
+    // Daily Chat auto-saves a conversation when the person closes it without
+    // going through the "Save this to your Journal?" card (see
+    // `DailyChatView.closeChat()`). This is the one chance to catch a save
+    // they didn't explicitly ask for.
+    @ViewBuilder
+    private var autoSaveToastOverlay: some View {
+        if autosaveToastVisible {
+            VStack {
+                Spacer()
+                HStack(spacing: 14) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(AppTheme.terracotta)
+                    Text("Saved to your Journal")
+                        .font(AppTheme.editorialBody(size: 14))
+                        .foregroundStyle(AppTheme.ink)
+                    Spacer(minLength: 8)
+                    Button("Undo") {
+                        autoSaveUndo?()
+                        dismissAutoSaveToast()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                    .foregroundStyle(AppTheme.terracotta)
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 14)
+                .background(AppTheme.cream)
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .shadow(color: AppTheme.cardShadow, radius: 16, x: 0, y: 6)
+                .padding(.horizontal, 20)
+                .padding(.bottom, 12)
+            }
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+            .animation(.easeOut(duration: 0.25), value: autosaveToastVisible)
+            .task(id: autoSaveToastToken) {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                dismissAutoSaveToast()
+            }
+        }
+    }
+
+    private var autosaveToastVisible: Bool {
+        autoSavedEntry != nil && autoSaveToastToken != nil
+    }
+
+    private func dismissAutoSaveToast() {
+        autoSavedEntry = nil
+        autoSaveUndo = nil
+        autoSaveToastToken = nil
+    }
+
     // MARK: - Header (prototype "screen-head")
     private var headerSection: some View {
         HStack(alignment: .top) {
@@ -627,12 +707,16 @@ struct HomeView: View {
     private var invitationCard: some View {
         InvitationCardView(
             dayOne: vm.entriesLoaded ? vm.recentEntries.isEmpty : nil,
+            // Gate the chat entry points on real AI availability (signed in +
+            // consent). A consent-declined user used to open the chat composer
+            // and only hit the failure at send time; now the pill is simply gone.
+            chatAvailable: AIService.shared.isAIAvailable,
             // Reset explicitly on both chat paths. `startWithDictation` is read
             // when the cover is built, and this flag used to be set true and
             // never cleared.
             onWrite:     { startChatWithDictation = false; showingDailyChat = true },
             onSpeak:     { startChatWithDictation = true;  showingDailyChat = true },
-            onBlankPage: { spillPrompt = ""; showingTimedSession = true },
+            onBlankPage: { showingTimedSession = true },
             onTemplates: { showingTemplates = true }
         )
         .padding(.horizontal, 20)
@@ -764,6 +848,55 @@ struct HomeView: View {
         .buttonStyle(.plain)
         .padding(.horizontal, 20)
         .padding(.bottom, 14)
+    }
+
+    // MARK: - Work through a thought
+    //
+    // A direct entry point to the featured CBT thought-record template. Without
+    // it the template is two taps deep behind the invitation card's quiet
+    // "Templates" chip; this card opens the runner directly — skipping the
+    // gallery — by setting `runningTemplate`, which the existing
+    // `.fullScreenCover(item:)` already presents. The gallery chip stays as the
+    // way into the full catalog.
+    @ViewBuilder
+    private var workThroughCard: some View {
+        if let template = JournalTemplate.all.first(where: { $0.id == "work-through-a-thought" }) {
+            Button { runningTemplate = template } label: {
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: "brain.head.profile")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(AppTheme.lav)
+                        .padding(.top, 2)
+
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("GUIDED EXERCISE")
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .foregroundStyle(AppTheme.lav)
+                            .tracking(1.5)
+
+                        Text("Work through a thought")
+                            .font(AppTheme.editorialBody(size: 14))
+                            .foregroundStyle(AppTheme.ink)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        Text("Untangle what's on your mind \u{2192}")
+                            .font(.system(size: 13, weight: .bold, design: .rounded))
+                            .foregroundStyle(AppTheme.lav)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(16)
+                .background(AppTheme.lav.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(AppTheme.lav.opacity(0.25), lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 14)
+        }
     }
 
     // MARK: - Spilr noticed (bridge to Mirror)

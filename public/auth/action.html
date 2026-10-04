@@ -48,6 +48,16 @@
     color: #8A7A6E;
     line-height: 1.6;
   }
+  a.button {
+    display: none;
+    margin-top: 20px;
+    padding: 12px 28px;
+    background: #C1592E;
+    color: #FFF8F2;
+    border-radius: 999px;
+    text-decoration: none;
+    font-weight: 600;
+  }
 </style>
 </head>
 <body>
@@ -55,6 +65,10 @@
   <h1>spilr.</h1>
   <h2 id="title">Verifying your email…</h2>
   <p id="detail"></p>
+  <!-- A link to this same domain (spilr-100f7.web.app) does not open the app —
+       iOS only treats a tap on a universal link as one when it's opened from
+       OUTSIDE that domain, e.g. from Mail. A custom scheme always opens it. -->
+  <a class="button" id="openApp" href="spilr://verified">Open Spilr</a>
 </main>
 <script>
   (function () {
@@ -68,12 +82,17 @@
 
     var title = document.getElementById("title");
     var detail = document.getElementById("detail");
-    function show(t, d) { title.textContent = t; detail.textContent = d; }
+    var openApp = document.getElementById("openApp");
+    function show(t, d, showButton) {
+      title.textContent = t;
+      detail.textContent = d;
+      if (showButton) openApp.style.display = "inline-block";
+    }
 
     var code = params.get("oobCode");
     var key = params.get("apiKey");
     if (!code || !key) {
-      show("This link is incomplete", "Open the Spilr app and tap Resend email for a fresh link.");
+      show("This link is incomplete", "Open the Spilr app and tap Resend email for a fresh link.", true);
       return;
     }
 
@@ -84,9 +103,12 @@
     })
       .then(function (res) {
         if (res.ok) {
-          show("Email verified", "You're all set. Go back to the Spilr app to continue.");
+          show("Email verified", "You're all set. Tap below to go back to the Spilr app.", true);
         } else {
-          show("This link has expired", "It may already have been used. Go back to the Spilr app. If you're still asked to verify, tap Resend email.");
+          // The code may be stale rather than the address unverified — a resend
+          // issues a fresh oobCode but the address could already be confirmed.
+          // The app re-checks on open, so the button still applies here.
+          show("This link has expired", "It may already have been used. Open the app below — if it still asks you to verify, tap Resend email.", true);
         }
       })
       .catch(function () {

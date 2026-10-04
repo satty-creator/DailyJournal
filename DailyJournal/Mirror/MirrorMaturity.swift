@@ -30,16 +30,7 @@ enum MirrorMaturity: Int, Comparable {
         }
     }
 
-    var canShowDailyMirror:    Bool { self >= .first   }
     var canShowFirstSketch:    Bool { self >= .unlock  }
-
-    /// A thread needs the same thing on three different days plus a contrast
-    /// set, which is not reachable much before this (§7).
-    var canShowThreads:        Bool { self >= .unlock  }
-    /// "What follows what" needs a baseline. At 7 entries the arrows are noise
-    /// presented as signal — the exact failure in the 9 Sept screenshots.
-    var canShowLagObservations: Bool { self >= .deeper }
-    var canShowShifting:       Bool { self >= .deeper  }
 }
 
 // MARK: - Unlock ladder

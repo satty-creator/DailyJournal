@@ -46,6 +46,18 @@ final class JournalEditorViewModel: ObservableObject {
     /// brand-new entry (there's nothing to have "viewed" yet).
     var sessionTypeLabel: String? { existingEntry?.sessionType.rawValue }
 
+    /// True for an entry Daily Chat produced (`.cbtReframe`, or the retired
+    /// `.dailyChat` on an older entry) — drives `JournalEditorView`'s
+    /// "Continue with Spilr" in place of the dictation mic. Dictating INTO an
+    /// AI-woven snapshot muddies wording the person didn't write; picking the
+    /// conversation back up and weaving a second, linked entry doesn't.
+    var isFromChat: Bool {
+        switch existingEntry?.sessionType {
+        case .cbtReframe, .dailyChat: return true
+        default: return false
+        }
+    }
+
     /// The entry to render into a shareable card: the freshly-saved one if we
     /// have it, otherwise the entry being edited.
     var shareableEntry: JournalEntry? { savedEntry ?? existingEntry }

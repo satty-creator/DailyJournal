@@ -8,8 +8,8 @@
 //
 //    - Push diagnostics: permission → APNs → FCM token → Firestore, one line
 //      each, so "push isn't working" becomes "this link is broken".
-//    - Send test push: calls `sendTestPush` (owner-only server-side) and
-//      shows FCM's verdict per device token.
+//    - Send test push: calls `sendTestPush` (rate-limited to the caller's own
+//      uid server-side, not owner-only) and shows FCM's verdict per device token.
 //    - Preview paywall: owners never see it otherwise.
 //
 
@@ -141,10 +141,13 @@ struct DeveloperSection: View {
             case 200:
                 break
             case 403:
-                // sendTestPush is owner-only server-side (functions/lib/entitlement.js).
-                // Debug builds show this section to every account, so say which one.
-                let who = Auth.auth().currentUser?.email ?? "this account"
-                testPushResult = "\(who) isn\u{2019}t an owner account, so the server won\u{2019}t send to it. Sign in as an owner \u{2014} or copy the FCM token above and use Firebase \u{2192} Messaging \u{2192} Send test message."
+                // sendTestPush now rejects only an anonymous sign-in — any real
+                // account can test its own push setup.
+                testPushResult = "Sign in with a real account (not a guest) to send a test push."
+                return
+            case 429:
+                // Per-uid rate limit server-side (functions/index.js, TEST_PUSH_MIN_GAP_MS).
+                testPushResult = "Sent one too recently \u{2014} wait a few seconds and try again."
                 return
             case 404:
                 testPushResult = "sendTestPush isn\u{2019}t deployed yet \u{2014} run firebase deploy --only functions."

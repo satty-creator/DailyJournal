@@ -17,35 +17,12 @@ final class SelfModelViewModel: ObservableObject {
     @Published var corrections: [ProfileCorrection] = []
     @Published var showCorrectionSheet = false
     @Published var selectedHypothesisId: String? = nil
-    @Published var narrative: MirrorNarrative? = nil
 
     var userId: String
 
     init(userId: String, selfModel: SelfModel) {
         self.userId = userId
         self.selfModel = selfModel
-    }
-
-    /// Loads a PREVIOUSLY generated narrative, if one exists. Read-only.
-    ///
-    /// The generation half is gone (Mirror v3 §5.5, Week 6). This was the last
-    /// client-side LLM call on the whole Mirror surface — a third prose writer
-    /// over the same hypotheses the server already writes cards and the weekly
-    /// letter from, with no lint on its output beyond a banned-term check, and
-    /// it ran on tab open. The weekly letter replaces it with a DATED artefact
-    /// built on counted facts plus exactly one observation, which is both
-    /// better grounded and archived.
-    ///
-    /// Existing narratives keep rendering until they age out, so nobody loses
-    /// a paragraph they had yesterday.
-    func loadNarrative() async {
-        guard let snap = try? await Firestore.firestore()
-            .collection("users").document(userId)
-            .collection("selfModel").document("narrative")
-            .getDocument(),
-              snap.exists, let data = snap.data()
-        else { return }
-        narrative = MirrorNarrative(from: data)
     }
 
     /// The ONLY producer of `UserHypothesisStatus` in the app, and therefore the
@@ -155,13 +132,55 @@ struct SelfModelView: View {
     /// banner regardless of `weeklyLetter`.
     private let onOpenLetter: (() -> Void)?
 
-    init(userId: String, selfModel: SelfModel, onAsk: (() -> Void)? = nil,
-         weeklyLetter: MirrorLetter? = nil, onOpenLetter: (() -> Void)? = nil) {
+    /// Onboarding baseline + before/after ratings — `MirrorView` owns loading
+    /// them (`MoodLogService`). Empty for a host that doesn't pass any
+    /// (previews, any future host); `MoodTrendCard` itself hides below 2
+    /// points regardless.
+    private let moodPoints: [MoodLogPoint]
+
+    /// The user's real entry count, passed from the Mirror tab. Drives the
+    /// early "First observations" stage (3–6 entries): before 7, nothing has
+    /// recurred across 3 distinct entries yet, so the profile's `timesSeen >= 3`
+    /// sections are empty and we render the looser observation section instead.
+    private let totalEntries: Int
+
+    /// The 3-to-6-entry window where the Mirror shows "First observations"
+    /// rather than the recurrence-gated profile sections. Below 3 the model has
+    /// `version == 0` and the empty state shows; at 7+ the real profile sections
+    /// take over.
+    private var isEarlyObservationStage: Bool { totalEntries < 7 }
+
+    init(userId: String, selfModel: SelfModel, totalEntries: Int = 0,
+         onAsk: (() -> Void)? = nil,
+         weeklyLetter: MirrorLetter? = nil, onOpenLetter: (() -> Void)? = nil,
+         moodPoints: [MoodLogPoint] = []) {
         incoming = selfModel
+        self.totalEntries = totalEntries
         self.onAsk = onAsk
         self.weeklyLetter = weeklyLetter
         self.onOpenLetter = onOpenLetter
+        self.moodPoints = moodPoints
         _vm = StateObject(wrappedValue: SelfModelViewModel(userId: userId, selfModel: selfModel))
+    }
+
+    /// The emerging items for the early "First observations" section — pulled
+    /// from the same server-mined hypothesis buckets the profile sections use,
+    /// but surfaced with the looser `isObservationSurfaceable` gate (no
+    /// `timesSeen >= 3` floor). Capped and ranked by confidence so the section
+    /// is "one thing at a time", never a wall of one-off hunches. Returns the
+    /// top 3.
+    private var earlyObservations: [SelfModelHypothesis] {
+        let protectiveAsHyp = vm.selfModel.protectiveStrategies.map { $0.asHypothesis }
+        let pool = vm.selfModel.coreRules
+            + protectiveAsHyp
+            + vm.selfModel.whatHelps
+            + vm.selfModel.values
+            + vm.selfModel.absences
+        return pool
+            .filter { $0.isObservationSurfaceable }
+            .sorted { $0.confidence > $1.confidence }
+            .prefix(3)
+            .map { $0 }
     }
 
     var body: some View {
@@ -187,25 +206,37 @@ struct SelfModelView: View {
                             WeeklyLetterBanner(onTap: onOpenLetter)
                         }
 
+                        if moodPoints.count >= 2 {
+                            MoodTrendCard(points: moodPoints)
+                        }
+
                         // The empty state lives INSIDE the scroll rather than
                         // beside it, so an account whose profile hasn't been
                         // mined yet still gets the Ask card above "Still
                         // learning" instead of losing it entirely.
                         if vm.selfModel.version == 0 {
                             emptyState
+                        } else if isEarlyObservationStage {
+                            // 3–6 entries: the "observations" rung of the unlock
+                            // ladder. The recurrence-gated profile sections below
+                            // are all empty this early (nothing has been seen on
+                            // 3 distinct entries yet), so render the looser
+                            // First-observations section built from the same
+                            // mined hypotheses. Firm, not hedged — but honest
+                            // that these are still forming.
+                            maturityBanner
+                            if earlyObservations.isEmpty {
+                                earlyObservationsEmptyState
+                            } else {
+                                firstObservationsSection
+                            }
                         } else {
                             maturityBanner
-                            if let narrative = vm.narrative {
-                                narrativeHeader(narrative)
-                            }
                             if !vm.selfModel.coreRules.filter { $0.isActive && $0.isProfileSurfaceable }.isEmpty {
                                 rulesSection
                             }
                             if !vm.selfModel.protectiveStrategies.filter { $0.isActive && $0.asHypothesis.isProfileSurfaceable }.isEmpty {
                                 protectiveSection
-                            }
-                            if !vm.selfModel.innerParts.filter({ $0.confidence > 0.3 }).isEmpty {
-                                innerPartsSection
                             }
                             if !vm.selfModel.whatHelps.filter { $0.isActive && $0.isProfileSurfaceable }.isEmpty {
                                 whatHelpsSection
@@ -264,7 +295,6 @@ struct SelfModelView: View {
                 vm.selfModel = incoming
             }
             .task {
-                await vm.loadNarrative()
                 AnalyticsManager.shared.logEvent(.mirrorHypothesisViewed)
             }
         }
@@ -293,6 +323,44 @@ struct SelfModelView: View {
         // ScrollView; inside one it would collapse to its intrinsic height and
         // sit under the nav bar. A minimum height keeps it visually centred.
         .frame(maxWidth: .infinity, minHeight: 420)
+    }
+
+    // MARK: - First observations (3–6 entries)
+
+    /// The 3-entry unlock. These come from the SAME server-mined hypotheses the
+    /// profile sections use — never a local template — but surfaced before the
+    /// `timesSeen >= 3` recurrence floor, because at this stage nothing has
+    /// recurred yet and that floor is what left the "unlock" showing an empty
+    /// screen. Reuses `hypothesisCard` so the confirm/correct actions and
+    /// evidence chips are identical to the mature profile; the eyebrow and
+    /// section copy are what mark these as early reads rather than settled
+    /// patterns.
+    private var firstObservationsSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            sectionLabel("First observations")
+            ForEach(earlyObservations) { h in
+                hypothesisCard(for: h, eyebrow: "early observation")
+            }
+        }
+    }
+
+    /// Shown at the early stage when the model exists but nothing cleared even
+    /// the loose observation gate — a mine that ran and found nothing yet.
+    /// Deliberately forward-looking: it must NOT repeat the mature screen's
+    /// "shows up on three different entries" line, which reads as a broken
+    /// promise to someone who just hit the 3-entry unlock.
+    private var earlyObservationsEmptyState: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("The picture is still forming")
+                .font(AppTheme.editorialDisplay(size: 18, weight: .semibold))
+                .foregroundStyle(AppTheme.ink)
+            Text("Spilr has read your entries and is holding its first reads lightly. A couple more and they sharpen into something worth showing.")
+                .font(AppTheme.editorialBody(size: 14))
+                .foregroundStyle(AppTheme.inkSoft)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .softCard(cornerRadius: 22, padding: 18)
     }
 
     // MARK: - Maturity banner
@@ -341,50 +409,6 @@ struct SelfModelView: View {
         .frame(width: 44, height: 44)
     }
 
-    // MARK: - Narrative header ("The Story So Far")
-
-    private func narrativeHeader(_ narrative: MirrorNarrative) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("the story so far")
-                .font(AppTheme.mono(size: 10))
-                .foregroundStyle(AppTheme.inkSoft)
-                .tracking(1.2)
-                .textCase(.uppercase)
-
-            Text(narrative.narrative)
-                .font(AppTheme.editorialBody(size: 15))
-                .foregroundStyle(AppTheme.ink)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if !narrative.shifting.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("what's shifting")
-                        .font(AppTheme.mono(size: 9))
-                        .foregroundStyle(AppTheme.inkSoft)
-                        .tracking(1)
-                        .textCase(.uppercase)
-                    ForEach(Array(narrative.shifting.prefix(3).enumerated()), id: \.offset) { _, shift in
-                        HStack(spacing: 8) {
-                            Text(shift.direction == .growing ? "\u{2197}" : "\u{2198}")
-                                .font(.system(size: 14))
-                            Text(shift.signal)
-                                .font(.system(size: 13, weight: .semibold, design: .rounded))
-                                .foregroundStyle(AppTheme.ink)
-                        }
-                    }
-                }
-            }
-
-            if let question = narrative.openQuestion, !question.isEmpty {
-                Text(question)
-                    .font(AppTheme.editorialBody(size: 13).italic())
-                    .foregroundStyle(AppTheme.inkSoft)
-                    .padding(.top, 4)
-            }
-        }
-        .softCard(cornerRadius: 22, padding: 18)
-    }
-
     // MARK: - Rules section
 
     private var rulesSection: some View {
@@ -403,17 +427,6 @@ struct SelfModelView: View {
             sectionLabel("What you do when it gets hard")
             ForEach(vm.selfModel.protectiveStrategies.filter { $0.isActive && $0.asHypothesis.isProfileSurfaceable }) { h in
                 protectiveCard(for: h)
-            }
-        }
-    }
-
-    // MARK: - Inner parts section
-
-    private var innerPartsSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            sectionLabel("Parts that show up")
-            ForEach(vm.selfModel.innerParts.filter { $0.confidence > 0.3 }) { part in
-                innerPartCard(for: part)
             }
         }
     }
@@ -494,7 +507,7 @@ struct SelfModelView: View {
             Text("Nothing here yet")
                 .font(AppTheme.editorialDisplay(size: 18, weight: .semibold))
                 .foregroundStyle(AppTheme.ink)
-            Text("This fills in when something shows up on three different days and holds up when Spilr checks it against your other entries.")
+            Text("This fills in when something shows up on three different entries.")
                 .font(AppTheme.editorialBody(size: 14))
                 .foregroundStyle(AppTheme.inkSoft)
                 .fixedSize(horizontal: false, vertical: true)
@@ -658,57 +671,6 @@ struct SelfModelView: View {
             metaChips(timesSeen: h.timesSeen, lastSeenAt: h.lastSeenAt, scope: h.scope.rawValue)
 
             cardActions(hypothesisId: h.id, isConfirmed: h.userStatus == .thisIsMe)
-        }
-        .softCard(cornerRadius: 24, padding: 18)
-    }
-
-    // MARK: - innerPartCard
-
-    private func innerPartCard(for part: InnerPart) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("part that shows up")
-                .font(AppTheme.mono(size: 9))
-                .foregroundStyle(AppTheme.inkSoft)
-                .tracking(1)
-                .textCase(.uppercase)
-
-            Text(part.name)
-                .font(AppTheme.editorialDisplay(size: 22, weight: .bold))
-                .foregroundStyle(AppTheme.ink)
-
-            Text(part.description)
-                .font(AppTheme.editorialBody(size: 15))
-                .foregroundStyle(AppTheme.inkSoft)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if !part.commonTriggers.isEmpty {
-                FlowLayout(spacing: 6) {
-                    ForEach(part.commonTriggers, id: \.self) { trigger in
-                        Text(trigger)
-                            .font(AppTheme.mono(size: 10))
-                            .foregroundStyle(AppTheme.ink)
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 5)
-                            .background(AppTheme.peach.opacity(0.3))
-                            .clipShape(Capsule())
-                    }
-                }
-            }
-
-            HStack(spacing: 10) {
-                Button {
-                    vm.selectedHypothesisId = part.id
-                    vm.showCorrectionSheet = true
-                } label: {
-                    Text("Correct")
-                        .font(.system(size: 13, weight: .semibold, design: .rounded))
-                        .foregroundStyle(AppTheme.ink)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 9)
-                        .overlay(Capsule().stroke(AppTheme.inkSoft.opacity(0.4), lineWidth: 1))
-                }
-                .buttonStyle(.plain)
-            }
         }
         .softCard(cornerRadius: 24, padding: 18)
     }

@@ -27,7 +27,7 @@ struct InsightShareCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("ninety.")
+                Text("Spilr.")
                     .font(AppTheme.editorialDisplay(size: 26))
                     .foregroundStyle(AppTheme.terracotta)
                     .italic()

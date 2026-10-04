@@ -38,7 +38,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
-		564DED252FC4646E00D4E7CB /* DailyJournal.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DailyJournal.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		564DED252FC4646E00D4E7CB /* Spilr.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Spilr.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		D1A7E5700000000000000001 /* DailyJournalTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DailyJournalTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		D1A7E5700000000000000002 /* DailyJournalUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DailyJournalUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -123,7 +123,7 @@
 		564DED262FC4646E00D4E7CB /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				564DED252FC4646E00D4E7CB /* DailyJournal.app */,
+				564DED252FC4646E00D4E7CB /* Spilr.app */,
 				D1A7E5700000000000000001 /* DailyJournalTests.xctest */,
 				D1A7E5700000000000000002 /* DailyJournalUITests.xctest */,
 			);
@@ -164,7 +164,7 @@
 				560920FA304F1E040074EB91 /* RevenueCatUI */,
 			);
 			productName = DailyJournal;
-			productReference = 564DED252FC4646E00D4E7CB /* DailyJournal.app */;
+			productReference = 564DED252FC4646E00D4E7CB /* Spilr.app */;
 			productType = "com.apple.product-type.application";
 		};
 		D1A7E570000000000000000B /* DailyJournalTests */ = {
@@ -485,9 +485,9 @@
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
-				MARKETING_VERSION = 1.8;
+				MARKETING_VERSION = 1.9;
 				PRODUCT_BUNDLE_IDENTIFIER = com.satakshi.DailyJournal;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_NAME = Spilr;
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SDKROOT = auto;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
@@ -524,9 +524,9 @@
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
-				MARKETING_VERSION = 1.8;
+				MARKETING_VERSION = 1.9;
 				PRODUCT_BUNDLE_IDENTIFIER = com.satakshi.DailyJournal;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_NAME = Spilr;
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SDKROOT = auto;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
@@ -553,7 +553,7 @@
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/DailyJournal.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/DailyJournal";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Spilr.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Spilr";
 			};
 			name = Debug;
 		};
@@ -573,7 +573,7 @@
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/DailyJournal.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/DailyJournal";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Spilr.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Spilr";
 			};
 			name = Release;
 		};

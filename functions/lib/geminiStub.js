@@ -34,6 +34,9 @@ function stubText(surface, wantJSON) {
       sentiment: "Reflective",
     });
   }
+  if (surface === "onboarding_opening_question") {
+    return JSON.stringify({ question: "What's actually going on with that, right now?" });
+  }
   return "{}";
 }
 

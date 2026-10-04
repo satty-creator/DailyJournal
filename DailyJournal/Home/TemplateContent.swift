@@ -5,8 +5,8 @@
 //  The step content and evidence citations behind `JournalTemplate.all`. Kept
 //  separate from `JournalTemplate.swift` so the catalog stays scannable.
 //
-//  Voice: direct and concrete, second person, the way `Mirror/MirrorSeeds.swift`
-//  talks — never the clinical register of a thought-record worksheet. A
+//  Voice: direct and concrete, second person — never the clinical register of a
+//  thought-record worksheet. A
 //  question like "What evidence supports that thought?" is what the framework
 //  is called; "What actually supports that thought?" is how Spilr asks it.
 //
@@ -24,6 +24,183 @@ import Foundation
 
 enum TemplateContent {
 
+    // MARK: - Shared chip sets (emotions, thinking traps)
+    //
+    // Pulled out once so every template that added a feelings or
+    // thinking-traps step (see the integrity note's "the feelings gap" —
+    // `untangleADecision` and `onboardingFirstEntry` cited the NHS thought
+    // record's "feelings" steps without ever asking for them) uses the exact
+    // same wording. Tapped order is preserved by `TemplateAnswer.choices`,
+    // not resorted here.
+
+    static let emotionOptions = [
+        "Anxious", "Sad", "Angry", "Ashamed", "Guilty",
+        "Hurt", "Lonely", "Overwhelmed", "Frustrated", "Embarrassed"
+    ]
+
+    /// Cognitive distortions from the standard CBT thinking-traps list (the
+    /// same handful the NHS thought record and most CBT worksheets use).
+    /// `chipHelp` below gives each one a one-line, non-clinical definition.
+    static let thinkingTrapOptions = [
+        "All-or-nothing", "Catastrophising", "Mind reading", "Fortune telling",
+        "Overgeneralising", "Should statements", "Labelling",
+        "Discounting the good", "Emotional reasoning", "Personalising", "Unfair comparison"
+    ]
+
+    static let thinkingTrapHelp: [String: String] = [
+        "All-or-nothing": "Seeing it as all good or all bad, with nothing in between.",
+        "Catastrophising": "Jumping straight to the worst possible outcome.",
+        "Mind reading": "Assuming you know what someone else is thinking about you.",
+        "Fortune telling": "Predicting how it'll go, as if it's already decided.",
+        "Overgeneralising": "Taking one thing that happened and treating it as a pattern.",
+        "Should statements": "Judging yourself or someone else against a rigid \u{201c}should.\u{201d}",
+        "Labelling": "Reducing yourself or someone else to one harsh word.",
+        "Discounting the good": "Writing off the parts that actually went fine.",
+        "Emotional reasoning": "Treating a strong feeling as proof that it's true.",
+        "Personalising": "Taking the blame for something that wasn't really about you.",
+        "Unfair comparison": "Measuring yourself against someone else's highlight reel."
+    ]
+
+    // MARK: - Work through a thought (NHS CBT thought record, full form —
+    // situation, thoughts, feelings, body, behaviour, thinking traps, evidence,
+    // balanced read, feelings after, next step. The featured template.)
+
+    static let workThroughAThought: [TemplateStep] = [
+        TemplateStep(
+            id: "situation",
+            label: "The situation",
+            question: "What happened \u{2014} just the facts?",
+            helper: "No interpretation yet. Describe it like a camera would: who, where, what was actually said or done.",
+            kind: .text(placeholder: "What happened was\u{2026}"),
+            whyThis: "This is \u{201c}situation\u{201d} in a CBT thought record \u{2014} naming what's actually in front of you, before the interpretation.",
+            examples: [
+                "My manager replied \u{201c}we need to talk\u{201d} and nothing else.",
+                "I texted a friend two days ago and still haven't heard back."
+            ]
+        ),
+        TemplateStep(
+            id: "thoughts",
+            label: "The thought driving it",
+            question: "What was the thought, word for word?",
+            helper: "The exact sentence that flashed through your head \u{2014} not the tidied-up version. Catch the sharpest one.",
+            kind: .text(placeholder: "The thought was\u{2026}"),
+            whyThis: "The thought record's \u{201c}automatic thought\u{201d} step \u{2014} the exact words, not the polished version.",
+            examples: [
+                "\u{201c}They're going to fire me.\u{201d}",
+                "\u{201c}I always ruin this.\u{201d}"
+            ]
+        ),
+        TemplateStep(
+            id: "emotions",
+            label: "What you felt",
+            question: "What did you feel?",
+            helper: "Name every feeling that showed up \u{2014} pick as many as fit.",
+            kind: .multiChoice(options: emotionOptions, allowsOther: true),
+            whyThis: "The record's \u{201c}feelings\u{201d} step \u{2014} naming the feeling, separately from the thought that came with it."
+        ),
+        TemplateStep(
+            id: "intensity-before",
+            label: "How strong, before",
+            question: "How strong is that feeling right now?",
+            helper: "0 = barely there \u{00b7} 10 = as strong as it gets.",
+            kind: .scale(role: .before)
+        ),
+        TemplateStep(
+            id: "breathe",
+            label: "A short pause",
+            question: "Before you look closer \u{2014} a minute of box breathing?",
+            helper: "Entirely optional. Skip it if you'd rather keep going.",
+            kind: .breathing()
+        ),
+        TemplateStep(
+            id: "body",
+            label: "Where you felt it",
+            question: "Where did your body feel it?",
+            helper: "Tight chest, clenched jaw, heavy stomach? The body often flags it before the mind does. Leave blank if nothing stands out.",
+            kind: .text(placeholder: "I can feel it in\u{2026}"),
+            whyThis: "From the five-areas model alongside thoughts, feelings and behaviour \u{2014} body sensations are often the earliest sign something's up.",
+            examples: [
+                "Chest went tight and my breathing got shallow.",
+                "Jaw clenched, shoulders up by my ears."
+            ]
+        ),
+        TemplateStep(
+            id: "behaviour",
+            label: "What you did",
+            question: "What did you do \u{2014} or want to do?",
+            helper: "The action or the urge, even one you resisted. Avoiding, snapping, checking your phone, going quiet \u{2014} all count.",
+            kind: .text(placeholder: "I ended up\u{2026}"),
+            whyThis: "The fifth area: behaviour. What a thought and feeling actually drove you toward.",
+            examples: [
+                "Reread the message ten times and didn't reply.",
+                "Cancelled plans and stayed in bed."
+            ]
+        ),
+        TemplateStep(
+            id: "traps",
+            label: "Thinking traps",
+            question: "Does your thought fall into any of these?",
+            helper: "Pick any that fit \u{2014} or none.",
+            kind: .multiChoice(options: thinkingTrapOptions),
+            whyThis: "Thinking traps are the thought record's shortcut for spotting a distortion before weighing the evidence.",
+            chipHelp: thinkingTrapHelp
+        ),
+        TemplateStep(
+            id: "evidence-for",
+            label: "What supports it",
+            question: "What real evidence says the thought is true?",
+            helper: "Facts only \u{2014} things you could show someone else. Not fears, not hunches.",
+            kind: .text(placeholder: "What supports it is\u{2026}"),
+            whyThis: "Facts first, before the interpretation \u{2014} this is \u{201c}evidence that supports the thought.\u{201d}",
+            examples: [
+                "He did say the project was behind.",
+                "I missed Tuesday's deadline."
+            ]
+        ),
+        TemplateStep(
+            id: "evidence-against",
+            label: "What it leaves out",
+            question: "What does the thought conveniently leave out?",
+            helper: "The facts the first read skipped \u{2014} times it went differently, things that don't fit the story.",
+            kind: .text(placeholder: "It leaves out\u{2026}"),
+            whyThis: "The record's most-skipped step: evidence the first read leaves out.",
+            examples: [
+                "My last review was strong.",
+                "She was travelling all week \u{2014} that explains the silence."
+            ]
+        ),
+        TemplateStep(
+            id: "balanced",
+            label: "A more balanced read",
+            question: "If a friend said this thought out loud, what would you tell them?",
+            helper: "Not a pep talk \u{2014} a fairer, fuller read that holds both the hard parts and the facts you just listed.",
+            kind: .text(placeholder: "A more balanced read is\u{2026}"),
+            whyThis: "The \u{201c}alternative thought\u{201d} step \u{2014} not necessarily positive, just more complete.",
+            examples: [
+                "\u{201c}One late deadline doesn't erase a good year.\u{201d}",
+                "\u{201c}Silence usually means busy, not angry.\u{201d}"
+            ]
+        ),
+        TemplateStep(
+            id: "intensity-after",
+            label: "How strong, after",
+            question: "How strong does it feel now?",
+            helper: "Same 0\u{2013}10 scale. The point is comparison, not precision.",
+            kind: .scale(role: .after)
+        ),
+        TemplateStep(
+            id: "next-step",
+            label: "One next step",
+            question: "What's one small thing you'll do next?",
+            helper: "Small enough that you'll actually do it today. One text, one five-minute task, one ask.",
+            kind: .text(placeholder: "One thing I can do is\u{2026}"),
+            examples: [
+                "Send a one-line reply instead of rehearsing a perfect one.",
+                "Ask my manager for 10 minutes to check in."
+            ]
+        )
+    ]
+
     // MARK: - After a hard conversation (Kristin Neff's self-compassion journal,
     // adapted to a conversation)
 
@@ -34,6 +211,13 @@ enum TemplateContent {
             question: "What happened in the conversation?",
             helper: "Just the facts first \u{2014} who said what.",
             kind: .text(placeholder: "The hardest part was\u{2026}")
+        ),
+        TemplateStep(
+            id: "emotions",
+            label: "What you felt",
+            question: "What did you feel afterward?",
+            helper: "Pick as many as fit.",
+            kind: .multiChoice(options: emotionOptions, allowsOther: true)
         ),
         TemplateStep(
             id: "self-talk",
@@ -85,6 +269,23 @@ enum TemplateContent {
             whyThis: "This is the thought record's \u{201c}automatic thought\u{201d} step \u{2014} write it as it actually sounds, not the tidied-up version."
         ),
         TemplateStep(
+            id: "emotions",
+            label: "What you felt",
+            question: "What did you feel about it?",
+            helper: "Pick as many as fit.",
+            kind: .multiChoice(options: emotionOptions, allowsOther: true),
+            whyThis: "The thought record's \u{201c}feelings\u{201d} step \u{2014} naming the feeling, separately from the thought that came with it."
+        ),
+        TemplateStep(
+            id: "traps",
+            label: "Thinking traps",
+            question: "Does that thought fall into any of these?",
+            helper: "Pick any that fit \u{2014} or none.",
+            kind: .multiChoice(options: thinkingTrapOptions),
+            whyThis: "Thinking traps are the thought record's shortcut for spotting a distortion before weighing the evidence.",
+            chipHelp: thinkingTrapHelp
+        ),
+        TemplateStep(
             id: "evidence-for",
             label: "What supports it",
             question: "What actually supports that thought?",
@@ -116,6 +317,89 @@ enum TemplateContent {
             kind: .scale(role: .after)
         )
     ]
+
+    // MARK: - Onboarding's guided first entry (NHS CBT thought record, full
+    // 5-step form — same framework as `untangleADecision` above, reworded
+    // from "the decision" to whatever's weighing on the person, since the
+    // first entry isn't necessarily about a decision). The situation step's
+    // question is written per-user at runtime — see
+    // `JournalTemplate.onboardingFirstEntry(openingQuestion:)`.
+
+    static func onboardingFirstEntry(openingQuestion: String) -> [TemplateStep] {
+        [
+            TemplateStep(
+                id: "heavy-before",
+                label: "How heavy, before",
+                question: "How heavy does this feel right now?",
+                helper: "0 = light \u{00b7} 10 = very heavy.",
+                kind: .scale(role: .before, values: Array(0...10))
+            ),
+            TemplateStep(
+                id: "situation",
+                label: "What's going on",
+                question: openingQuestion,
+                helper: "Just the facts first \u{2014} what's actually happening.",
+                kind: .text(placeholder: "What's going on is\u{2026}"),
+                whyThis: "This mirrors \u{201c}situation\u{201d} in a CBT thought record \u{2014} naming what's actually in front of you, before the interpretation."
+            ),
+            TemplateStep(
+                id: "thought",
+                label: "The thought driving it",
+                question: "What thought keeps coming up about it?",
+                helper: "Write it exactly as it sounds in your head.",
+                kind: .text(placeholder: "The thought is\u{2026}"),
+                whyThis: "This is the thought record's \u{201c}automatic thought\u{201d} step \u{2014} write it as it actually sounds, not the tidied-up version."
+            ),
+            TemplateStep(
+                id: "emotions",
+                label: "What you felt",
+                question: "What did you feel about it?",
+                helper: "Pick as many as fit.",
+                kind: .multiChoice(options: emotionOptions, allowsOther: true),
+                whyThis: "The thought record's \u{201c}feelings\u{201d} step \u{2014} naming the feeling, separately from the thought that came with it."
+            ),
+            TemplateStep(
+                id: "traps",
+                label: "Thinking traps",
+                question: "Does that thought fall into any of these?",
+                helper: "Pick any that fit \u{2014} or none.",
+                kind: .multiChoice(options: thinkingTrapOptions),
+                whyThis: "Thinking traps are the thought record's shortcut for spotting a distortion before weighing the evidence.",
+                chipHelp: thinkingTrapHelp
+            ),
+            TemplateStep(
+                id: "evidence-for",
+                label: "What supports it",
+                question: "What actually supports that thought?",
+                helper: "Facts, not guesses.",
+                kind: .text(placeholder: "What supports it is\u{2026}"),
+                whyThis: "Facts first, before the interpretation \u{2014} this is \u{201c}evidence that supports the thought.\u{201d}"
+            ),
+            TemplateStep(
+                id: "evidence-against",
+                label: "What it leaves out",
+                question: "What does that thought leave out?",
+                helper: "Look for the facts the first read skips over.",
+                kind: .text(placeholder: "It leaves out\u{2026}"),
+                whyThis: "The record's most-skipped step: evidence the first read leaves out."
+            ),
+            TemplateStep(
+                id: "balanced",
+                label: "A fairer read",
+                question: "What's a fairer way to see this?",
+                helper: "It doesn't have to be positive \u{2014} just fairer and more complete.",
+                kind: .text(placeholder: "A fairer read is\u{2026}"),
+                whyThis: "The \u{201c}alternative thought\u{201d} step \u{2014} not necessarily positive, just more complete."
+            ),
+            TemplateStep(
+                id: "heavy-after",
+                label: "How heavy, after",
+                question: "How heavy does it feel now?",
+                helper: "Same 0\u{2013}10 scale. The point is comparison, not precision.",
+                kind: .scale(role: .after, values: Array(0...10))
+            )
+        ]
+    }
 
     // MARK: - Gratitude, gently (gratitude-letter RCT)
 
@@ -219,6 +503,13 @@ enum TemplateContent {
     // MARK: - Wind down (practice pattern, check-in shaped)
 
     static let windDown: [TemplateStep] = [
+        TemplateStep(
+            id: "breathe",
+            label: "A short pause",
+            question: "Start with a minute of box breathing?",
+            helper: "Entirely optional. Skip it if you'd rather just write.",
+            kind: .breathing()
+        ),
         TemplateStep(
             id: "landing",
             label: "How you're landing",

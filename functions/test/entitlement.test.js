@@ -106,10 +106,23 @@ test("pre-policy accounts (only an old trialStartedAt) haven't started their pre
 });
 
 test("one surface can't eat more than its share of the preview", () => {
-  const d = freeDoc({ trialPerSurface: { chat_turn: { inTok: E.PREVIEW_BUDGET.inTok * E.SURFACE_SHARE_CAP, outTok: 0 } } });
-  const r = E.decideAccess(d, T0 + 1000, "chat_turn");
+  // A non-chat surface is capped at SURFACE_SHARE_CAP (0.5).
+  const d = freeDoc({ trialPerSurface: { journal_insights: { inTok: E.PREVIEW_BUDGET.inTok * E.SURFACE_SHARE_CAP, outTok: 0 } } });
+  const r = E.decideAccess(d, T0 + 1000, "journal_insights");
   assert.deepEqual([r.allowed, r.reason], [false, "surface_cap"]);
-  assert.equal(E.decideAccess(d, T0 + 1000, "journal_insights").allowed, true);
+  // A different surface keeps its own untouched bucket.
+  assert.equal(E.decideAccess(d, T0 + 1000, "chat_turn").allowed, true);
+});
+
+test("chat gets a larger preview share than other surfaces (temporary)", () => {
+  // Chat is lifted to CHAT_SURFACE_SHARE_CAP (0.7): still allowed at the 0.5
+  // mark that would cap any other surface...
+  const mid = freeDoc({ trialPerSurface: { chat_turn: { inTok: E.PREVIEW_BUDGET.inTok * E.SURFACE_SHARE_CAP, outTok: 0 } } });
+  assert.equal(E.decideAccess(mid, T0 + 1000, "chat_turn").allowed, true);
+  // ...and capped at its own 0.7 share.
+  const full = freeDoc({ trialPerSurface: { chat_turn: { inTok: E.PREVIEW_BUDGET.inTok * E.CHAT_SURFACE_SHARE_CAP, outTok: 0 } } });
+  const r = E.decideAccess(full, T0 + 1000, "chat_turn");
+  assert.deepEqual([r.allowed, r.reason], [false, "surface_cap"]);
 });
 
 /* ── paid / expired ──────────────────────────────────────────────────────── */

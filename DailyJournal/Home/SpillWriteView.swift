@@ -25,8 +25,6 @@ import UIKit
 struct SpillWriteView: View {
 
     let userId: String
-    /// Optional starter prompt shown in the prompt card.
-    let prompt: String
     let onSave: () -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -51,27 +49,19 @@ struct SpillWriteView: View {
 
     // Starter "question" — same engine the pencil's blank-page starter uses, so a
     // free spill always opens with a probing prompt the user can re-roll.
-    @StateObject private var hints = HintEngine(
-        context: HintContext(pebbles: [], personal: .safe, mode: .write)
-    )
+    @StateObject private var hints: HintEngine
     @State private var displayedPrompt: String
-    /// True when a specific prompt was passed in (read reply / chip) — then we
-    /// show it as-is and hide the re-roll controls.
-    @State private var usingExplicitPrompt: Bool
 
-    init(userId: String, prompt: String = "", onSave: @escaping () -> Void) {
+    init(userId: String, onSave: @escaping () -> Void) {
         self.userId = userId
-        self.prompt = prompt
         self.onSave = onSave
         _vm = StateObject(wrappedValue: TimedSessionViewModel(userId: userId))
-        // When no explicit prompt is supplied, prime the displayed prompt from
-        // the first Mirror Seed (Loop) so the selected seed and the prompt card
-        // start in a coherent state.
-        let starter = prompt.isEmpty
-            ? (MirrorSeed.all.first?.prompt ?? HintLadder.starterPrompt(pebbles: [], personal: .safe))
-            : prompt
-        _displayedPrompt = State(initialValue: starter)
-        _usingExplicitPrompt = State(initialValue: !prompt.isEmpty)
+        let engine = HintEngine(userId: userId)
+        _hints = StateObject(wrappedValue: engine)
+        // Prime the displayed prompt from the starter question bank — not a
+        // Mirror seed, which assumes enough history to reflect a pattern back
+        // and reads as an odd, abstract opener on a blank-page write.
+        _displayedPrompt = State(initialValue: engine.next())
     }
 
     private var trimmed: String {
@@ -220,19 +210,29 @@ struct SpillWriteView: View {
 
                 Spacer()
 
+                // Labeled, not a bare icon: a small unlabeled paperplane was the
+                // only entry point into future-self letters and went unnoticed.
+                // A pill that names the action makes the feature discoverable.
                 Button {
                     vm.saveEntry(photo: photoUIImage, mood: selectedMood)
                     saved = true
                     UINotificationFeedbackGenerator().notificationOccurred(.success)
                     showFutureSelfSheet = true
                 } label: {
-                    Image(systemName: "paperplane")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(trimmed.isEmpty ? AppTheme.slate : AppTheme.terracotta)
-                        .frame(width: 34, height: 34)
-                        .background(AppTheme.cream.opacity(0.7))
-                        .clipShape(Circle())
-                        .overlay(Circle().stroke(AppTheme.inkSoft.opacity(0.15), lineWidth: 1))
+                    HStack(spacing: 5) {
+                        Image(systemName: "paperplane")
+                            .font(.system(size: 12, weight: .semibold))
+                        Text("Future self")
+                            .font(.system(size: 13, weight: .semibold))
+                    }
+                    .foregroundStyle(trimmed.isEmpty ? AppTheme.slate : AppTheme.terracotta)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(AppTheme.cream.opacity(0.7))
+                    .clipShape(Capsule())
+                    .overlay(Capsule().stroke(
+                        (trimmed.isEmpty ? AppTheme.inkSoft : AppTheme.terracotta).opacity(0.2),
+                        lineWidth: 1))
                 }
                 .buttonStyle(.plain)
                 .disabled(trimmed.isEmpty)
@@ -285,7 +285,7 @@ struct SpillWriteView: View {
     // MARK: - Prompt card (starter "question" + re-roll)
     private var promptCard: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(usingExplicitPrompt ? "today's prompt" : "need a way in?")
+            Text("need a way in?")
                 .font(AppTheme.mono(size: 10))
                 .foregroundStyle(AppTheme.inkSoft)
                 .tracking(2)
@@ -297,12 +297,8 @@ struct SpillWriteView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .animation(.easeInOut(duration: 0.2), value: displayedPrompt)
 
-            if !usingExplicitPrompt {
-                HStack(spacing: 8) {
-                    rerollPill("gentler")     { displayedPrompt = hints.restyledStarter(.gentle) }
-                    rerollPill("more direct") { displayedPrompt = hints.restyledStarter(.direct) }
-                    rerollPill("weirder")     { displayedPrompt = hints.restyledStarter(.weird) }
-                }
+            rerollPill("another one", icon: "arrow.triangle.2.circlepath") {
+                displayedPrompt = hints.next()
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -315,17 +311,23 @@ struct SpillWriteView: View {
         )
     }
 
-    private func rerollPill(_ title: String, _ action: @escaping () -> Void) -> some View {
+    private func rerollPill(_ title: String, icon: String? = nil, _ action: @escaping () -> Void) -> some View {
         Button {
             withAnimation(.easeInOut(duration: 0.2)) { action() }
         } label: {
-            Text(title)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(AppTheme.inkSoft)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
-                .background(AppTheme.paperWarm)
-                .clipShape(Capsule())
+            HStack(spacing: 5) {
+                if let icon {
+                    Image(systemName: icon)
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+            }
+            .foregroundStyle(AppTheme.inkSoft)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(AppTheme.paperWarm)
+            .clipShape(Capsule())
         }
         .buttonStyle(.plain)
     }
@@ -391,8 +393,13 @@ struct SpillWriteView: View {
                                 .tracking(0.2)
                                 .multilineTextAlignment(.center)
                                 .lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
-                        .frame(maxWidth: .infinity)
+                        // A fixed height, not just `maxWidth: .infinity` — see
+                        // the same fix in JournalEditorView's mood picker:
+                        // "Very pleasant"/"Very unpleasant" wrap to 2 lines
+                        // while the rest fit on 1, so the chips were uneven.
+                        .frame(maxWidth: .infinity, minHeight: 50)
                         .padding(.vertical, 8)
                         .background(
                             selectedMood == mood
@@ -526,7 +533,7 @@ struct SpillWriteView: View {
             let topics    = LocalAI.extractTopics(from: vm.content)
             let sentiment = LocalAI.detectSentiment(from: vm.content)
             VStack(spacing: 10) {
-                aiLine(badge: "AI",
+                aiLine(badge: "○",
                        lead: "Live mirror:",
                        body: topics.isEmpty
                             ? "nothing obvious yet — you might be circling something harder to name."
